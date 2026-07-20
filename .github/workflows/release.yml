@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: contains(github.event.head_commit.message, '[release]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig cross-compiler
+        run: >-
+          npm install
+          --cache "$RUNNER_TEMP/npm-cache"
+          --prefix "$RUNNER_TEMP/keyswitchfix-zig"
+          @oven/zig-linux-x64@0.12.0-dev.1286
+
+      - name: Build release package
+        env:
+          ZIG: ${{ runner.temp }}/keyswitchfix-zig/node_modules/@oven/zig-linux-x64/zig
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-local-cache
+        run: ./package-release.sh
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          TAG="v${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "KeySwitchFix $VERSION"
+          git push origin "$TAG"
+          gh release create "$TAG" \
+            "dist/KeySwitchFix-Setup.exe" \
+            "dist/KeySwitchFix-Uninstall.exe" \
+            "dist/KeySwitchFix-${VERSION}-Windows-x64.zip" \
+            "dist/SHA256SUMS.txt" \
+            --verify-tag \
+            --title "KeySwitchFix ${VERSION}" \
+            --generate-notes
+
