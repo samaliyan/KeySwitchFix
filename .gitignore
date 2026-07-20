@@ -1,0 +1,25 @@
+# Build output
+dist/
+resources/*.res
+*.exe
+*.pdb
+*.obj
+*.o
+*.tmp
+
+# Tool caches
+node_modules/
+.cache/
+zig-cache/
+.zig-cache/
+
+# Editors and operating systems
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+desktop.ini
+
