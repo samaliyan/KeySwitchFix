@@ -49,4 +49,3 @@ jobs:
             dist/KeySwitchFix-Uninstall.exe
             dist/KeySwitchFix.exe
             dist/SHA256SUMS.txt
-
