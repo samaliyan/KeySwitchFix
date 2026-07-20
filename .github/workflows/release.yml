@@ -35,7 +35,7 @@ jobs:
           ZIG: ${{ runner.temp }}/keyswitchfix-zig/node_modules/@oven/zig-linux-x64/zig
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-local-cache
-        run: ./package-release.sh
+        run: chmod +x build-native.sh package-release.sh && bash ./package-release.sh
 
       - name: Create tag and GitHub Release
         env:
