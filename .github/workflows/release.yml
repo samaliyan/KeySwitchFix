@@ -55,4 +55,3 @@ jobs:
             --verify-tag \
             --title "KeySwitchFix ${VERSION}" \
             --generate-notes
-
