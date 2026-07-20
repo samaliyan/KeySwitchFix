@@ -1,0 +1,13 @@
+#define IDI_APP                 101
+#define IDR_EN_BLOOM            201
+#define IDR_FA_BLOOM            202
+#define IDR_APP_BINARY          301
+#define IDR_UNINSTALL_BINARY    302
+#define IDD_INSTALLER           401
+#define IDC_INSTALL_TITLE       1001
+#define IDC_INSTALL_TEXT        1002
+#define IDC_STARTUP             1003
+#define IDC_INSTALL             1004
+#define IDC_CANCEL              1005
+#define IDC_INSTALL_ICON        1006
+#define IDC_INSTALL_NOTE        1007
