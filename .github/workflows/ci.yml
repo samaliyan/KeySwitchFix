@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build Windows x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Zig cross-compiler
+        run: >-
+          npm install
+          --cache "$RUNNER_TEMP/npm-cache"
+          --prefix "$RUNNER_TEMP/keyswitchfix-zig"
+          @oven/zig-linux-x64@0.12.0-dev.1286
+
+      - name: Test and build
+        env:
+          ZIG: ${{ runner.temp }}/keyswitchfix-zig/node_modules/@oven/zig-linux-x64/zig
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-local-cache
+        run: ./build-native.sh
+
+      - name: Upload verified executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeySwitchFix-${{ github.sha }}-Windows-x64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/KeySwitchFix-Setup.exe
+            dist/KeySwitchFix-Uninstall.exe
+            dist/KeySwitchFix.exe
+            dist/SHA256SUMS.txt
+
