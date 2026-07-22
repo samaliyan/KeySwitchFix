@@ -45,6 +45,8 @@ int main(void) {
     const uint32_t salam[] = {0x1F,0x22,0x23,0x26};
     const uint32_t ketab[] = {0x27,0x24,0x23,0x21};
     const uint32_t hello[] = {0x23,0x12,0x26,0x26,0x18};
+    const uint32_t behsa[] = {0x21,0x17,0x1F,0x23};
+    const uint32_t behsazi[] = {0x21,0x17,0x1F,0x23,0x2E,0x20};
 
     CHECK(en_data && fa_data, "dictionary files load");
     CHECK(ks_bloom_init(&en, en_data, en_size), "English Bloom validates");
@@ -76,6 +78,19 @@ int main(void) {
     CHECK(ks_evaluate(tokens, 5, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
           "Persian-to-English hello decision");
     CHECK(wcscmp(decision.replacement, L"hello") == 0, "replacement is hello");
+
+    CHECK(make_tokens(behsa, 4, tokens), "behsazi prefix scan codes map");
+    ks_tokens_to_persian(tokens, 4, mapped);
+    CHECK(wcscmp(mapped, L"بهسا") == 0, "behsazi prefix maps to behsa");
+    CHECK(ks_evaluate(tokens, 4, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
+          "incomplete Persian prefix demonstrates the fish false positive");
+    CHECK(wcscmp(decision.replacement, L"fish") == 0, "incomplete prefix maps to fish");
+
+    CHECK(make_tokens(behsazi, 6, tokens), "behsazi scan codes map");
+    ks_tokens_to_persian(tokens, 6, mapped);
+    CHECK(wcscmp(mapped, L"بهسازی") == 0, "completed word maps to behsazi");
+    CHECK(!ks_evaluate(tokens, 6, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
+          "completed Persian word remains unchanged at the word boundary");
 
     free(en_data);
     free(fa_data);

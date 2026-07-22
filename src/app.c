@@ -13,7 +13,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"2.1.0"
+#define APP_VERSION L"2.1.1"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -532,16 +532,6 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
         if (g_word_count < KS_MAX_WORD && !g_overflow_count) g_word[g_word_count++] = token;
         else ++g_overflow_count;
 
-        if (!g_overflow_count && ks_evaluate(g_word, g_word_count, g_word_language,
-                                              minimum_length(), &g_english_bloom,
-                                              &g_persian_bloom, &decision)) {
-            if (apply_decision(foreground, &decision, g_word_count - 1, 0)) {
-                g_suppressed_vk = data->vkCode;
-                g_suppressed_at = GetTickCount();
-                clear_word();
-                return 1;
-            }
-        }
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     }
 
@@ -580,7 +570,7 @@ static void add_tray_icon(void) {
     g_tray.cbSize = sizeof(g_tray);
     g_tray.hWnd = g_window;
     g_tray.uID = ID_TRAY;
-    g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     g_tray.uCallbackMessage = WM_APP_TRAY;
     g_tray.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP));
     safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t), L"KeySwitchFix — Active");
@@ -590,7 +580,7 @@ static void add_tray_icon(void) {
 }
 
 static void update_tray_tip(void) {
-    g_tray.uFlags = NIF_TIP;
+    g_tray.uFlags = NIF_TIP | NIF_SHOWTIP;
     safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t),
               g_settings.enabled ? L"KeySwitchFix — Active" : L"KeySwitchFix — Paused");
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
@@ -982,7 +972,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         return 3;
     }
 
-    g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 2.1.0",
+    g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 2.1.1",
                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                CW_USEDEFAULT, CW_USEDEFAULT, 776, 634, NULL, NULL, instance, NULL);
     if (!g_window) {
