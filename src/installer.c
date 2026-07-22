@@ -10,7 +10,7 @@
 #include "../resources/resource.h"
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"2.1.0"
+#define APP_VERSION L"2.1.1"
 #define APP_WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 #define WM_APP_EXIT (WM_APP + 9)
 
@@ -261,8 +261,8 @@ static void show_install_complete(HWND dialog) {
     SetDlgItemTextW(dialog, IDC_INSTALL_TITLE, L"Installation complete");
     SetDlgItemTextW(dialog, IDC_INSTALL_TEXT,
                     g_shortcuts_created
-                        ? L"KeySwitchFix 2.1 was installed successfully. Desktop and Start Menu shortcuts are ready."
-                        : L"KeySwitchFix 2.1 was installed, but Windows could not create one or more shortcuts.");
+                        ? L"KeySwitchFix 2.1.1 was installed successfully. Desktop and Start Menu shortcuts are ready."
+                        : L"KeySwitchFix 2.1.1 was installed, but Windows could not create one or more shortcuts.");
     SetDlgItemTextW(dialog, IDC_STARTUP, L"Launch KeySwitchFix now");
     SendDlgItemMessageW(dialog, IDC_STARTUP, BM_SETCHECK, BST_CHECKED, 0);
     SetDlgItemTextW(dialog, IDC_INSTALL_NOTE,
