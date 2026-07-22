@@ -28,7 +28,7 @@ Detection is confidence-based: the intended word must exist in the opposite-lang
 - Native Win32 C application with no .NET or external runtime
 - Approximately 147,000 offline English and Persian dictionary entries
 - Works across desktop applications using physical scan-code mapping
-- Corrects during typing or on Space, Enter, and Tab
+- Corrects only after Space, Enter, or Tab so valid words are not changed mid-typing
 - Undo the latest correction with **Ctrl + Win + Backspace**
 - English-only dashboard, tray controls, sensitivity settings, and live diagnostics
 - Per-user installer, desktop/Start Menu shortcuts, startup option, and clean uninstaller
@@ -97,4 +97,3 @@ Use **Windows Settings → Apps → Installed apps → KeySwitchFix → Uninstal
 ## License
 
 Application code is released under the [MIT License](LICENSE.txt). Embedded dictionary resources have their own compatible notices in [`third-party/`](third-party/README.txt).
-

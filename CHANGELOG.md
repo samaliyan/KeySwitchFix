@@ -2,6 +2,14 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] - 2026-07-22
+
+### Fixed
+
+- Restored the standard Windows tooltip for the version 4 tray icon.
+- Delayed automatic correction until Space, Enter, or Tab so valid Persian and English words are not changed while they are still being typed.
+- Made release packaging independent of executable permission bits on shell scripts.
+
 ## [2.1.0] - 2026-07-20
 
 ### Added
@@ -38,8 +46,8 @@ All notable changes to KeySwitchFix are documented here. The project follows [Se
 - Native x64 Win32 application, per-user Setup, standalone Uninstaller, tray UI, diagnostics, and offline Bloom dictionaries.
 - Physical scan-code detection for Persian and English layout mismatches.
 
+[2.1.1]: https://github.com/silimore/KeySwitchFix/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/silimore/KeySwitchFix/releases/tag/v2.1.0
 [2.0.2]: https://github.com/silimore/KeySwitchFix/compare/v2.0.2...v2.1.0
 [2.0.1]: https://github.com/silimore/KeySwitchFix/compare/v2.0.1...v2.0.2
 [2.0.0]: https://github.com/silimore/KeySwitchFix/releases/tag/v2.0.0
-
