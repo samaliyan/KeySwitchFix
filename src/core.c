@@ -72,6 +72,19 @@ int ks_bloom_contains(const KS_BLOOM *bloom, const wchar_t *value) {
     return 1;
 }
 
+int ks_is_word_scancode(uint32_t scan) {
+    if ((scan >= 0x10 && scan <= 0x1B) ||
+        (scan >= 0x1E && scan <= 0x28) ||
+        (scan >= 0x2C && scan <= 0x33))
+        return 1;
+    /*
+     * OEM backslash is used by one of the Windows Persian layout variants
+     * for a Persian letter. It has no portable fallback mapping, but runtime
+     * ToUnicodeEx translation can map it exactly.
+     */
+    return scan == 0x2B;
+}
+
 int ks_map_scancode(uint32_t scan, int shift, int caps, KS_TOKEN *token) {
     wchar_t en = 0;
     wchar_t fa = 0;
@@ -163,6 +176,515 @@ static int english_word_shape(const wchar_t *value) {
     return 1;
 }
 
+static int exact_word(const wchar_t *value, const wchar_t *const *words, size_t count) {
+    size_t index;
+    for (index = 0; index < count; ++index) {
+        if (wcscmp(value, words[index]) == 0) return 1;
+    }
+    return 0;
+}
+
+static int short_english_word(const wchar_t *value) {
+    static const wchar_t *const words[] = {
+        L"a", L"i",
+        L"ad", L"ah", L"ai", L"am", L"an", L"as", L"at", L"be",
+        L"by", L"do", L"go", L"he", L"hi", L"if", L"in", L"is",
+        L"it", L"me", L"my", L"no", L"of", L"oh", L"ok", L"on",
+        L"or", L"so", L"to", L"up", L"us", L"we"
+    };
+    return exact_word(value, words, sizeof(words) / sizeof(words[0]));
+}
+
+static int short_persian_word(const wchar_t *value) {
+    static const wchar_t *const words[] = {
+        L"و",
+        L"آب", L"آن", L"آه", L"از", L"او", L"ای", L"با", L"بد",
+        L"بر", L"به", L"بی", L"پا", L"پر", L"پس", L"تا", L"تب",
+        L"ته", L"تو", L"جا", L"جز", L"چه", L"خب", L"خط", L"در",
+        L"دل", L"دم", L"ده", L"دو", L"را", L"رو", L"زن", L"سر",
+        L"سن", L"سه", L"شب", L"شد", L"حق", L"حل", L"کم", L"کن",
+        L"که", L"کل", L"کی", L"گل", L"لب", L"ما", L"من", L"نه",
+        L"نو", L"هم", L"هر", L"هی", L"یا", L"یک", L"وی"
+    };
+    return exact_word(value, words, sizeof(words) / sizeof(words[0]));
+}
+
+static int word_bloom_contains(const KS_BLOOM *primary,
+                               const KS_BLOOM *supplemental,
+                               const wchar_t *value) {
+    return ks_bloom_contains(primary, value) ||
+           ks_bloom_contains(supplemental, value);
+}
+
+static int persian_word_known(const wchar_t *value, int count,
+                              const KS_BLOOM *persian,
+                              const KS_BLOOM *persian_common) {
+    wchar_t canonical[KS_MAX_WORD + 1];
+    int known;
+
+    known = count <= 2
+        ? short_persian_word(value)
+        : word_bloom_contains(persian, persian_common, value);
+    if (known || value[0] != L'ا') return known;
+
+    /*
+     * Persian users commonly omit Shift for an initial alef-madda: ایا,
+     * اقا, ارام, ... . Use the canonical form only for dictionary lookup;
+     * the replacement keeps the exact spelling the user physically typed.
+     */
+    wcscpy(canonical, value);
+    canonical[0] = L'آ';
+    return count <= 2
+        ? short_persian_word(canonical)
+        : word_bloom_contains(persian, persian_common, canonical);
+}
+
+int ks_word_membership(const KS_TOKEN *tokens, int count,
+                       const KS_BLOOM *english, const KS_BLOOM *persian,
+                       const KS_BLOOM *english_common,
+                       const KS_BLOOM *persian_common,
+                       int *english_known, int *persian_known) {
+    wchar_t en[KS_MAX_WORD + 1];
+    wchar_t en_lower[KS_MAX_WORD + 1];
+    wchar_t fa[KS_MAX_WORD + 1];
+    int en_result;
+    int fa_result;
+
+    if (!tokens || count < 1 || count > KS_MAX_WORD) return 0;
+    ks_tokens_to_english(tokens, count, en);
+    ks_tokens_to_persian(tokens, count, fa);
+    english_lower(en, en_lower);
+
+    if (count <= 2) {
+        en_result = english_word_shape(en_lower) && short_english_word(en_lower);
+        fa_result = persian_word_known(fa, count, persian, persian_common);
+    } else {
+        en_result = english_word_shape(en_lower) &&
+                    word_bloom_contains(english, english_common, en_lower);
+        fa_result = persian_word_known(fa, count, persian, persian_common);
+    }
+    if (english_known) *english_known = en_result;
+    if (persian_known) *persian_known = fa_result;
+    return 1;
+}
+
+int ks_classify_word(const KS_TOKEN *tokens, int count,
+                     const KS_LEXICONS *lexicons,
+                     int *english_known, int *persian_known,
+                     int *english_frequent, int *persian_frequent) {
+    wchar_t en[KS_MAX_WORD + 1];
+    wchar_t en_lower[KS_MAX_WORD + 1];
+    wchar_t fa[KS_MAX_WORD + 1];
+    int en_known = 0;
+    int fa_known = 0;
+
+    if (!lexicons ||
+        !ks_word_membership(tokens, count,
+                            lexicons->english_words, lexicons->persian_words,
+                            lexicons->english_common, lexicons->persian_common,
+                            &en_known, &fa_known)) return 0;
+    ks_tokens_to_english(tokens, count, en);
+    ks_tokens_to_persian(tokens, count, fa);
+    english_lower(en, en_lower);
+    if (english_known) *english_known = en_known;
+    if (persian_known) *persian_known = fa_known;
+    if (english_frequent) {
+        *english_frequent =
+            en_known && ks_bloom_contains(lexicons->english_frequent, en_lower);
+    }
+    if (persian_frequent) {
+        *persian_frequent =
+            fa_known && ks_bloom_contains(lexicons->persian_frequent, fa);
+    }
+    return 1;
+}
+
+void ks_context_reset(KS_LANGUAGE_CONTEXT *context) {
+    if (!context) return;
+    memset(context, 0, sizeof(*context));
+    context->language = KS_LANG_OTHER;
+}
+
+void ks_context_observe(KS_LANGUAGE_CONTEXT *context,
+                        KS_LANGUAGE language, int evidence) {
+    if (!context ||
+        (language != KS_LANG_ENGLISH && language != KS_LANG_PERSIAN)) return;
+    if (evidence < 1) evidence = 1;
+    if (evidence > 4) evidence = 4;
+    ++context->observed_words;
+    if (context->language == KS_LANG_OTHER || context->strength <= 0) {
+        context->language = language;
+        context->strength = evidence;
+        return;
+    }
+    if (context->language == language) {
+        if (context->strength < evidence) context->strength = evidence;
+        else if (context->strength < 4) ++context->strength;
+        return;
+    }
+    if (context->strength > evidence) {
+        context->strength -= evidence;
+        return;
+    }
+    if (context->strength == evidence) {
+        context->language = KS_LANG_OTHER;
+        context->strength = 0;
+        return;
+    }
+    context->language = language;
+    context->strength = evidence - context->strength;
+}
+
+KS_LANGUAGE ks_context_current(const KS_LANGUAGE_CONTEXT *context,
+                               int *strength) {
+    if (strength) *strength = 0;
+    if (!context || context->strength <= 0 ||
+        (context->language != KS_LANG_ENGLISH &&
+         context->language != KS_LANG_PERSIAN)) return KS_LANG_OTHER;
+    if (strength) *strength = context->strength;
+    return context->language;
+}
+
+static int sensitivity_minimum_length(int sensitivity) {
+    if (sensitivity <= 0) return 4;
+    return 2;
+}
+
+static int ambiguity_threshold(int sensitivity) {
+    if (sensitivity <= 0) return 45;
+    if (sensitivity >= 2) return 25;
+    return 35;
+}
+
+typedef struct KS_COLLISION_PRIOR {
+    const wchar_t *english;
+    int points;
+} KS_COLLISION_PRIOR;
+
+#include "collision_priors.inc"
+
+int ks_collision_prior_points(const wchar_t *english_word) {
+    size_t left = 0;
+    size_t right = KS_COLLISION_PRIOR_COUNT;
+    if (!english_word || !*english_word) return 0;
+    while (left < right) {
+        size_t middle = left + (right - left) / 2;
+        int comparison = wcscmp(english_word,
+                                KS_COLLISION_PRIORS[middle].english);
+        if (comparison == 0) return KS_COLLISION_PRIORS[middle].points;
+        if (comparison < 0) right = middle;
+        else left = middle + 1;
+    }
+    return 0;
+}
+
+int ks_evaluate_sequence(const KS_SEQUENCE_WORD *words, int word_count,
+                         int sensitivity,
+                         KS_LANGUAGE context_language, int context_strength,
+                         const KS_LEXICONS *lexicons,
+                         KS_SEQUENCE_RESULT *result) {
+    int index;
+    int english_score = 0;
+    int persian_score = 0;
+    int english_known_words = 0;
+    int persian_known_words = 0;
+    int threshold;
+    int margin;
+
+    if (!result) return 0;
+    memset(result, 0, sizeof(*result));
+    result->language = KS_LANG_OTHER;
+    if (!words || !lexicons || word_count < 2 ||
+        word_count > KS_MAX_SEQUENCE_WORDS) return 0;
+
+    for (index = 0; index < word_count; ++index) {
+        int english_known = 0;
+        int persian_known = 0;
+        int english_frequent = 0;
+        int persian_frequent = 0;
+        int unknown_penalty;
+        if (!words[index].tokens || words[index].count < 1 ||
+            words[index].count > KS_MAX_WORD ||
+            !ks_classify_word(words[index].tokens, words[index].count,
+                              lexicons,
+                              &english_known, &persian_known,
+                              &english_frequent, &persian_frequent))
+            return 0;
+
+        unknown_penalty = words[index].count <= 2 ? 16 : 26;
+        if (english_known) {
+            english_score += 30 + (english_frequent ? 18 : 0);
+            ++english_known_words;
+        } else {
+            english_score -= unknown_penalty;
+        }
+        if (persian_known) {
+            persian_score += 30 + (persian_frequent ? 18 : 0);
+            ++persian_known_words;
+        } else {
+            persian_score -= unknown_penalty;
+        }
+    }
+
+    /*
+     * A complete same-language run is stronger than the sum of isolated
+     * words. This is the local sentence evidence that turns
+     * "nv clhkd ;i" into "در زمانی که" without sending text anywhere.
+     */
+    if (english_known_words == word_count)
+        english_score += 12 + word_count * 8;
+    if (persian_known_words == word_count)
+        persian_score += 12 + word_count * 8;
+
+    /* Strength 5 is an explicit collision preference, not learned context. */
+    if (context_strength > 0 && context_strength <= 4) {
+        if (context_language == KS_LANG_ENGLISH)
+            english_score += context_strength * 8;
+        else if (context_language == KS_LANG_PERSIAN)
+            persian_score += context_strength * 8;
+    }
+
+    result->english_score = english_score;
+    result->persian_score = persian_score;
+    result->english_known_words = english_known_words;
+    result->persian_known_words = persian_known_words;
+
+    threshold = sensitivity <= 0 ? 55 : sensitivity >= 2 ? 30 : 40;
+    margin = english_score - persian_score;
+    if (margin >= threshold && english_known_words == word_count &&
+        english_known_words >= 2) {
+        result->language = KS_LANG_ENGLISH;
+        result->confidence = margin > 100 ? 100 : margin;
+        return 1;
+    }
+    if (-margin >= threshold && persian_known_words == word_count &&
+        persian_known_words >= 2) {
+        result->language = KS_LANG_PERSIAN;
+        result->confidence = -margin > 100 ? 100 : -margin;
+        return 1;
+    }
+    return 0;
+}
+
+static void fill_decision(const KS_TOKEN *tokens, int count,
+                          KS_LANGUAGE active_language, int confidence,
+                          KS_DECISION *decision) {
+    wchar_t en[KS_MAX_WORD + 1];
+    wchar_t fa[KS_MAX_WORD + 1];
+    ks_tokens_to_english(tokens, count, en);
+    ks_tokens_to_persian(tokens, count, fa);
+    memset(decision, 0, sizeof(*decision));
+    decision->should_correct = 1;
+    decision->key_count = count;
+    decision->confidence = confidence;
+    decision->source_language = active_language;
+    decision->target_language =
+        active_language == KS_LANG_ENGLISH ? KS_LANG_PERSIAN : KS_LANG_ENGLISH;
+    if (active_language == KS_LANG_ENGLISH) {
+        wcscpy(decision->original, en);
+        wcscpy(decision->replacement, fa);
+    } else {
+        wcscpy(decision->original, fa);
+        wcscpy(decision->replacement, en);
+    }
+}
+
+KS_LIVE_RESULT ks_evaluate_contextual(
+                                 const KS_TOKEN *tokens, int count,
+                                 KS_LANGUAGE active_language, int sensitivity,
+                                 KS_LANGUAGE context_language, int context_strength,
+                                 int sentence_start,
+                                 KS_EVALUATION_PHASE phase,
+                                 const KS_LEXICONS *lexicons,
+                                 KS_DECISION *decision) {
+    wchar_t en[KS_MAX_WORD + 1];
+    wchar_t en_lower[KS_MAX_WORD + 1];
+    wchar_t fa[KS_MAX_WORD + 1];
+    const wchar_t *active_word;
+    const KS_BLOOM *active_prefixes;
+    const KS_BLOOM *active_common_prefixes;
+    KS_LANGUAGE target_language;
+    int english_known = 0;
+    int persian_known = 0;
+    int english_frequent = 0;
+    int persian_frequent = 0;
+    int active_known;
+    int target_known;
+    int confidence;
+    int active_is_prefix;
+    int active_is_common_prefix;
+    int prior;
+    int evidence;
+    int explicit_preference;
+    int active_frequent;
+    int target_frequent;
+
+    if (!decision) return KS_LIVE_NONE;
+    memset(decision, 0, sizeof(*decision));
+    if (!tokens || !lexicons ||
+        count < sensitivity_minimum_length(sensitivity) ||
+        count > KS_MAX_WORD ||
+        (active_language != KS_LANG_ENGLISH &&
+         active_language != KS_LANG_PERSIAN)) return KS_LIVE_NONE;
+    if (!ks_classify_word(tokens, count, lexicons,
+                          &english_known, &persian_known,
+                          &english_frequent, &persian_frequent))
+        return KS_LIVE_NONE;
+
+    target_language =
+        active_language == KS_LANG_ENGLISH ? KS_LANG_PERSIAN : KS_LANG_ENGLISH;
+    active_known =
+        active_language == KS_LANG_ENGLISH ? english_known : persian_known;
+    target_known =
+        target_language == KS_LANG_ENGLISH ? english_known : persian_known;
+    active_frequent =
+        active_language == KS_LANG_ENGLISH
+            ? english_frequent : persian_frequent;
+    target_frequent =
+        target_language == KS_LANG_ENGLISH
+            ? english_frequent : persian_frequent;
+    if (!target_known) return KS_LIVE_NONE;
+
+    /*
+     * A one-sided dictionary match is objective layout evidence. Language
+     * preference and sentence context must never suppress it; this is the
+     * critical distinction that keeps اثممخ -> hello working in Prefer
+     * Persian mode.
+     */
+    if (!active_known) {
+        confidence = 90;
+        if (count >= 5) confidence += 10;
+        else if (count >= 3) confidence += 5;
+        if (confidence > 100) confidence = 100;
+        fill_decision(tokens, count, active_language, confidence, decision);
+    } else {
+        /*
+         * Both layouts produce real words. Only this branch uses a user
+         * preference, sentence evidence, and corpus-normalized prior.
+         * context_strength 5 is reserved for the explicit tray preference.
+         */
+        explicit_preference = context_strength >= 5;
+        if (explicit_preference) {
+            if (context_language != target_language) return KS_LIVE_NONE;
+            evidence = 100;
+        } else {
+            if (context_strength < 0) context_strength = 0;
+            if (context_strength > 4) context_strength = 4;
+            evidence = 0;
+            if (context_language == target_language)
+                evidence += context_strength * 30;
+            else if (context_language == active_language)
+                evidence -= context_strength * 30;
+            if (target_frequent && !active_frequent)
+                evidence += 45;
+            else if (active_frequent && !target_frequent)
+                evidence -= 45;
+
+            ks_tokens_to_english(tokens, count, en);
+            english_lower(en, en_lower);
+            prior = ks_collision_prior_points(en_lower);
+            if (target_language == KS_LANG_ENGLISH) prior = -prior;
+            /*
+             * Two-key collisions carry too little information for a
+             * corpus-only sentence-start rewrite (of/خب is the canonical
+             * example). They require sentence/document context or an
+             * explicit preference. Longer words may use the full prior.
+             */
+            if (sentence_start && count >= 3) evidence += prior;
+            else evidence += prior / 4;
+            if (phase == KS_PHASE_IDLE) evidence += 5;
+            else if (phase == KS_PHASE_BOUNDARY) evidence += 10;
+            if (evidence < ambiguity_threshold(sensitivity)) {
+                /*
+                 * If the adaptive-idle bonus is the only missing evidence,
+                 * arm the timer instead of abandoning the candidate. This is
+                 * what lets a sentence-initial leg -> مثل collision resolve
+                 * before Space without making a premature third-key edit.
+                 */
+                if (phase == KS_PHASE_LIVE &&
+                    evidence + 5 >= ambiguity_threshold(sensitivity))
+                    return KS_LIVE_WAIT_FOR_IDLE;
+                return KS_LIVE_NONE;
+            }
+        }
+        confidence = evidence;
+        if (confidence < 0) confidence = 0;
+        if (confidence > 100) confidence = 100;
+        fill_decision(tokens, count, active_language, confidence, decision);
+    }
+
+    if (phase == KS_PHASE_BOUNDARY) return KS_LIVE_CORRECT_NOW;
+    if (count == 2) {
+        if (phase == KS_PHASE_LIVE) return KS_LIVE_WAIT_FOR_IDLE;
+        return KS_LIVE_CORRECT_NOW;
+    }
+
+    ks_tokens_to_english(tokens, count, en);
+    ks_tokens_to_persian(tokens, count, fa);
+    if (active_language == KS_LANG_ENGLISH) {
+        english_lower(en, en_lower);
+        active_word = en_lower;
+        active_prefixes = lexicons->english_prefixes;
+        active_common_prefixes = lexicons->english_common_prefixes;
+    } else {
+        active_word = fa;
+        active_prefixes = lexicons->persian_prefixes;
+        active_common_prefixes = lexicons->persian_common_prefixes;
+    }
+    active_is_prefix = ks_bloom_contains(active_prefixes, active_word);
+    active_is_common_prefix =
+        ks_bloom_contains(active_common_prefixes, active_word);
+
+    if (phase == KS_PHASE_LIVE) {
+        if (active_known && context_language == target_language &&
+            context_strength >= 4) return KS_LIVE_CORRECT_NOW;
+        if (active_is_prefix) return KS_LIVE_WAIT_FOR_IDLE;
+        return KS_LIVE_CORRECT_NOW;
+    }
+    if (!active_known && active_is_common_prefix)
+        return KS_LIVE_WAIT_FOR_IDLE;
+    return KS_LIVE_CORRECT_NOW;
+}
+
+KS_LIVE_RESULT ks_evaluate_smart_common(
+                                 const KS_TOKEN *tokens, int count,
+                                 KS_LANGUAGE active_language, int sensitivity,
+                                 KS_LANGUAGE context_language, int context_strength,
+                                 KS_EVALUATION_PHASE phase,
+                                 const KS_BLOOM *english, const KS_BLOOM *persian,
+                                 const KS_BLOOM *english_common,
+                                 const KS_BLOOM *persian_common,
+                                 const KS_BLOOM *english_prefixes,
+                                 const KS_BLOOM *persian_prefixes,
+                                 KS_DECISION *decision) {
+    KS_LEXICONS lexicons;
+    memset(&lexicons, 0, sizeof(lexicons));
+    lexicons.english_words = english;
+    lexicons.persian_words = persian;
+    lexicons.english_common = english_common;
+    lexicons.persian_common = persian_common;
+    lexicons.english_prefixes = english_prefixes;
+    lexicons.persian_prefixes = persian_prefixes;
+    return ks_evaluate_contextual(
+        tokens, count, active_language, sensitivity,
+        context_language, context_strength, 0, phase, &lexicons, decision);
+}
+
+KS_LIVE_RESULT ks_evaluate_smart(const KS_TOKEN *tokens, int count,
+                                 KS_LANGUAGE active_language, int sensitivity,
+                                 KS_LANGUAGE context_language, int context_strength,
+                                 KS_EVALUATION_PHASE phase,
+                                 const KS_BLOOM *english, const KS_BLOOM *persian,
+                                 const KS_BLOOM *english_prefixes,
+                                 const KS_BLOOM *persian_prefixes,
+                                 KS_DECISION *decision) {
+    return ks_evaluate_smart_common(
+        tokens, count, active_language, sensitivity,
+        context_language, context_strength, phase,
+        english, persian, NULL, NULL, english_prefixes, persian_prefixes,
+        decision);
+}
+
 int ks_evaluate(const KS_TOKEN *tokens, int count, KS_LANGUAGE active_language,
                 int minimum_length, const KS_BLOOM *english, const KS_BLOOM *persian,
                 KS_DECISION *decision) {
@@ -180,8 +702,8 @@ int ks_evaluate(const KS_TOKEN *tokens, int count, KS_LANGUAGE active_language,
     ks_tokens_to_english(tokens, count, en);
     ks_tokens_to_persian(tokens, count, fa);
     english_lower(en, en_lower);
-    en_known = english_word_shape(en_lower) && ks_bloom_contains(english, en_lower);
-    fa_known = ks_bloom_contains(persian, fa);
+    ks_word_membership(tokens, count, english, persian, NULL, NULL,
+                       &en_known, &fa_known);
 
     if (active_language == KS_LANG_PERSIAN && en_known && !fa_known) {
         decision->should_correct = 1;
@@ -204,4 +726,58 @@ int ks_evaluate(const KS_TOKEN *tokens, int count, KS_LANGUAGE active_language,
     }
 
     return 0;
+}
+
+KS_LIVE_RESULT ks_evaluate_live(const KS_TOKEN *tokens, int count,
+                                KS_LANGUAGE active_language, int minimum_length,
+                                const KS_BLOOM *english, const KS_BLOOM *persian,
+                                const KS_BLOOM *english_prefixes,
+                                const KS_BLOOM *persian_prefixes,
+                                KS_DECISION *decision) {
+    wchar_t active_word[KS_MAX_WORD + 1];
+    const KS_BLOOM *prefixes;
+
+    if (!ks_evaluate(tokens, count, active_language, minimum_length,
+                     english, persian, decision)) return KS_LIVE_NONE;
+
+    if (active_language == KS_LANG_ENGLISH) {
+        english_lower(decision->original, active_word);
+        prefixes = english_prefixes;
+    } else {
+        wcscpy(active_word, decision->original);
+        prefixes = persian_prefixes;
+    }
+
+    if (ks_bloom_contains(prefixes, active_word)) return KS_LIVE_WAIT_FOR_IDLE;
+    return KS_LIVE_CORRECT_NOW;
+}
+
+static uint32_t clamp_delay(uint32_t value, uint32_t minimum, uint32_t maximum) {
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+uint32_t ks_update_key_interval_ms(uint32_t current_average_ms,
+                                   uint32_t observed_interval_ms) {
+    if (current_average_ms < 40u || current_average_ms > 500u) {
+        current_average_ms = 150u;
+    }
+    if (observed_interval_ms < 20u || observed_interval_ms > 1500u) {
+        return current_average_ms;
+    }
+    return (current_average_ms * 3u + observed_interval_ms) / 4u;
+}
+
+uint32_t ks_idle_delay_ms(int sensitivity, uint32_t average_key_interval_ms) {
+    if (average_key_interval_ms < 40u) average_key_interval_ms = 40u;
+    if (average_key_interval_ms > 500u) average_key_interval_ms = 500u;
+
+    if (sensitivity == 2) {
+        return clamp_delay(average_key_interval_ms * 2u, 280u, 650u);
+    }
+    if (sensitivity == 0) {
+        return clamp_delay(average_key_interval_ms * 4u, 650u, 1200u);
+    }
+    return clamp_delay(average_key_interval_ms * 3u, 450u, 900u);
 }

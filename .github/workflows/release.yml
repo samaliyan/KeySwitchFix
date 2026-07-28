@@ -41,12 +41,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           VERSION="$(tr -d '\r\n' < VERSION)"
           TAG="v${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "KeySwitchFix $VERSION"
-          git push origin "$TAG"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            TAG_TREE="$(git rev-parse "$TAG^{tree}")"
+            HEAD_TREE="$(git rev-parse "HEAD^{tree}")"
+            if [ "$TAG_TREE" != "$HEAD_TREE" ]; then
+              echo "::error::Tag $TAG already points to different source. Bump VERSION before publishing."
+              exit 1
+            fi
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG already exists for this exact source; nothing to do."
+              exit 0
+            fi
+          else
+            git tag -a "$TAG" -m "KeySwitchFix $VERSION"
+            git push origin "$TAG"
+          fi
+
           gh release create "$TAG" \
             "dist/KeySwitchFix-Setup.exe" \
             "dist/KeySwitchFix-Uninstall.exe" \

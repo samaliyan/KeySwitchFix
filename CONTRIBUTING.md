@@ -31,6 +31,18 @@ False corrections are more disruptive than missed corrections. A dictionary chan
 
 Do not add raw word lists without confirming their license. Dictionary resources are compact Bloom filters and their upstream notices must remain in `third-party/`.
 
+To reproduce every Bloom resource, install the pinned source packages and run:
+
+```bash
+npm install --prefix /tmp/keyswitchfix-dictionaries dictionary-en@4.0.0 dictionary-fa@2.0.0
+python3 -m pip install --target /tmp/keyswitchfix-wordfreq wordfreq==3.1.1
+PYTHONPATH=/tmp/keyswitchfix-wordfreq python3 tools/generate_blooms.py \
+  --dictionary-root /tmp/keyswitchfix-dictionaries/node_modules
+```
+
+The generator verifies the exact SHA-256 of the pinned English and Persian
+wordfreq data before changing a resource.
+
 ## Coding style
 
 - C11, four-space indentation, no tabs.
@@ -40,4 +52,3 @@ Do not add raw word lists without confirming their license. Dictionary resources
 - Avoid adding runtimes, services, telemetry, or background updaters.
 
 By contributing, you agree that your contribution is licensed under the MIT License.
-

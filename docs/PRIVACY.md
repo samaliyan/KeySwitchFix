@@ -4,7 +4,14 @@ KeySwitchFix is deliberately offline.
 
 ## Data processed
 
-The application keeps physical key tokens for only the current candidate word in process memory. It also reads the foreground executable name and keyboard layout to apply exclusions and select the correct mapping.
+The application keeps physical key tokens for the current candidate word and
+the current Space-separated sentence in process memory, with hard limits of 32
+words and 512 characters. It also keeps the exact latest correction for up to
+15 seconds so Backspace can restore it. Sentence history is discarded when the
+caret model becomes unreliable, including mouse clicks, navigation, window
+changes, sentence termination, and unsupported punctuation. The application
+also reads the foreground executable name and keyboard layout to apply
+exclusions and select the correct mapping.
 
 ## Data not collected
 
@@ -13,7 +20,7 @@ KeySwitchFix does not:
 - connect to the internet;
 - include analytics, telemetry, advertisements, or crash uploaders;
 - write typed words to files, the registry, or Windows Event Log;
-- store a history of corrections;
+- persist typed text or correction history beyond process memory;
 - run a Windows service;
 - transmit process names or settings.
 
@@ -26,4 +33,3 @@ Standard Win32 password edits and common password-manager processes are excluded
 ## Verifiability
 
 There are no networking libraries in the application import table. Release builds and their SHA-256 checksums are produced by the public GitHub Actions workflow.
-

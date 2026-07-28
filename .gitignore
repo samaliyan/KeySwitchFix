@@ -10,6 +10,7 @@ resources/*.res
 # Tool caches
 node_modules/
 .cache/
+__pycache__/
 zig-cache/
 .zig-cache/
 
@@ -22,4 +23,3 @@ zig-cache/
 .DS_Store
 Thumbs.db
 desktop.ini
-

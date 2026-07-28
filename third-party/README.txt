@@ -8,4 +8,10 @@ KeySwitchFix embeds Bloom representations derived from:
    License: SCOWL permissive license plus upstream notices
    Full notice: dictionary-en-LICENSE.txt
 
-The application resources contain probabilistic membership bits, not the original word-list files.
+3. wordfreq 3.1.1 / combined English and Persian frequency estimates
+   Software license: Apache License 2.0
+   Derived frequency-data license: Creative Commons BY-SA 4.0
+   Full notices: wordfreq-LICENSE.txt and wordfreq-NOTICE.txt
+
+The application resources contain probabilistic membership bits and compact
+physical-key collision priors, not the original word-list files.

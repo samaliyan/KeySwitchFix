@@ -79,6 +79,30 @@ def main():
 
     assert digest(app.resource(10, 201)) == digest((ROOT / "resources" / "en.bloom").read_bytes())
     assert digest(app.resource(10, 202)) == digest((ROOT / "resources" / "fa.bloom").read_bytes())
+    assert digest(app.resource(10, 203)) == digest(
+        (ROOT / "resources" / "en-prefix.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 204)) == digest(
+        (ROOT / "resources" / "fa-prefix.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 205)) == digest(
+        (ROOT / "resources" / "en-common.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 206)) == digest(
+        (ROOT / "resources" / "fa-common.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 207)) == digest(
+        (ROOT / "resources" / "en-frequent.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 208)) == digest(
+        (ROOT / "resources" / "fa-frequent.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 209)) == digest(
+        (ROOT / "resources" / "en-common-prefix.bloom").read_bytes()
+    )
+    assert digest(app.resource(10, 210)) == digest(
+        (ROOT / "resources" / "fa-common-prefix.bloom").read_bytes()
+    )
     assert digest(setup.resource(10, 301)) == digest(app_path.read_bytes())
     assert digest(setup.resource(10, 302)) == digest(uninstall_path.read_bytes())
     print("PE verification passed: x64 GUI files and all embedded payloads are exact.")

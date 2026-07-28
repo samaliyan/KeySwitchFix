@@ -1,6 +1,14 @@
 #define IDI_APP                 101
 #define IDR_EN_BLOOM            201
 #define IDR_FA_BLOOM            202
+#define IDR_EN_PREFIX_BLOOM     203
+#define IDR_FA_PREFIX_BLOOM     204
+#define IDR_EN_COMMON_BLOOM     205
+#define IDR_FA_COMMON_BLOOM     206
+#define IDR_EN_FREQUENT_BLOOM   207
+#define IDR_FA_FREQUENT_BLOOM   208
+#define IDR_EN_COMMON_PREFIX    209
+#define IDR_FA_COMMON_PREFIX    210
 #define IDR_APP_BINARY          301
 #define IDR_UNINSTALL_BINARY    302
 #define IDD_INSTALLER           401

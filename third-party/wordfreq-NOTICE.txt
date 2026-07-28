@@ -1,0 +1,46 @@
+wordfreq 3.1.1
+Copyright 2022 Robyn Speer
+https://github.com/rspeer/wordfreq
+
+Robyn Speer must be credited as Robyn Speer, the name used on her academic
+work. The wordfreq software is distributed under Apache License 2.0; see
+wordfreq-LICENSE.txt.
+
+wordfreq includes data that may be redistributed under Creative Commons
+Attribution-ShareAlike 4.0:
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Its combined frequency estimates use data derived from sources including:
+
+- Google Books Ngrams and Google Books Syntactic Ngrams;
+- the Leeds Internet Corpus;
+- Wikipedia;
+- ParaCrawl;
+- OPUS OpenSubtitles 2018, with attribution to OpenSubtitles;
+- SUBTLEX word lists created by Marc Brysbaert and collaborators;
+- aggregate word statistics collected from Twitter.
+
+The upstream project states that the SUBTLEX authors must be credited and that
+SUBTLEX remains freely available data:
+https://www.ugent.be/pp/experimentele-psychologie/en/research/documents/subtlexus
+
+KeySwitchFix transformation
+---------------------------
+
+KeySwitchFix does not embed the wordfreq package or its original word lists.
+tools/generate_blooms.py reads the pinned English and Persian frequency data,
+normalizes/filter words that the supported keyboard layouts can produce, and
+stores only probabilistic Bloom membership bits plus a compact table of
+physical-key collision priors. The common, frequent, common-prefix Bloom files
+and collision-prior table derived from wordfreq are distributed under CC
+BY-SA 4.0. Application source code remains under the project MIT license.
+
+Pinned wordfreq files:
+
+- wordfreq/data/large_en.msgpack.gz
+  SHA-256 dffae8066b78dce0a6667cf5f58e567054f902674667090a7ac8a8a44628b05c
+- wordfreq/data/small_fa.msgpack.gz
+  SHA-256 bfb503f6b0d6bdddce720ee8154faf1c79d8b0417e6c865643da3b17b7638057
+
+The complete upstream attribution notice is available at:
+https://github.com/rspeer/wordfreq/blob/master/NOTICE.md
