@@ -26,6 +26,10 @@ application's layout automatically.
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
 
+Version 2.8 adds a keyboard-hook watchdog, Shift+Space (ZWNJ) awareness for
+words such as `می‌خواهم`, a per-app exclusion shortcut on the tray menu, a
+`Ctrl + Win + K` pause hotkey, and a DPI-aware dashboard.
+
 Version 2.7 combines both dictionary candidates, common/frequent vocabulary,
 sentence position, weighted document language, normalized bilingual frequency,
 typing phase, prefix safety, and continuous current-sentence review. It keeps
@@ -48,6 +52,9 @@ inferred from the available keys or context alone.
 - Auto, Prefer Persian, and Prefer English modes for ambiguous collisions
 - Recognizes common unshifted initial `آ` spellings such as `ایا`
 - Undo the latest correction with one plain **Backspace**; `Ctrl + Win + Backspace` remains a fallback
+- Treats Shift+Space as a Persian ZWNJ boundary, so `می‌خواهم` and `کتاب‌ها` are repaired and re-typed exactly
+- Re-arms its keyboard hook automatically if Windows silently detaches it
+- **Exclude this app** from the tray menu and `Ctrl + Win + K` to pause/resume
 - English-only dashboard, tray controls, sensitivity settings, and live diagnostics
 - Per-user installer, desktop/Start Menu shortcuts, startup option, and clean uninstaller
 - No network access, telemetry, cloud processing, typed-text log, or background service
@@ -66,7 +73,8 @@ The executable is currently unsigned, so Microsoft Defender SmartScreen may disp
 
 - KeySwitchFix starts enabled and can start automatically with Windows.
 - Double-click the tray icon or use the desktop shortcut to open the dashboard.
-- Right-click the tray icon to pause correction, choose **Writing language**, or exit.
+- Right-click the tray icon to pause correction, choose **Writing language**, exclude the app you last typed in, or exit.
+- Press `Ctrl + Win + K` to pause or resume correction from anywhere.
 - Closing the dashboard hides it to the tray; choosing **Exit** stops the program.
 - If Windows Explorer restarts, the tray icon restores itself automatically.
 
@@ -76,6 +84,7 @@ If correction does not occur, open **Live diagnostics** and confirm:
 - `Keyboard hook: Running`
 - `Current context` reports an English or Persian layout
 - `Input observed` increases while typing in another application
+- No warning about a missing Persian or English keyboard layout is shown
 
 ## Privacy and security
 
@@ -113,6 +122,7 @@ The build performs:
 - exact verification of embedded dictionaries and Setup payloads
 
 See [Architecture](docs/ARCHITECTURE.md), the
+[2.8 review](docs/REVIEW_2.8.0.md), the
 [three-cycle 2.7 review](docs/STRICT_REVIEW_2.7.0.md), and
 [Contributing](CONTRIBUTING.md) before submitting changes.
 

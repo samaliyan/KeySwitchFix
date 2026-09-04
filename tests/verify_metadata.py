@@ -57,6 +57,24 @@ def main() -> None:
         assert hash_count == expected_hashes, f"{path}: unexpected hash count"
         assert len(data) == 16 + bit_count // 8, f"{path}: invalid Bloom size"
 
+    core = read("src/core.c")
+    generator = read("tools/generate_blooms.py")
+
+    def c_list(function: str) -> set:
+        body = core.split(f"static int {function}(", 1)[1].split("};", 1)[0]
+        return set(re.findall(r'L"([^"]+)"', body))
+
+    def py_set(name: str) -> set:
+        body = generator.split(f"{name} = {{", 1)[1].split("}", 1)[0]
+        return set(re.findall(r'"([^"]+)"', body))
+
+    assert c_list("short_english_word") == py_set("SHORT_ENGLISH_WORDS"), (
+        "short English word list differs between core.c and generate_blooms.py"
+    )
+    assert c_list("short_persian_word") == py_set("SHORT_PERSIAN_WORDS"), (
+        "short Persian word list differs between core.c and generate_blooms.py"
+    )
+
     app = read("src/app.c")
     assert not re.search(r"\bF12\b|VK_F12|self-test", app, re.IGNORECASE), (
         "src/app.c: obsolete shortcut or self-test UI returned"

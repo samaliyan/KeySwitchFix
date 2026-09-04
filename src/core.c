@@ -72,6 +72,57 @@ int ks_bloom_contains(const KS_BLOOM *bloom, const wchar_t *value) {
     return 1;
 }
 
+wchar_t ks_canonical_persian(wchar_t character) {
+    /*
+     * The dictionaries are normalized to Persian yeh (U+06CC) and kaf
+     * (U+06A9). Some Windows Persian layouts and older systems emit the
+     * Arabic code points instead; without this mapping every correctly typed
+     * Persian word containing ي or ك would look unknown, and the English
+     * candidate would win a correction it should never have won.
+     */
+    switch (character) {
+        case 0x064A: /* ARABIC LETTER YEH */
+        case 0x0649: /* ARABIC LETTER ALEF MAKSURA */
+            return 0x06CC;
+        case 0x0643: /* ARABIC LETTER KAF */
+            return 0x06A9;
+        default:
+            return character;
+    }
+}
+
+int ks_is_persian_diacritic(wchar_t character) {
+    /*
+     * Tanwin, fatha/damma/kasra, shadda, sukun, superscript alef, and the
+     * Quranic marks: the Arabic-script combining marks (category Mn) that
+     * the dictionary generator strips before storing a spelling.
+     */
+    return (character >= 0x064B && character <= 0x065F) ||
+           character == 0x0670 ||
+           (character >= 0x06D6 && character <= 0x06DC) ||
+           (character >= 0x06DF && character <= 0x06E4) ||
+           character == 0x06E7 || character == 0x06E8 ||
+           (character >= 0x06EA && character <= 0x06ED);
+}
+
+/*
+ * Dictionary spellings carry no diacritics, but users type them (حتماً,
+ * مدرّس). Look words up without the marks so a correctly typed Persian
+ * word with a tashdid or tanwin is still recognized as Persian instead of
+ * becoming "unknown" and handing the decision to the English candidate.
+ * Returns the number of characters removed.
+ */
+static int strip_persian_diacritics(const wchar_t *source, wchar_t *target) {
+    int removed = 0;
+    while (*source) {
+        if (ks_is_persian_diacritic(*source)) ++removed;
+        else *target++ = *source;
+        ++source;
+    }
+    *target = 0;
+    return removed;
+}
+
 int ks_is_word_scancode(uint32_t scan) {
     if ((scan >= 0x10 && scan <= 0x1B) ||
         (scan >= 0x1E && scan <= 0x28) ||
@@ -184,27 +235,45 @@ static int exact_word(const wchar_t *value, const wchar_t *const *words, size_t 
     return 0;
 }
 
+/*
+ * Two-key words are deliberately excluded from the Bloom dictionaries, so
+ * these exact lists are the only membership evidence for them. Every English
+ * token whose physical keys also spell a listed Persian word must appear
+ * here: otherwise the Persian side becomes "objective" one-sided evidence and
+ * a genuine English token is rewritten. "id" (هی), "ms" (پس) and "pr" (حق)
+ * are the common cases; keeping them on both lists turns them into ordinary
+ * collisions that need sentence context or an explicit preference.
+ */
 static int short_english_word(const wchar_t *value) {
     static const wchar_t *const words[] = {
         L"a", L"i",
         L"ad", L"ah", L"ai", L"am", L"an", L"as", L"at", L"be",
-        L"by", L"do", L"go", L"he", L"hi", L"if", L"in", L"is",
-        L"it", L"me", L"my", L"no", L"of", L"oh", L"ok", L"on",
-        L"or", L"so", L"to", L"up", L"us", L"we"
+        L"by", L"do", L"go", L"he", L"hi", L"id", L"if", L"in",
+        L"is", L"it", L"me", L"ms", L"my", L"no", L"of", L"oh",
+        L"ok", L"on", L"or", L"pr", L"so", L"to", L"up", L"us",
+        L"we"
     };
     return exact_word(value, words, sizeof(words) / sizeof(words[0]));
 }
 
+/*
+ * می, ها, تر, ام and ات are the halves that surround a ZWNJ in everyday
+ * Persian (می‌خواهم, کتاب‌ها, بزرگ‌تر, خانه‌ام, دست‌ات). Shift+Space
+ * separates them into their own tokens, so they must be recognizable on
+ * their own. None of their physical-key spellings (ld, ih, jv, hl, hj) is an
+ * English word.
+ */
 static int short_persian_word(const wchar_t *value) {
     static const wchar_t *const words[] = {
         L"و",
-        L"آب", L"آن", L"آه", L"از", L"او", L"ای", L"با", L"بد",
-        L"بر", L"به", L"بی", L"پا", L"پر", L"پس", L"تا", L"تب",
-        L"ته", L"تو", L"جا", L"جز", L"چه", L"خب", L"خط", L"در",
-        L"دل", L"دم", L"ده", L"دو", L"را", L"رو", L"زن", L"سر",
-        L"سن", L"سه", L"شب", L"شد", L"حق", L"حل", L"کم", L"کن",
-        L"که", L"کل", L"کی", L"گل", L"لب", L"ما", L"من", L"نه",
-        L"نو", L"هم", L"هر", L"هی", L"یا", L"یک", L"وی"
+        L"آب", L"آن", L"آه", L"از", L"ام", L"او", L"ای", L"ات",
+        L"با", L"بد", L"بر", L"به", L"بی", L"پا", L"پر", L"پس",
+        L"تا", L"تب", L"تر", L"ته", L"تو", L"جا", L"جز", L"چه",
+        L"خب", L"خط", L"در", L"دل", L"دم", L"ده", L"دو", L"را",
+        L"رو", L"زن", L"سر", L"سن", L"سه", L"شب", L"شد", L"حق",
+        L"حل", L"کم", L"کن", L"که", L"کل", L"کی", L"گل", L"لب",
+        L"ما", L"من", L"می", L"نه", L"نو", L"ها", L"هم", L"هر",
+        L"هی", L"یا", L"یک", L"وی"
     };
     return exact_word(value, words, sizeof(words) / sizeof(words[0]));
 }
@@ -220,8 +289,14 @@ static int persian_word_known(const wchar_t *value, int count,
                               const KS_BLOOM *persian,
                               const KS_BLOOM *persian_common) {
     wchar_t canonical[KS_MAX_WORD + 1];
+    wchar_t stripped[KS_MAX_WORD + 1];
     int known;
 
+    if (strip_persian_diacritics(value, stripped)) {
+        count = (int)wcslen(stripped);
+        if (count < 1) return 0;
+        value = stripped;
+    }
     known = count <= 2
         ? short_persian_word(value)
         : word_bloom_contains(persian, persian_common, value);
@@ -293,8 +368,10 @@ int ks_classify_word(const KS_TOKEN *tokens, int count,
             en_known && ks_bloom_contains(lexicons->english_frequent, en_lower);
     }
     if (persian_frequent) {
+        wchar_t stripped[KS_MAX_WORD + 1];
+        strip_persian_diacritics(fa, stripped);
         *persian_frequent =
-            fa_known && ks_bloom_contains(lexicons->persian_frequent, fa);
+            fa_known && ks_bloom_contains(lexicons->persian_frequent, stripped);
     }
     return 1;
 }
@@ -500,6 +577,7 @@ KS_LIVE_RESULT ks_evaluate_contextual(
     wchar_t en[KS_MAX_WORD + 1];
     wchar_t en_lower[KS_MAX_WORD + 1];
     wchar_t fa[KS_MAX_WORD + 1];
+    wchar_t fa_stripped[KS_MAX_WORD + 1];
     const wchar_t *active_word;
     const KS_BLOOM *active_prefixes;
     const KS_BLOOM *active_common_prefixes;
@@ -627,7 +705,8 @@ KS_LIVE_RESULT ks_evaluate_contextual(
         active_prefixes = lexicons->english_prefixes;
         active_common_prefixes = lexicons->english_common_prefixes;
     } else {
-        active_word = fa;
+        strip_persian_diacritics(fa, fa_stripped);
+        active_word = fa_stripped;
         active_prefixes = lexicons->persian_prefixes;
         active_common_prefixes = lexicons->persian_common_prefixes;
     }
@@ -744,7 +823,7 @@ KS_LIVE_RESULT ks_evaluate_live(const KS_TOKEN *tokens, int count,
         english_lower(decision->original, active_word);
         prefixes = english_prefixes;
     } else {
-        wcscpy(active_word, decision->original);
+        strip_persian_diacritics(decision->original, active_word);
         prefixes = persian_prefixes;
     }
 

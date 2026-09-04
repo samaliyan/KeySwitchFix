@@ -40,19 +40,25 @@ ENGLISH_TO_PERSIAN = {
     "s": "س", "t": "ف", "u": "ع", "v": "ر", "w": "ص", "x": "ط",
     "y": "غ", "z": "ظ", "'": "گ",
 }
+# Keep these two sets identical to short_english_word()/short_persian_word()
+# in src/core.c. Every English token whose physical keys spell a listed
+# Persian word (id/هی, ms/پس, pr/حق) must be on the English side too, so it
+# is treated as a collision instead of one-sided Persian evidence.
 SHORT_ENGLISH_WORDS = {
     "a", "i",
     "ad", "ah", "ai", "am", "an", "as", "at", "be", "by", "do", "go",
-    "he", "hi", "if", "in", "is", "it", "me", "my", "no", "of", "oh",
-    "ok", "on", "or", "so", "to", "up", "us", "we",
+    "he", "hi", "id", "if", "in", "is", "it", "me", "ms", "my", "no",
+    "of", "oh", "ok", "on", "or", "pr", "so", "to", "up", "us", "we",
 }
+# می, ها, تر, ام, ات are the halves around a ZWNJ (Shift+Space).
 SHORT_PERSIAN_WORDS = {
     "و",
-    "آب", "آن", "آه", "از", "او", "ای", "با", "بد", "بر", "به", "بی",
-    "پا", "پر", "پس", "تا", "تب", "ته", "تو", "جا", "جز", "چه", "خب",
-    "خط", "در", "دل", "دم", "ده", "دو", "را", "رو", "زن", "سر", "سن",
-    "سه", "شب", "شد", "حق", "حل", "کم", "کن", "که", "کل", "کی", "گل",
-    "لب", "ما", "من", "نه", "نو", "هم", "هر", "هی", "یا", "یک", "وی",
+    "آب", "آن", "آه", "از", "ام", "او", "ای", "ات", "با", "بد", "بر",
+    "به", "بی", "پا", "پر", "پس", "تا", "تب", "تر", "ته", "تو", "جا",
+    "جز", "چه", "خب", "خط", "در", "دل", "دم", "ده", "دو", "را", "رو",
+    "زن", "سر", "سن", "سه", "شب", "شد", "حق", "حل", "کم", "کن", "که",
+    "کل", "کی", "گل", "لب", "ما", "من", "می", "نه", "نو", "ها", "هم",
+    "هر", "هی", "یا", "یک", "وی",
 }
 
 # A small number of malformed fragments exist in the upstream Persian

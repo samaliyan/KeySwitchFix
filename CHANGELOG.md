@@ -2,6 +2,63 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] - 2026-09-04
+
+### Added
+
+- A keyboard-hook watchdog. Windows silently detaches a low-level hook whose
+  callback ever exceeds its timeout budget; the application now compares
+  `GetLastInputInfo` with the last event the hooks delivered and re-arms them,
+  instead of reporting `Running` forever while nothing is corrected.
+- Zero-width non-joiner support: Shift+Space is treated as a Persian word
+  boundary, the exact ZWNJ is replayed after a correction, and phrase repair
+  reproduces it. `ld` + Shift+Space + `o,hil` now becomes `می‌خواهم`.
+- The ZWNJ halves `می`, `ها`, `تر`, `ام`, and `ات` as recognized short
+  Persian words.
+- **Exclude _app_.exe** / **Resume correction in _app_.exe** on the tray menu
+  for the application you last typed in.
+- `Ctrl + Win + K` pauses and resumes correction without opening the tray.
+- The dashboard scales with the system DPI setting instead of rendering at
+  96 DPI on high-resolution laptops.
+- A diagnostics warning when the Persian or English keyboard layout is not
+  installed in Windows.
+- Regression coverage for English two-key tokens, ZWNJ halves, and the
+  Arabic-yeh/kaf normalization; `verify_metadata.py` now asserts that the
+  short-word lists in `core.c` and `generate_blooms.py` are identical.
+
+### Changed
+
+- The 500 ms diagnostics refresh runs only while the dashboard is visible,
+  and labels are rewritten only when their text changes (no flicker).
+- The tray menu posts `WM_NULL` after `TrackPopupMenu`, so it dismisses when
+  the user clicks elsewhere.
+
+### Fixed
+
+- `id`, `ms`, and `pr` typed in English were rewritten to `هی`, `پس`, and
+  `حق` after a pause or Space, because the English short-word list did not
+  contain them and the Persian side therefore counted as one-sided evidence.
+  They are now genuine collisions that require sentence context or an explicit
+  preference. The trade-off: an isolated `ms` intended as `پس` at the very
+  start of a sentence now waits for the next word (phrase repair) or Persian
+  document context instead of being corrected on its own.
+- Persian text typed on a layout that emits Arabic `ي`/`ك` (U+064A/U+0643)
+  looked unknown to the normalized dictionaries, which allowed accidental
+  English matches to rewrite correct Persian words. Runtime tokens are now
+  canonicalized to `ی`/`ک`.
+- Persian words typed with a tanwin or tashdid (`حتماً`, `مدرّس`) were unknown
+  to the diacritic-free dictionaries; lookups now strip the marks first, so
+  correctly typed words stay protected.
+- A ZWNJ produced by a letter key (Shift+B on the legacy Persian layout) is
+  treated as the same word boundary as Shift+Space.
+- `find_layout` called `LoadKeyboardLayout` on every keystroke whenever one
+  language was missing, silently adding a keyboard to the user's language bar.
+  The static fallback table is used instead and the diagnostics explain what
+  is missing.
+- The uninstaller's self-delete helper launched a bare `cmd.exe`, which
+  Windows resolves through the current directory first; it now uses the full
+  `System32` path.
+
 ## [2.7.0] - 2026-07-27
 
 ### Added

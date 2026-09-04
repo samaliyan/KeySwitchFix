@@ -10,7 +10,7 @@
 #include "../resources/resource.h"
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"2.7.0"
+#define APP_VERSION L"2.8.0"
 #define APP_WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 #define WM_APP_EXIT (WM_APP + 9)
 
@@ -334,17 +334,27 @@ static int current_module_is_installed_uninstaller(void) {
 
 static void schedule_self_delete(void) {
     wchar_t self[MAX_PATH];
-    wchar_t command[MAX_PATH * 3];
+    wchar_t system_directory[MAX_PATH];
+    wchar_t cmd_path[MAX_PATH];
+    wchar_t command[MAX_PATH * 4];
     STARTUPINFOW startup;
     PROCESS_INFORMATION process;
     GetModuleFileNameW(NULL, self, MAX_PATH);
-    swprintf(command, MAX_PATH * 3,
-             L"cmd.exe /D /C ping 127.0.0.1 -n 3 >NUL & del /F /Q \"%ls\" & rmdir \"%ls\"",
-             self, g_install_directory);
+    /*
+     * Resolve cmd.exe explicitly. A bare "cmd.exe" is searched starting with
+     * the process directory and the current directory, so an uninstaller
+     * launched from an untrusted folder could run a planted binary.
+     */
+    if (!GetSystemDirectoryW(system_directory, MAX_PATH))
+        wcscpy(system_directory, L"C:\\Windows\\System32");
+    swprintf(cmd_path, MAX_PATH, L"%ls\\cmd.exe", system_directory);
+    swprintf(command, MAX_PATH * 4,
+             L"\"%ls\" /D /C ping 127.0.0.1 -n 3 >NUL & del /F /Q \"%ls\" & rmdir \"%ls\"",
+             cmd_path, self, g_install_directory);
     ZeroMemory(&startup, sizeof(startup));
     startup.cb = sizeof(startup);
     ZeroMemory(&process, sizeof(process));
-    if (CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
+    if (CreateProcessW(cmd_path, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL,
                        &startup, &process)) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);

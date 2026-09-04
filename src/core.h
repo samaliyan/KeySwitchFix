@@ -89,6 +89,8 @@ typedef enum KS_EVALUATION_PHASE {
 
 int ks_bloom_init(KS_BLOOM *bloom, const unsigned char *data, size_t size);
 int ks_bloom_contains(const KS_BLOOM *bloom, const wchar_t *value);
+wchar_t ks_canonical_persian(wchar_t character);
+int ks_is_persian_diacritic(wchar_t character);
 int ks_is_word_scancode(uint32_t scan_code);
 int ks_map_scancode(uint32_t scan_code, int shift_down, int caps_lock, KS_TOKEN *token);
 void ks_tokens_to_english(const KS_TOKEN *tokens, int count, wchar_t *output);

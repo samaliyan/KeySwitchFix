@@ -627,6 +627,152 @@ int main(void) {
                             &decision) == KS_LIVE_NONE,
           "smart scoring keeps completed behsazi in Persian");
 
+    /*
+     * Genuine English two-key tokens whose physical keys also spell a listed
+     * Persian word must be collisions, never one-sided Persian evidence.
+     * Before 2.8 "user id " became "user هی ".
+     */
+    {
+        static const struct {
+            const char *keys;
+            const wchar_t *persian;
+        } english_token_suite[] = {
+            {"id", L"هی"}, {"ms", L"پس"}, {"pr", L"حق"}
+        };
+        for (suite_index = 0;
+             suite_index < sizeof(english_token_suite) /
+                           sizeof(english_token_suite[0]);
+             ++suite_index) {
+            CHECK(make_ascii_tokens(english_token_suite[suite_index].keys,
+                                    tokens) == 2,
+                  "English two-key token maps");
+            CHECK(ks_classify_word(tokens, 2, &lexicons,
+                                   &english_known, &persian_known,
+                                   NULL, NULL) &&
+                      english_known && persian_known,
+                  "English two-key token is a collision on both sides");
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
+                                         KS_LANG_OTHER, 0, 0,
+                                         KS_PHASE_BOUNDARY, &lexicons,
+                                         &decision) == KS_LIVE_NONE,
+                  "English two-key token survives Space without context");
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
+                                         KS_LANG_ENGLISH, 3, 0,
+                                         KS_PHASE_IDLE, &lexicons,
+                                         &decision) == KS_LIVE_NONE,
+                  "English two-key token survives a pause in English text");
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
+                                         KS_LANG_PERSIAN, 3, 0,
+                                         KS_PHASE_IDLE, &lexicons,
+                                         &decision) == KS_LIVE_CORRECT_NOW &&
+                      wcscmp(decision.replacement,
+                             english_token_suite[suite_index].persian) == 0,
+                  "Persian context still resolves the collision to Persian");
+        }
+    }
+
+    /*
+     * ZWNJ halves: Shift+Space splits می‌خواهم into می and خواهم. The first
+     * half has to be a known Persian word on its own or "ld خواهم" is
+     * never repaired. None of these key sequences spells English.
+     */
+    {
+        static const struct {
+            const char *keys;
+            const wchar_t *expected;
+        } zwnj_half_suite[] = {
+            {"ld", L"می"}, {"ih", L"ها"}, {"jv", L"تر"},
+            {"hl", L"ام"}, {"hj", L"ات"}
+        };
+        for (suite_index = 0;
+             suite_index < sizeof(zwnj_half_suite) /
+                           sizeof(zwnj_half_suite[0]);
+             ++suite_index) {
+            CHECK(make_ascii_tokens(zwnj_half_suite[suite_index].keys,
+                                    tokens) == 2,
+                  "ZWNJ half maps to physical keys");
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
+                                         KS_LANG_OTHER, 0, 1,
+                                         KS_PHASE_BOUNDARY, &lexicons,
+                                         &decision) == KS_LIVE_CORRECT_NOW &&
+                      wcscmp(decision.replacement,
+                             zwnj_half_suite[suite_index].expected) == 0,
+                  "ZWNJ half is corrected to Persian at Shift+Space");
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_PERSIAN, 1,
+                                         KS_LANG_OTHER, 0, 1,
+                                         KS_PHASE_BOUNDARY, &lexicons,
+                                         &decision) == KS_LIVE_NONE,
+                  "correctly typed ZWNJ half is left alone");
+        }
+        sequence[0].count = make_ascii_tokens("ld", sequence_tokens[0]);
+        sequence[1].count = make_ascii_tokens("o,hil", sequence_tokens[1]);
+        CHECK(ks_evaluate_sequence(sequence, 2, 1, KS_LANG_OTHER, 0,
+                                   &lexicons, &sequence_result) &&
+                  sequence_result.language == KS_LANG_PERSIAN,
+              "mi-khaham resolves as a coherent Persian phrase");
+    }
+
+    CHECK(ks_canonical_persian(0x064A) == 0x06CC &&
+          ks_canonical_persian(0x0649) == 0x06CC &&
+          ks_canonical_persian(0x0643) == 0x06A9 &&
+          ks_canonical_persian(L'س') == L'س' &&
+          ks_canonical_persian(L'k') == L'k',
+          "Arabic yeh and kaf normalize to their Persian code points");
+    CHECK(ks_is_persian_diacritic(0x0651) && ks_is_persian_diacritic(0x064E) &&
+          ks_is_persian_diacritic(0x064B) && ks_is_persian_diacritic(0x0670) &&
+          !ks_is_persian_diacritic(0x06DD) && !ks_is_persian_diacritic(L'ی') &&
+          !ks_is_persian_diacritic(L'a'),
+          "diacritic detection covers Arabic-script combining marks only");
+    {
+        /* حتماً and مدرّس: correct Persian typed with a tanwin/shadda must stay
+           Persian-known, or the English candidate would win by default. */
+        CHECK(make_ascii_tokens("pjlh", tokens) == 4, "hatman keys map");
+        tokens[4].english = L'R';      /* Shift+R is fathatan on the Persian layout */
+        tokens[4].persian = 0x064B;
+        CHECK(ks_classify_word(tokens, 5, &lexicons,
+                               &english_known, &persian_known, NULL, NULL) &&
+                  persian_known && !english_known,
+              "hatman with tanwin is recognized as Persian");
+        CHECK(ks_evaluate_contextual(tokens, 5, KS_LANG_PERSIAN, 1,
+                                     KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+                                     &lexicons, &decision) == KS_LIVE_NONE,
+              "hatman with tanwin is never rewritten");
+        CHECK(make_ascii_tokens("lnvs", tokens) == 4, "modarres keys map");
+        tokens[4] = tokens[3];
+        tokens[3].english = L'I';      /* Shift+I is shadda on the Persian layout */
+        tokens[3].persian = 0x0651;
+        CHECK(ks_classify_word(tokens, 5, &lexicons,
+                               &english_known, &persian_known, NULL, NULL) &&
+                  persian_known,
+              "modarres with shadda is recognized as Persian");
+        /* The reverse direction still works: a capitalized English word
+           mistyped on the Persian layout produces a diacritic token. */
+        CHECK(make_ascii_tokens("xcel", tokens + 1) == 4, "Excel keys map");
+        tokens[0].english = L'E';
+        tokens[0].persian = 0x064D;    /* Shift+E is kasratan */
+        CHECK(ks_evaluate_contextual(tokens, 5, KS_LANG_PERSIAN, 1,
+                                     KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+                                     &lexicons, &decision) == KS_LIVE_CORRECT_NOW &&
+                  wcscmp(decision.replacement, L"Excel") == 0,
+              "capitalized Excel mistyped on the Persian layout is corrected");
+    }
+    {
+        wchar_t legacy[KS_MAX_WORD + 1];
+        int index;
+        CHECK(make_ascii_tokens("mdnh", tokens) == 4, "legacy peyda keys map");
+        /* Simulate a layout that emits Arabic yeh, then canonicalize. */
+        tokens[1].persian = 0x064A;
+        ks_tokens_to_persian(tokens, 4, legacy);
+        CHECK(!ks_bloom_contains(&fa, legacy),
+              "Arabic-yeh spelling is unknown to the normalized dictionary");
+        for (index = 0; index < 4; ++index)
+            tokens[index].persian = ks_canonical_persian(tokens[index].persian);
+        CHECK(ks_evaluate_contextual(tokens, 4, KS_LANG_PERSIAN, 1,
+                                     KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+                                     &lexicons, &decision) == KS_LIVE_NONE,
+              "canonicalized legacy Persian peyda is not rewritten");
+    }
+
     CHECK(ks_idle_delay_ms(1, 100) == 450, "balanced fast-typing delay is clamped");
     CHECK(ks_idle_delay_ms(1, 250) == 750, "balanced delay adapts to typing speed");
     CHECK(ks_idle_delay_ms(1, 400) == 900, "balanced slow-typing delay is capped");

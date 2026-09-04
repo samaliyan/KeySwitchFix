@@ -8,7 +8,8 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
 2. The foreground thread's keyboard layout is classified as English, Persian, or unsupported.
 3. Physical scan codes are translated through the actual installed/last-used
    Windows English and Persian layouts. The static core table is only a safe
-   fallback, so both Persian layout variants are supported.
+   fallback, so both Persian layout variants are supported. Layouts are never
+   loaded on the user's behalf; a missing layout is reported in diagnostics.
 4. The current word is checked against compact offline base, common-word, and
    proper-prefix Bloom dictionaries; exact lists cover common two-key words. A controlled
    initial `ا` → `آ` canonical lookup recognizes common unshifted Persian
@@ -34,6 +35,17 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
 10. The exact original and replacement are retained for 15 seconds. One plain
     Backspace restores the original word or phrase; the registered
     `Ctrl + Win + Backspace` hotkey is a fallback.
+11. Shift+Space is a word boundary like Space, but it is remembered as a
+    zero-width non-joiner. A correction replays the exact ZWNJ when the target
+    text is Persian, and phrase repair reproduces each recorded separator.
+12. Runtime Persian tokens are canonicalized (`ي`→`ی`, `ك`→`ک`), and the
+    core strips Arabic combining marks before every dictionary lookup, so
+    `حتماً` and `مدرّس` stay Persian-known while the exact keys the user
+    typed are preserved for the replacement text.
+13. A watchdog timer compares `GetLastInputInfo` with the last event the hooks
+    delivered and reinstalls both hooks when Windows detached them. It re-arms
+    once per quiet episode so that input to elevated windows, which UIPI hides
+    from a non-elevated hook, does not cause churn.
 
 The application ignores its own injected input, rejects Space/digits as word
 tokens before runtime `ToUnicodeEx` mapping, clears phrase history whenever
