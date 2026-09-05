@@ -75,6 +75,28 @@ def main() -> None:
         "short Persian word list differs between core.c and generate_blooms.py"
     )
 
+    for path in ("resources/en-rank.bin", "resources/fa-rank.bin",
+                 "tests/fixtures/rank-fixture-en.bin", "tests/fixtures/rank-fixture-fa.bin"):
+        full = ROOT / path
+        if not full.exists():
+            assert path.startswith("resources/"), f"{path}: fixture missing"
+            print(f"note: {path} not generated yet (needs wordfreq); build-native.sh creates it")
+            continue
+        data = full.read_bytes()
+        magic, version, slot_count, word_count = struct.unpack("<4sIII", data[:16])
+        assert magic == b"KSRT" and version == 1, f"{path}: invalid rank table header"
+        assert slot_count & (slot_count - 1) == 0 and 256 <= slot_count <= 1 << 24, (
+            f"{path}: slot count must be a power of two"
+        )
+        assert 0 < word_count <= slot_count, f"{path}: invalid word count"
+        assert len(data) == 16 + slot_count * 4, f"{path}: invalid rank table size"
+        if path.startswith("resources/"):
+            assert word_count >= 16384, f"{path}: too few words for daily vocabulary"
+    require("src/app.c", "try_spelling_correction(")
+    require("src/app.c", "ks_ignore_list_add(&g_spelling_ignore")
+    require("src/spell.c", "int ks_spell_correct(")
+    require("resources/app.rc", 'IDR_EN_RANK_TABLE RCDATA "en-rank.bin"')
+
     app = read("src/app.c")
     assert not re.search(r"\bF12\b|VK_F12|self-test", app, re.IGNORECASE), (
         "src/app.c: obsolete shortcut or self-test UI returned"

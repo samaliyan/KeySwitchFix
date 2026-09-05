@@ -7,6 +7,7 @@
 #include <wchar.h>
 
 #include "core.h"
+#include "spell.h"
 #include "../resources/resource.h"
 
 #ifndef MOD_NOREPEAT
@@ -14,7 +15,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"2.8.0"
+#define APP_VERSION L"2.9.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -48,11 +49,14 @@
 #define IDC_LANGUAGE_MODE 104
 #define IDC_SAVE 105
 #define IDC_HIDE 106
+#define IDC_SPELLING 107
+#define IDC_PERSONAL_DICTIONARY 108
+#define IDC_TILE_VALUE 120      /* 120..122 */
+#define IDC_TILE_CAPTION 130    /* 130..132 */
 #define IDC_STATUS_LABEL 110
 #define IDC_LAYOUT_LABEL 111
 #define IDC_HOOK_LABEL 112
 #define IDC_ACTIVITY_LABEL 113
-#define IDC_COUNTS_LABEL 114
 
 #define IDM_OPEN 200
 #define IDM_TOGGLE 201
@@ -61,6 +65,7 @@
 #define IDM_LANGUAGE_PERSIAN 205
 #define IDM_LANGUAGE_ENGLISH 206
 #define IDM_EXCLUDE_CURRENT 207
+#define IDM_SPELLING 208
 
 #define INPUT_MARKER ((ULONG_PTR)0x4B534632u)
 #define KS_MAX_PHRASE_CHARS KS_MAX_SEQUENCE_CHARS
@@ -70,6 +75,13 @@ typedef struct SETTINGS {
     int sensitivity;
     int language_mode;
     int start_with_windows;
+    /* KS_SPELL_OFF .. KS_SPELL_AGGRESSIVE; the level restored by the tray
+       toggle when spelling is switched back on. */
+    int spelling;
+    int spelling_last_level;
+    /* Opt-in: words whose correction the user undoes are saved to a personal
+       dictionary file and never corrected again. */
+    int personal_dictionary;
     wchar_t excluded[512];
 } SETTINGS;
 
@@ -79,6 +91,8 @@ typedef struct UNDO_RECORD {
     KS_LANGUAGE source_language;
     UINT delimiter;
     int delimiter_zwnj;
+    /* 1 when this was a spelling fix; undoing it teaches the ignore list. */
+    int spelling;
     ULONGLONG created_at;
     wchar_t original[KS_MAX_PHRASE_CHARS + 1];
     wchar_t replacement[KS_MAX_PHRASE_CHARS + 1];
@@ -98,10 +112,10 @@ static HWND g_status_label;
 static HWND g_layout_label;
 static HWND g_hook_label;
 static HWND g_activity_label;
-static HWND g_counts_label;
 static HWND g_enable_button;
 static HWND g_sensitivity;
 static HWND g_language_mode;
+static HWND g_spelling;
 static HWND g_startup;
 static HWND g_excluded;
 static HHOOK g_keyboard_hook;
@@ -111,6 +125,8 @@ static HFONT g_font_regular;
 static HFONT g_font_medium;
 static HFONT g_font_title;
 static HFONT g_font_status;
+static HFONT g_font_tile;
+static HFONT g_font_small;
 static HBRUSH g_brush_white;
 static HBRUSH g_brush_background;
 static SETTINGS g_settings;
@@ -144,6 +160,15 @@ static KS_BLOOM g_persian_prefix_bloom;
 static KS_BLOOM g_english_common_prefix_bloom;
 static KS_BLOOM g_persian_common_prefix_bloom;
 static KS_LEXICONS g_lexicons;
+static KS_RANK_TABLE g_english_rank_table;
+static KS_RANK_TABLE g_persian_rank_table;
+static KS_SPELL_LEXICON g_english_spelling;
+static KS_SPELL_LEXICON g_persian_spelling;
+static KS_IGNORE_LIST g_spelling_ignore;
+static KS_VOCAB g_session_vocabulary;
+static KS_VOCAB g_personal_vocabulary;
+static wchar_t g_personal_dictionary_path[MAX_PATH];
+static int g_spelling_available;
 static KS_TOKEN g_word[KS_MAX_WORD];
 static int g_word_count;
 static int g_overflow_count;
@@ -173,6 +198,7 @@ static UNDO_RECORD g_undo;
 static volatile LONG g_keys_seen;
 static volatile LONG g_words_checked;
 static volatile LONG g_corrections;
+static volatile LONG g_spelling_fixes;
 static wchar_t g_last_activity[256] = L"Waiting for keyboard input...";
 
 static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
@@ -216,6 +242,20 @@ static int load_bloom_resource(int identifier, KS_BLOOM *bloom) {
     return data && ks_bloom_init(bloom, data, (size_t)size);
 }
 
+static int load_rank_resource(int identifier, KS_RANK_TABLE *table) {
+    HRSRC resource = FindResourceW(g_instance, MAKEINTRESOURCEW(identifier), RT_RCDATA);
+    HGLOBAL loaded;
+    const unsigned char *data;
+    DWORD size;
+    memset(table, 0, sizeof(*table));
+    if (!resource) return 0;
+    size = SizeofResource(g_instance, resource);
+    loaded = LoadResource(g_instance, resource);
+    if (!loaded) return 0;
+    data = (const unsigned char *)LockResource(loaded);
+    return data && ks_rank_table_init(table, data, (size_t)size);
+}
+
 static void build_paths(void) {
     DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", g_data_directory,
                                             (DWORD)(sizeof(g_data_directory) / sizeof(wchar_t)));
@@ -228,6 +268,9 @@ static void build_paths(void) {
     CreateDirectoryW(g_data_directory, NULL);
     swprintf(g_settings_path, sizeof(g_settings_path) / sizeof(g_settings_path[0]),
              L"%ls\\settings.ini", g_data_directory);
+    swprintf(g_personal_dictionary_path,
+             sizeof(g_personal_dictionary_path) / sizeof(g_personal_dictionary_path[0]),
+             L"%ls\\personal-dictionary.txt", g_data_directory);
 }
 
 static void load_settings(void) {
@@ -241,6 +284,16 @@ static void load_settings(void) {
     g_settings.language_mode = GetPrivateProfileIntW(L"General", L"LanguageMode", 0, g_settings_path);
     if (g_settings.language_mode < 0 || g_settings.language_mode > 2) g_settings.language_mode = 0;
     g_settings.start_with_windows = GetPrivateProfileIntW(L"General", L"StartWithWindows", 1, g_settings_path);
+    g_settings.spelling = GetPrivateProfileIntW(L"Spelling", L"Level", KS_SPELL_BALANCED, g_settings_path);
+    if (g_settings.spelling < KS_SPELL_OFF || g_settings.spelling > KS_SPELL_AGGRESSIVE)
+        g_settings.spelling = KS_SPELL_BALANCED;
+    g_settings.spelling_last_level = GetPrivateProfileIntW(L"Spelling", L"LastLevel", KS_SPELL_BALANCED, g_settings_path);
+    if (g_settings.spelling_last_level < KS_SPELL_CONSERVATIVE ||
+        g_settings.spelling_last_level > KS_SPELL_AGGRESSIVE)
+        g_settings.spelling_last_level = KS_SPELL_BALANCED;
+    if (g_settings.spelling) g_settings.spelling_last_level = g_settings.spelling;
+    g_settings.personal_dictionary =
+        GetPrivateProfileIntW(L"Spelling", L"PersonalDictionary", 0, g_settings_path) != 0;
     GetPrivateProfileStringW(L"General", L"ExcludedProcesses",
                              L"1Password.exe,Bitwarden.exe,CredentialUIBroker.exe,KeePass.exe,KeePassXC.exe,LastPass.exe,LockApp.exe",
                              g_settings.excluded,
@@ -276,6 +329,12 @@ static void save_settings(void) {
     swprintf(number, 16, L"%d", g_settings.start_with_windows);
     WritePrivateProfileStringW(L"General", L"StartWithWindows", number, g_settings_path);
     WritePrivateProfileStringW(L"General", L"ExcludedProcesses", g_settings.excluded, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.spelling);
+    WritePrivateProfileStringW(L"Spelling", L"Level", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.spelling_last_level);
+    WritePrivateProfileStringW(L"Spelling", L"LastLevel", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.personal_dictionary);
+    WritePrivateProfileStringW(L"Spelling", L"PersonalDictionary", number, g_settings_path);
     update_startup_registry();
 }
 
@@ -1016,6 +1075,251 @@ static int try_sequence_correction(HWND foreground,
     return 0;
 }
 
+/*
+ * Personal dictionary: one word per line, UTF-8. Loaded only when the user
+ * has opted in; every word is trusted (never corrected). Written only when a
+ * spelling fix is undone while the option is on.
+ */
+static int personal_dictionary_lines;
+
+static void save_personal_dictionary(void) {
+    HANDLE file;
+    int i;
+    file = CreateFileW(g_personal_dictionary_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    for (i = 0; i < g_personal_vocabulary.count; ++i) {
+        char utf8[KS_MAX_WORD * 4 + 4];
+        DWORD written = 0;
+        int length = WideCharToMultiByte(CP_UTF8, 0, g_personal_vocabulary.entries[i].text, -1,
+                                         utf8, (int)sizeof(utf8) - 3, NULL, NULL);
+        if (length <= 1) continue;
+        utf8[length - 1] = '\r';
+        utf8[length] = '\n';
+        WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL);
+    }
+    CloseHandle(file);
+    personal_dictionary_lines = g_personal_vocabulary.count;
+}
+
+static void load_personal_dictionary(void) {
+    HANDLE file;
+    DWORD size;
+    DWORD read = 0;
+    char *bytes;
+    wchar_t *text = NULL;
+    int characters = 0;
+    wchar_t *cursor;
+    int lines = 0;
+    int utf16 = 0;
+
+    ks_vocab_reset(&g_personal_vocabulary);
+    personal_dictionary_lines = 0;
+    if (!g_settings.personal_dictionary) return;
+    file = CreateFileW(g_personal_dictionary_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;      /* no dictionary yet */
+    size = GetFileSize(file, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0) {
+        CloseHandle(file);
+        return;
+    }
+    if (size > 4u * 1024u * 1024u) {
+        CloseHandle(file);
+        set_activity(L"personal-dictionary.txt is larger than 4 MB and was not loaded.");
+        return;
+    }
+    bytes = (char *)HeapAlloc(GetProcessHeap(), 0, size + 2);
+    if (!bytes) {
+        CloseHandle(file);
+        return;
+    }
+    if (!ReadFile(file, bytes, size, &read, NULL)) read = 0;
+    CloseHandle(file);
+    bytes[read] = 0;
+    bytes[read + 1] = 0;
+
+    /* Notepad may have saved the file as UTF-16 LE; honour its BOM. */
+    utf16 = read >= 2 && (unsigned char)bytes[0] == 0xFF && (unsigned char)bytes[1] == 0xFE;
+    if (utf16) {
+        characters = (int)((read - 2) / sizeof(wchar_t));
+        text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, ((size_t)characters + 1) * sizeof(wchar_t));
+        if (text) {
+            memcpy(text, bytes + 2, (size_t)characters * sizeof(wchar_t));
+            text[characters] = 0;
+        }
+    } else {
+        characters = MultiByteToWideChar(CP_UTF8, 0, bytes, (int)read, NULL, 0);
+        if (characters > 0)
+            text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, ((size_t)characters + 1) * sizeof(wchar_t));
+        if (text) {
+            MultiByteToWideChar(CP_UTF8, 0, bytes, (int)read, text, characters);
+            text[characters] = 0;
+        }
+    }
+    if (text) {
+        cursor = text;
+        if (*cursor == 0xFEFF) ++cursor;
+        while (*cursor) {
+            wchar_t *end = cursor;
+            wchar_t *start;
+            while (*end && *end != L'\n' && *end != L'\r') ++end;
+            /* Trim spaces and tabs on both sides. */
+            start = cursor;
+            while (start < end && (*start == L' ' || *start == L'\t')) ++start;
+            while (end > start && (end[-1] == L' ' || end[-1] == L'\t')) --end;
+            if (end > start && (size_t)(end - start) <= KS_MAX_WORD && *start != 0xFFFD) {
+                wchar_t word[KS_MAX_WORD + 1];
+                memcpy(word, start, (size_t)(end - start) * sizeof(wchar_t));
+                word[end - start] = 0;
+                ks_vocab_trust(&g_personal_vocabulary, word);   /* deduplicates */
+                ++lines;
+            }
+            while (*end == L'\n' || *end == L'\r') ++end;
+            cursor = end;
+        }
+        HeapFree(GetProcessHeap(), 0, text);
+    }
+    HeapFree(GetProcessHeap(), 0, bytes);
+    personal_dictionary_lines = lines;
+    /* Rewrite a file that has duplicates, whitespace, UTF-16, or more lines
+       than the ring keeps, so it never grows without bound. */
+    if (utf16 || lines != g_personal_vocabulary.count || lines > KS_VOCAB_CAPACITY)
+        save_personal_dictionary();
+}
+
+static void append_personal_dictionary(const wchar_t *word) {
+    HANDLE file;
+    char utf8[KS_MAX_WORD * 4 + 4];
+    int length;
+    DWORD written = 0;
+
+    if (!g_settings.personal_dictionary || !word || !*word) return;
+    if (ks_vocab_trusted(&g_personal_vocabulary, word)) return;
+    ks_vocab_trust(&g_personal_vocabulary, word);
+    if (personal_dictionary_lines >= KS_VOCAB_CAPACITY) {
+        /* The ring has recycled its oldest entry; compact the file to match. */
+        save_personal_dictionary();
+        return;
+    }
+    length = WideCharToMultiByte(CP_UTF8, 0, word, -1, utf8, (int)sizeof(utf8) - 3, NULL, NULL);
+    if (length <= 1) return;
+    utf8[length - 1] = '\r';
+    utf8[length] = '\n';
+    file = CreateFileW(g_personal_dictionary_path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        set_activity(L"The personal dictionary could not be written.");
+        return;
+    }
+    WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL);
+    CloseHandle(file);
+    ++personal_dictionary_lines;
+}
+
+/*
+ * Spelling correction runs only after the layout logic has declined: the word
+ * is unknown in the active language AND its other-layout reading is unknown
+ * too, so it is neither a layout mistake nor a collision. It fires at a word
+ * boundary only, on lowercase English or letter-only Persian, and one plain
+ * Backspace restores the typed spelling and remembers it for the session.
+ */
+/*
+ * Code editors and terminals are full of identifiers that sit one edit away
+ * from a frequent word (bool/book, endl/end, async/sync). Layout repair stays
+ * active there, but spelling correction is skipped below Aggressive. The
+ * user-editable "Excluded apps" list still disables everything.
+ */
+static int spelling_skipped_process(HWND foreground) {
+    static const wchar_t *const developer_tools[] = {
+        L"WindowsTerminal.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+        L"conhost.exe", L"OpenConsole.exe", L"mintty.exe", L"alacritty.exe",
+        L"wezterm-gui.exe", L"putty.exe", L"Code.exe", L"Code - Insiders.exe",
+        L"Cursor.exe", L"windsurf.exe", L"devenv.exe", L"idea64.exe",
+        L"pycharm64.exe", L"webstorm64.exe", L"phpstorm64.exe", L"rider64.exe",
+        L"clion64.exe", L"goland64.exe", L"datagrip64.exe", L"studio64.exe",
+        L"sublime_text.exe", L"notepad++.exe", L"atom.exe", L"ssms.exe",
+        L"sqldeveloper64W.exe", L"dbeaver.exe", L"HeidiSQL.exe",
+        L"git-bash.exe", L"bash.exe", L"wsl.exe", L"ubuntu.exe"
+    };
+    wchar_t name[MAX_PATH];
+    size_t i;
+    /* Queried fresh: g_last_typed_process is only refreshed when a query
+       succeeds at word start and may describe an earlier application. */
+    if (!query_process_basename(foreground, name, MAX_PATH)) return 0;
+    for (i = 0; i < sizeof(developer_tools) / sizeof(developer_tools[0]); ++i) {
+        if (_wcsicmp(name, developer_tools[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+#define SPELL_NOT_CONSULTED 0   /* off, unavailable, or not a candidate word */
+#define SPELL_APPLIED 1
+#define SPELL_DECLINED 2        /* the model looked and found nothing safe */
+#define SPELL_SUPPRESSED 3      /* a fix existed but the context forbids it */
+
+static int try_spelling_correction(HWND foreground, UINT delimiter, int delimiter_zwnj) {
+    wchar_t typed[KS_MAX_WORD + 1];
+    KS_SPELL_RESULT result;
+    KS_DECISION decision;
+    const KS_SPELL_LEXICON *lexicon;
+
+    if (!g_spelling_available || g_settings.spelling == KS_SPELL_OFF) return SPELL_NOT_CONSULTED;
+    if (!foreground || g_word_count < 3 || g_word_count > KS_MAX_WORD) return SPELL_NOT_CONSULTED;
+    if (g_word_language != KS_LANG_ENGLISH && g_word_language != KS_LANG_PERSIAN) return SPELL_NOT_CONSULTED;
+    lexicon = g_word_language == KS_LANG_PERSIAN ? &g_persian_spelling : &g_english_spelling;
+    tokens_to_language(g_word, g_word_count, g_word_language, typed);
+    if (!ks_spell_correct(typed, g_settings.spelling, lexicon, &g_spelling_ignore, &result) ||
+        !result.should_correct)
+        return SPELL_DECLINED;
+    /* The process and password-field queries cost system calls; they run
+       only once a correction is actually about to be applied. */
+    if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground))
+        return SPELL_SUPPRESSED;
+    if (is_protected_field(foreground)) {
+        set_activity(L"Correction skipped in a protected password field.");
+        return SPELL_SUPPRESSED;
+    }
+    memset(&decision, 0, sizeof(decision));
+    decision.should_correct = 1;
+    decision.key_count = g_word_count;
+    decision.confidence = result.confidence;
+    decision.source_language = g_word_language;
+    decision.target_language = g_word_language;
+    safe_copy(decision.original, KS_MAX_WORD + 1, result.original);
+    safe_copy(decision.replacement, KS_MAX_WORD + 1, result.replacement);
+    if (!send_replacement(foreground, g_word_count, decision.replacement,
+                          delimiter, delimiter_zwnj, g_word_language))
+        return 0;
+    store_undo(foreground, &decision, delimiter, delimiter_zwnj);
+    g_undo.spelling = 1;
+    mark_sentence_word(foreground);
+    remember_intent(foreground, g_word_language, 2);
+    InterlockedIncrement(&g_spelling_fixes);
+    set_activity_pair(result.kind == KS_SPELL_KIND_ZWNJ ? L"Half-space"
+                      : result.kind == KS_SPELL_KIND_SPLIT ? L"Missing space"
+                      : L"Spelling",
+                      decision.original, decision.replacement);
+    /* The physical tokens no longer describe the text on screen, so the
+       sentence model cannot safely rewrite this word again. */
+    clear_history();
+    return SPELL_APPLIED;
+}
+
+/*
+ * The learned vocabulary is trained only from words the model actually
+ * examined and left alone, in a context where it would have corrected them:
+ * never from developer tools, password fields, or when spelling is off.
+ */
+static void observe_vocabulary(HWND foreground) {
+    wchar_t typed[KS_MAX_WORD + 1];
+    if (g_word_count < 3 || g_word_count > KS_MAX_WORD) return;
+    if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground)) return;
+    if (is_protected_field(foreground)) return;
+    tokens_to_language(g_word, g_word_count, g_word_language, typed);
+    ks_vocab_observe(&g_session_vocabulary, typed);
+}
+
 static void try_smart_correction(void) {
     HWND foreground;
     KS_LANGUAGE language;
@@ -1064,6 +1368,19 @@ static int try_undo(int consume_delimiter) {
                          restored_delimiter, g_undo.delimiter_zwnj,
                          g_undo.source_language)) {
         set_activity_pair(L"Restored", g_undo.replacement, g_undo.original);
+        /* The user rejected a spelling fix: that spelling is now theirs.
+           It is written to disk only when the personal dictionary is on. */
+        if (g_undo.spelling) {
+            /* One undo makes the word trusted for this session. It reaches
+               the personal dictionary only when the user has typed or
+               restored it before, so a stray Backspace cannot teach a typo
+               permanently. */
+            int seen_before = ks_vocab_observe(&g_session_vocabulary, g_undo.original) >= 2;
+            ks_ignore_list_add(&g_spelling_ignore, g_undo.original);
+            ks_vocab_trust(&g_session_vocabulary, g_undo.original);
+            if (seen_before) append_personal_dictionary(g_undo.original);
+            if (g_spelling_fixes > 0) InterlockedDecrement(&g_spelling_fixes);
+        }
         clear_intent();
         remember_intent(foreground, g_undo.source_language, 4);
         mark_sentence_word(foreground);
@@ -1308,9 +1625,44 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
                 g_word_language == KS_LANG_ENGLISH
                     ? english_frequent : persian_frequent;
             int ambiguous = english_known && persian_known;
+            int target_known =
+                g_word_language == KS_LANG_ENGLISH ? persian_known : english_known;
+            int consult_spelling = 0;
             if (active_known) {
                 remember_intent(foreground, g_word_language,
                                 ambiguous ? 1 : active_frequent ? 3 : 2);
+            }
+            /*
+             * When is the spelling model consulted?
+             *  - the word is unknown in both layouts: a misspelling or the
+             *    user's own word;
+             *  - Persian, known, unambiguous: the base dictionary stores
+             *    ZWNJ-free spellings, so میپرسیدند is "known" although the
+             *    standard form is می‌پرسیدند; only the joiner is restored;
+             *  - English, "known" only through the raw corpus tier (alot,
+             *    thankyou): the layout logic rightly trusts that tier, the
+             *    spelling lexicon deliberately does not.
+             */
+            if (!target_known) {
+                if (!active_known) consult_spelling = 1;
+                else if (g_word_language == KS_LANG_PERSIAN && !ambiguous) consult_spelling = 1;
+                else if (g_word_language == KS_LANG_ENGLISH && g_spelling_available &&
+                         g_word_count >= 3) {
+                    wchar_t typed[KS_MAX_WORD + 1];
+                    tokens_to_language(g_word, g_word_count, g_word_language, typed);
+                    if (!ks_spell_known(typed, &g_english_spelling)) consult_spelling = 1;
+                }
+            }
+            if (consult_spelling) {
+                int outcome = try_spelling_correction(foreground, boundary_key, zwnj);
+                if (outcome == SPELL_APPLIED) {
+                    g_suppressed_vk = data->vkCode;
+                    g_suppressed_at = GetTickCount();
+                    if (terminates_sentence) start_new_sentence(foreground);
+                    clear_word();
+                    return 1;
+                }
+                if (outcome == SPELL_DECLINED && !active_known) observe_vocabulary(foreground);
             }
         }
         if (!g_skip_word && !g_overflow_count && g_word_count > 0) {
@@ -1466,6 +1818,10 @@ static void show_tray_menu(void) {
                 MF_STRING | (g_settings.language_mode == 2 ? MF_CHECKED : 0),
                 IDM_LANGUAGE_ENGLISH, L"Prefer English for collisions");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)language_menu, L"Writing language");
+    AppendMenuW(menu, MF_STRING |
+                      (g_settings.spelling != KS_SPELL_OFF ? MF_CHECKED : 0) |
+                      (g_spelling_available ? 0 : MF_GRAYED),
+                IDM_SPELLING, L"Fix spelling mistakes");
     if (g_last_typed_process[0]) {
         wchar_t label[MAX_PATH + 48];
         swprintf(label, sizeof(label) / sizeof(label[0]),
@@ -1495,75 +1851,42 @@ static void show_main_window(void) {
     SetTimer(g_window, ID_TIMER_STATUS, 500, NULL);
 }
 
-static void update_controls_from_settings(void) {
-    SendMessageW(g_sensitivity, CB_SETCURSEL, (WPARAM)g_settings.sensitivity, 0);
-    SendMessageW(g_language_mode, CB_SETCURSEL, (WPARAM)g_settings.language_mode, 0);
-    SendMessageW(g_startup, BM_SETCHECK, g_settings.start_with_windows ? BST_CHECKED : BST_UNCHECKED, 0);
-    SetWindowTextW(g_excluded, g_settings.excluded);
-    InvalidateRect(g_enable_button, NULL, TRUE);
-    update_tray_tip();
-}
+/* ------------------------------------------------------------------------ */
+/* Dashboard                                                                 */
+/*                                                                           */
+/* Geometry is authored at 96 DPI on an 840x748 client area and scaled once  */
+/* at startup. Every label column is wide enough for its longest caption in  */
+/* Segoe UI 16px with room to spare, so nothing is clipped by a neighbour.   */
+/* ------------------------------------------------------------------------ */
 
-static void read_controls_to_settings(void) {
-    LRESULT selection = SendMessageW(g_sensitivity, CB_GETCURSEL, 0, 0);
-    if (selection >= 0 && selection <= 2) g_settings.sensitivity = (int)selection;
-    selection = SendMessageW(g_language_mode, CB_GETCURSEL, 0, 0);
-    if (selection >= 0 && selection <= 2) g_settings.language_mode = (int)selection;
-    g_settings.start_with_windows = SendMessageW(g_startup, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    GetWindowTextW(g_excluded, g_settings.excluded,
-                   (int)(sizeof(g_settings.excluded) / sizeof(wchar_t)));
-}
+#define UI_CLIENT_WIDTH 840
+#define UI_CLIENT_HEIGHT 752
+#define UI_HEADER_HEIGHT 128
+#define UI_MARGIN 32
+#define UI_CARD_LEFT UI_MARGIN
+#define UI_CARD_RIGHT (UI_CLIENT_WIDTH - UI_MARGIN)
+#define UI_LABEL_LEFT 56
+#define UI_CONTROL_LEFT 260
+#define UI_CONTROL_WIDTH 300
+#define UI_SIDE_LEFT 572
+#define UI_SIDE_WIDTH 224
 
-/* SetWindowText repaints even when nothing changed; on a 500 ms timer that
-   shows up as flicker. Only touch a label whose text is actually different. */
-static void set_label_text(HWND label, const wchar_t *text) {
-    wchar_t current[512];
-    if (!label) return;
-    current[0] = 0;
-    GetWindowTextW(label, current, (int)(sizeof(current) / sizeof(current[0])));
-    if (wcscmp(current, text) != 0) SetWindowTextW(label, text);
-}
+static const COLORREF UI_HEADER_TOP = RGB(22, 34, 66);
+static const COLORREF UI_HEADER_BOTTOM = RGB(44, 72, 132);
+static const COLORREF UI_BACKGROUND = RGB(245, 247, 251);
+static const COLORREF UI_CARD_BORDER = RGB(222, 228, 238);
+static const COLORREF UI_TEXT = RGB(40, 51, 74);
+static const COLORREF UI_MUTED = RGB(104, 116, 140);
+static const COLORREF UI_ACCENT = RGB(76, 111, 230);
+static const COLORREF UI_GREEN = RGB(38, 176, 120);
+static const COLORREF UI_GREY = RGB(139, 148, 166);
+static const COLORREF UI_TILE = RGB(240, 244, 251);
 
-static void update_diagnostics_ui(void) {
-    wchar_t buffer[512];
-    wchar_t process_name[MAX_PATH];
-    HWND foreground = GetForegroundWindow();
-    KS_LANGUAGE language;
-    const wchar_t *missing_layout;
+static HBRUSH g_brush_tile;
+static HWND g_tile_values[3];
+static HWND g_tile_captions[3];
+static HWND g_personal_dictionary;
 
-    if (foreground == g_window) foreground = g_word_window;
-    if (!query_process_basename(foreground, process_name, MAX_PATH))
-        safe_copy(process_name, MAX_PATH, L"Unknown app");
-    language = foreground_language(foreground);
-
-    set_label_text(g_status_label, g_settings.enabled ? L"Protection is active" : L"Protection is paused");
-    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"Current context: %ls  •  %ls layout",
-             process_name, language_name(language));
-    set_label_text(g_layout_label, buffer);
-    missing_layout = missing_layout_name();
-    if (missing_layout) {
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"The %ls keyboard layout is not installed in Windows. Add it under Settings > Time & language > Language.",
-                 missing_layout);
-    } else if (g_hook_reinstalls) {
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Keyboard hook: %ls (re-armed %d×)  •  Undo: Backspace  •  Pause: Ctrl + Win + K",
-                 g_keyboard_hook ? L"Running" : L"FAILED", g_hook_reinstalls);
-    } else {
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Keyboard hook: %ls  •  Undo: Backspace (or Ctrl + Win + Backspace)  •  Pause: Ctrl + Win + K",
-                 g_keyboard_hook ? L"Running" : L"FAILED");
-    }
-    set_label_text(g_hook_label, buffer);
-    set_label_text(g_activity_label, g_last_activity);
-    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-             L"Input observed: %ld keys  •  %ld words checked  •  %ld corrections",
-             g_keys_seen, g_words_checked, g_corrections);
-    set_label_text(g_counts_label, buffer);
-    InvalidateRect(g_enable_button, NULL, TRUE);
-}
-
-/* All dashboard geometry is authored at 96 DPI and scaled once at startup. */
 static int scale(int value) {
     return MulDiv(value, g_dpi, 96);
 }
@@ -1582,39 +1905,167 @@ static HWND create_child(const wchar_t *class_name, const wchar_t *text, DWORD s
                            parent, (HMENU)(INT_PTR)identifier, g_instance, NULL);
 }
 
+static void update_controls_from_settings(void) {
+    SendMessageW(g_sensitivity, CB_SETCURSEL, (WPARAM)g_settings.sensitivity, 0);
+    SendMessageW(g_language_mode, CB_SETCURSEL, (WPARAM)g_settings.language_mode, 0);
+    SendMessageW(g_spelling, CB_SETCURSEL, (WPARAM)g_settings.spelling, 0);
+    EnableWindow(g_spelling, g_spelling_available);
+    EnableWindow(g_personal_dictionary, g_spelling_available);
+    SendMessageW(g_personal_dictionary, BM_SETCHECK,
+                 g_settings.personal_dictionary ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_startup, BM_SETCHECK, g_settings.start_with_windows ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowTextW(g_excluded, g_settings.excluded);
+    InvalidateRect(g_enable_button, NULL, TRUE);
+    if (g_window) {
+        /* The header pill shows the active/paused state. */
+        RECT header = {0, 0, scale(UI_CLIENT_WIDTH), scale(UI_HEADER_HEIGHT)};
+        InvalidateRect(g_window, &header, FALSE);
+    }
+    update_tray_tip();
+}
+
+static void read_controls_to_settings(void) {
+    LRESULT selection = SendMessageW(g_sensitivity, CB_GETCURSEL, 0, 0);
+    int personal_before = g_settings.personal_dictionary;
+    if (selection >= 0 && selection <= 2) g_settings.sensitivity = (int)selection;
+    selection = SendMessageW(g_language_mode, CB_GETCURSEL, 0, 0);
+    if (selection >= 0 && selection <= 2) g_settings.language_mode = (int)selection;
+    selection = SendMessageW(g_spelling, CB_GETCURSEL, 0, 0);
+    if (selection >= KS_SPELL_OFF && selection <= KS_SPELL_AGGRESSIVE) {
+        g_settings.spelling = (int)selection;
+        if (g_settings.spelling) g_settings.spelling_last_level = g_settings.spelling;
+    }
+    g_settings.personal_dictionary =
+        SendMessageW(g_personal_dictionary, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (g_settings.personal_dictionary && !personal_before) load_personal_dictionary();
+    if (!g_settings.personal_dictionary) ks_vocab_reset(&g_personal_vocabulary);
+    g_settings.start_with_windows = SendMessageW(g_startup, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    GetWindowTextW(g_excluded, g_settings.excluded,
+                   (int)(sizeof(g_settings.excluded) / sizeof(wchar_t)));
+}
+
+/* SetWindowText repaints even when nothing changed; on a 500 ms timer that
+   shows up as flicker. Only touch a label whose text is actually different. */
+static void set_label_text(HWND label, const wchar_t *text) {
+    wchar_t current[512];
+    if (!label) return;
+    current[0] = 0;
+    GetWindowTextW(label, current, (int)(sizeof(current) / sizeof(current[0])));
+    if (wcscmp(current, text) != 0) SetWindowTextW(label, text);
+}
+
+static void set_tile_value(int index, LONG value) {
+    wchar_t buffer[32];
+    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%ld", value);
+    set_label_text(g_tile_values[index], buffer);
+}
+
+static void update_diagnostics_ui(void) {
+    wchar_t buffer[512];
+    wchar_t process_name[MAX_PATH];
+    HWND foreground = GetForegroundWindow();
+    KS_LANGUAGE language;
+    const wchar_t *missing_layout;
+
+    if (foreground == g_window) foreground = g_word_window;
+    if (!query_process_basename(foreground, process_name, MAX_PATH))
+        safe_copy(process_name, MAX_PATH, L"No application yet");
+    language = foreground_language(foreground);
+
+    set_label_text(g_status_label, g_settings.enabled
+        ? L"Protection is active" : L"Protection is paused");
+    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+             L"Typing in %ls  •  %ls layout%ls",
+             process_name, language_name(language),
+             g_spelling_available ? L"" : L"  •  spelling data missing");
+    set_label_text(g_layout_label, buffer);
+
+    missing_layout = missing_layout_name();
+    if (missing_layout) {
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                 L"The %ls keyboard layout is not installed in Windows. Add it under Settings > Time & language > Language.",
+                 missing_layout);
+    } else if (g_hook_reinstalls) {
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                 L"Keyboard hook: %ls (re-armed %d×)  •  Undo: Backspace  •  Pause: Ctrl + Win + K",
+                 g_keyboard_hook ? L"Running" : L"FAILED", g_hook_reinstalls);
+    } else {
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                 L"Keyboard hook: %ls  •  Undo: Backspace or Ctrl + Win + Backspace  •  Pause: Ctrl + Win + K",
+                 g_keyboard_hook ? L"Running" : L"FAILED");
+    }
+    set_label_text(g_hook_label, buffer);
+    set_label_text(g_activity_label, g_last_activity);
+    set_tile_value(0, g_keys_seen);
+    set_tile_value(1, g_corrections);
+    set_tile_value(2, g_spelling_fixes);
+    InvalidateRect(g_enable_button, NULL, TRUE);
+}
+
+static void create_tile(HWND window, int index, int left, int top, const wchar_t *caption) {
+    g_tile_values[index] = create_child(L"STATIC", L"0", SS_ENDELLIPSIS, 0,
+                                        left + 16, top + 10, 200, 32, window, IDC_TILE_VALUE + index);
+    g_tile_captions[index] = create_child(L"STATIC", caption, SS_ENDELLIPSIS, 0,
+                                          left + 16, top + 44, 200, 20, window,
+                                          IDC_TILE_CAPTION + index);
+}
+
 static void create_ui(HWND window) {
     g_font_regular = create_ui_font(16, FW_NORMAL);
     g_font_medium = create_ui_font(17, FW_SEMIBOLD);
     g_font_title = create_ui_font(30, FW_BOLD);
     g_font_status = create_ui_font(22, FW_SEMIBOLD);
+    g_font_tile = create_ui_font(26, FW_BOLD);
+    g_font_small = create_ui_font(14, FW_NORMAL);
 
-    g_status_label = create_child(L"STATIC", L"", 0, 0, 48, 164, 480, 30, window, IDC_STATUS_LABEL);
-    g_layout_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0, 48, 199, 560, 22, window, IDC_LAYOUT_LABEL);
-    g_enable_button = create_child(L"BUTTON", L"Enable automatic correction", BS_OWNERDRAW, 0,
-                                   584, 164, 126, 42, window, IDC_ENABLE);
+    /* Card 1: status */
+    g_status_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
+                                  UI_LABEL_LEFT, 172, 500, 32, window, IDC_STATUS_LABEL);
+    g_layout_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
+                                  UI_LABEL_LEFT, 210, 560, 22, window, IDC_LAYOUT_LABEL);
+    g_enable_button = create_child(L"BUTTON", L"", BS_OWNERDRAW, 0,
+                                   652, 178, 140, 42, window, IDC_ENABLE);
 
+    /* Card 2: settings */
     g_sensitivity = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
-                                 150, 290, 190, 200, window, IDC_SENSITIVITY);
+                                 UI_CONTROL_LEFT, 322, UI_CONTROL_WIDTH, 200, window, IDC_SENSITIVITY);
     SendMessageW(g_sensitivity, CB_ADDSTRING, 0, (LPARAM)L"Conservative");
     SendMessageW(g_sensitivity, CB_ADDSTRING, 0, (LPARAM)L"Balanced (recommended)");
     SendMessageW(g_sensitivity, CB_ADDSTRING, 0, (LPARAM)L"Sensitive");
     g_startup = create_child(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX, 0,
-                             500, 290, 210, 25, window, IDC_APP_STARTUP);
+                             UI_SIDE_LEFT, 324, UI_SIDE_WIDTH, 26, window, IDC_APP_STARTUP);
+
     g_language_mode = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
-                                   150, 324, 190, 200, window, IDC_LANGUAGE_MODE);
+                                   UI_CONTROL_LEFT, 364, UI_CONTROL_WIDTH, 200, window, IDC_LANGUAGE_MODE);
     SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Auto — sentence context");
-    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Prefer Persian collisions");
-    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Prefer English collisions");
+    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Prefer Persian for collisions");
+    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Prefer English for collisions");
+
+    g_spelling = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
+                              UI_CONTROL_LEFT, 406, UI_CONTROL_WIDTH, 200, window, IDC_SPELLING);
+    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Off");
+    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Conservative");
+    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Balanced (recommended)");
+    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Aggressive");
+    g_personal_dictionary = create_child(L"BUTTON", L"Remember undone words", BS_AUTOCHECKBOX, 0,
+                                         UI_SIDE_LEFT, 408, UI_SIDE_WIDTH, 26, window,
+                                         IDC_PERSONAL_DICTIONARY);
+
     g_excluded = create_child(L"EDIT", L"", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-                              150, 358, 560, 27, window, IDC_EXCLUDED);
+                              UI_CONTROL_LEFT, 448, UI_CARD_RIGHT - UI_CONTROL_LEFT - 24,
+                              28, window, IDC_EXCLUDED);
 
-    g_hook_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0, 48, 444, 664, 22, window, IDC_HOOK_LABEL);
+    /* Card 3: diagnostics */
+    create_tile(window, 0, UI_LABEL_LEFT, 560, L"keys observed");
+    create_tile(window, 1, UI_LABEL_LEFT + 248, 560, L"layout fixes");
+    create_tile(window, 2, UI_LABEL_LEFT + 496, 560, L"spelling fixes");
+    g_hook_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
+                                UI_LABEL_LEFT, 640, 736, 22, window, IDC_HOOK_LABEL);
     g_activity_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
-                                    48, 476, 664, 24, window, IDC_ACTIVITY_LABEL);
-    g_counts_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0, 48, 510, 664, 22, window, IDC_COUNTS_LABEL);
+                                    UI_LABEL_LEFT, 666, 736, 22, window, IDC_ACTIVITY_LABEL);
 
-    create_child(L"BUTTON", L"Save settings", BS_OWNERDRAW, 0, 24, 608, 150, 38, window, IDC_SAVE);
-    create_child(L"BUTTON", L"Hide to tray", BS_OWNERDRAW, 0, 184, 608, 140, 38, window, IDC_HIDE);
+    create_child(L"BUTTON", L"Save settings", BS_OWNERDRAW, 0, UI_MARGIN, 704, 160, 36, window, IDC_SAVE);
+    create_child(L"BUTTON", L"Hide to tray", BS_OWNERDRAW, 0, UI_MARGIN + 172, 704, 150, 36, window, IDC_HIDE);
 
     {
         HWND child = GetWindow(window, GW_CHILD);
@@ -1624,64 +2075,134 @@ static void create_ui(HWND window) {
         }
     }
     SendMessageW(g_status_label, WM_SETFONT, (WPARAM)g_font_status, TRUE);
-    SendMessageW(g_hook_label, WM_SETFONT, (WPARAM)g_font_medium, TRUE);
+    SendMessageW(g_layout_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
+    SendMessageW(g_hook_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
+    SendMessageW(g_activity_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
+    {
+        int i;
+        for (i = 0; i < 3; ++i) {
+            SendMessageW(g_tile_values[i], WM_SETFONT, (WPARAM)g_font_tile, TRUE);
+            SendMessageW(g_tile_captions[i], WM_SETFONT, (WPARAM)g_font_small, TRUE);
+        }
+    }
     g_brush_white = CreateSolidBrush(RGB(255, 255, 255));
-    g_brush_background = CreateSolidBrush(RGB(245, 247, 251));
+    g_brush_background = CreateSolidBrush(UI_BACKGROUND);
+    g_brush_tile = CreateSolidBrush(UI_TILE);
     update_controls_from_settings();
 }
 
-static void draw_card(HDC dc, int left, int top, int right, int bottom) {
-    HBRUSH brush = CreateSolidBrush(RGB(255, 255, 255));
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(225, 230, 239));
+static int is_tile_label(HWND control) {
+    int i;
+    for (i = 0; i < 3; ++i)
+        if (control == g_tile_values[i] || control == g_tile_captions[i]) return 1;
+    return 0;
+}
+
+static void fill_round_rect(HDC dc, int left, int top, int right, int bottom, int radius,
+                            COLORREF fill, COLORREF border) {
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
     HGDIOBJ old_brush = SelectObject(dc, brush);
     HGDIOBJ old_pen = SelectObject(dc, pen);
-    RoundRect(dc, scale(left), scale(top), scale(right), scale(bottom), scale(18), scale(18));
+    RoundRect(dc, scale(left), scale(top), scale(right), scale(bottom), scale(radius), scale(radius));
     SelectObject(dc, old_pen);
     SelectObject(dc, old_brush);
     DeleteObject(pen);
     DeleteObject(brush);
 }
 
+static void draw_card(HDC dc, int left, int top, int right, int bottom) {
+    fill_round_rect(dc, left, top, right, bottom, 18, RGB(255, 255, 255), UI_CARD_BORDER);
+}
+
 static void draw_text(HDC dc, int left, int top, const wchar_t *text) {
     TextOutW(dc, scale(left), scale(top), text, lstrlenW(text));
+}
+
+static void draw_text_right(HDC dc, int right, int top, const wchar_t *text) {
+    SIZE extent;
+    GetTextExtentPoint32W(dc, text, lstrlenW(text), &extent);
+    TextOutW(dc, scale(right) - extent.cx, scale(top), text, lstrlenW(text));
+}
+
+static void draw_header(HDC dc, const RECT *client) {
+    int height = scale(UI_HEADER_HEIGHT);
+    int y;
+    /* Vertical gradient in 4-pixel bands: no msimg32 dependency. */
+    for (y = 0; y < height; y += 4) {
+        RECT band = {0, y, client->right, y + 4 < height ? y + 4 : height};
+        int r = GetRValue(UI_HEADER_TOP) + (GetRValue(UI_HEADER_BOTTOM) - GetRValue(UI_HEADER_TOP)) * y / height;
+        int g = GetGValue(UI_HEADER_TOP) + (GetGValue(UI_HEADER_BOTTOM) - GetGValue(UI_HEADER_TOP)) * y / height;
+        int b = GetBValue(UI_HEADER_TOP) + (GetBValue(UI_HEADER_BOTTOM) - GetBValue(UI_HEADER_TOP)) * y / height;
+        HBRUSH brush = CreateSolidBrush(RGB(r, g, b));
+        FillRect(dc, &band, brush);
+        DeleteObject(brush);
+    }
+    SelectObject(dc, g_font_title);
+    SetTextColor(dc, RGB(255, 255, 255));
+    draw_text(dc, UI_MARGIN, 30, L"KeySwitchFix");
+    SelectObject(dc, g_font_regular);
+    SetTextColor(dc, RGB(196, 208, 236));
+    draw_text(dc, UI_MARGIN + 2, 76, L"Persian ↔ English layout repair and spelling correction");
+    SelectObject(dc, g_font_small);
+    SetTextColor(dc, RGB(160, 176, 214));
+    draw_text_right(dc, UI_CARD_RIGHT, 96, L"v" APP_VERSION L"  •  offline  •  no logging");
+
+    /* Status pill */
+    {
+        const wchar_t *text = g_settings.enabled ? L"Active" : L"Paused";
+        COLORREF dot = g_settings.enabled ? UI_GREEN : UI_GREY;
+        fill_round_rect(dc, UI_CARD_RIGHT - 120, 36, UI_CARD_RIGHT, 68, 16,
+                        RGB(52, 82, 146), RGB(70, 104, 174));
+        {
+            HBRUSH brush = CreateSolidBrush(dot);
+            HPEN pen = CreatePen(PS_SOLID, 1, dot);
+            HGDIOBJ old_brush = SelectObject(dc, brush);
+            HGDIOBJ old_pen = SelectObject(dc, pen);
+            Ellipse(dc, scale(UI_CARD_RIGHT - 104), scale(46), scale(UI_CARD_RIGHT - 92), scale(58));
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
+            DeleteObject(pen);
+            DeleteObject(brush);
+        }
+        SelectObject(dc, g_font_medium);
+        SetTextColor(dc, RGB(255, 255, 255));
+        draw_text(dc, UI_CARD_RIGHT - 82, 41, text);
+    }
 }
 
 static void paint_main_window(HWND window) {
     PAINTSTRUCT paint;
     HDC dc = BeginPaint(window, &paint);
     RECT client;
-    HBRUSH header = CreateSolidBrush(RGB(28, 42, 76));
     HFONT old_font;
     SetBkMode(dc, TRANSPARENT);
     GetClientRect(window, &client);
     FillRect(dc, &client, g_brush_background);
-    {
-        RECT header_rect = {0, 0, client.right, scale(116)};
-        FillRect(dc, &header_rect, header);
-    }
-    DeleteObject(header);
-
     old_font = (HFONT)SelectObject(dc, g_font_title);
-    SetTextColor(dc, RGB(255, 255, 255));
-    draw_text(dc, 28, 25, L"KeySwitchFix");
-    SelectObject(dc, g_font_regular);
-    SetTextColor(dc, RGB(190, 202, 230));
-    draw_text(dc, 30, 70, L"Automatic Persian / English keyboard layout repair");
+    draw_header(dc, &client);
 
-    draw_card(dc, 24, 136, 736, 228);
-    draw_card(dc, 24, 246, 736, 392);
-    draw_card(dc, 24, 410, 736, 560);
+    draw_card(dc, UI_CARD_LEFT, 152, UI_CARD_RIGHT, 252);
+    draw_card(dc, UI_CARD_LEFT, 272, UI_CARD_RIGHT, 500);
+    draw_card(dc, UI_CARD_LEFT, 520, UI_CARD_RIGHT, 692);
+
+    /* Tiles */
+    fill_round_rect(dc, UI_LABEL_LEFT, 560, UI_LABEL_LEFT + 232, 624, 14, UI_TILE, UI_TILE);
+    fill_round_rect(dc, UI_LABEL_LEFT + 248, 560, UI_LABEL_LEFT + 480, 624, 14, UI_TILE, UI_TILE);
+    fill_round_rect(dc, UI_LABEL_LEFT + 496, 560, UI_LABEL_LEFT + 728, 624, 14, UI_TILE, UI_TILE);
 
     SelectObject(dc, g_font_medium);
-    SetTextColor(dc, RGB(48, 59, 82));
-    draw_text(dc, 48, 260, L"Correction settings");
-    draw_text(dc, 48, 424, L"Live diagnostics");
+    SetTextColor(dc, UI_TEXT);
+    draw_text(dc, UI_LABEL_LEFT, 286, L"Correction settings");
+    draw_text(dc, UI_LABEL_LEFT, 534, L"Live diagnostics");
     SelectObject(dc, g_font_regular);
-    SetTextColor(dc, RGB(99, 112, 137));
-    draw_text(dc, 48, 294, L"Sensitivity");
-    draw_text(dc, 48, 328, L"Writing language");
-    draw_text(dc, 48, 362, L"Excluded apps");
-    draw_text(dc, 340, 617, L"No cloud, no logging, no background service");
+    SetTextColor(dc, UI_MUTED);
+    draw_text(dc, UI_LABEL_LEFT, 326, L"Sensitivity");
+    draw_text(dc, UI_LABEL_LEFT, 368, L"Writing language");
+    draw_text(dc, UI_LABEL_LEFT, 410, L"Spelling");
+    draw_text(dc, UI_LABEL_LEFT, 452, L"Excluded apps");
+    SelectObject(dc, g_font_small);
+    draw_text_right(dc, UI_CARD_RIGHT, 713, L"No cloud, no logging, no background service");
     SelectObject(dc, old_font);
     EndPaint(window, &paint);
 }
@@ -1690,15 +2211,13 @@ static void draw_button(DRAWITEMSTRUCT *item) {
     wchar_t text[64];
     HBRUSH brush;
     HPEN pen;
-    COLORREF foreground = RGB(255, 255, 255);
     RECT rectangle = item->rcItem;
     HGDIOBJ old_brush;
     HGDIOBJ old_pen;
     HGDIOBJ old_font;
-    int primary = item->CtlID == IDC_SAVE || item->CtlID == IDC_ENABLE;
     COLORREF color;
-    if (item->CtlID == IDC_ENABLE) color = g_settings.enabled ? RGB(38, 188, 127) : RGB(139, 148, 166);
-    else if (primary) color = RGB(76, 111, 230);
+    if (item->CtlID == IDC_ENABLE) color = g_settings.enabled ? UI_GREEN : UI_GREY;
+    else if (item->CtlID == IDC_SAVE) color = UI_ACCENT;
     else color = RGB(93, 111, 148);
     if (item->itemState & ODS_SELECTED) color = RGB(GetRValue(color) * 4 / 5,
                                                     GetGValue(color) * 4 / 5,
@@ -1714,11 +2233,11 @@ static void draw_button(DRAWITEMSTRUCT *item) {
     DeleteObject(pen);
     DeleteObject(brush);
     if (item->CtlID == IDC_ENABLE)
-        safe_copy(text, 64, g_settings.enabled ? L"Pause" : L"Enable");
+        safe_copy(text, 64, g_settings.enabled ? L"Pause" : L"Resume");
     else
         GetWindowTextW(item->hwndItem, text, 64);
     SetBkMode(item->hDC, TRANSPARENT);
-    SetTextColor(item->hDC, foreground);
+    SetTextColor(item->hDC, RGB(255, 255, 255));
     old_font = SelectObject(item->hDC, g_font_medium);
     DrawTextW(item->hDC, text, -1, &rectangle, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(item->hDC, old_font);
@@ -1761,8 +2280,16 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
         case WM_ERASEBKGND:
             return 1;
         case WM_CTLCOLORSTATIC:
+            if (is_tile_label((HWND)lparam)) {
+                int is_value = (HWND)lparam == g_tile_values[0] ||
+                               (HWND)lparam == g_tile_values[1] ||
+                               (HWND)lparam == g_tile_values[2];
+                SetBkColor((HDC)wparam, UI_TILE);
+                SetTextColor((HDC)wparam, is_value ? UI_ACCENT : UI_MUTED);
+                return (LRESULT)g_brush_tile;
+            }
             SetBkColor((HDC)wparam, RGB(255, 255, 255));
-            SetTextColor((HDC)wparam, RGB(62, 73, 96));
+            SetTextColor((HDC)wparam, (HWND)lparam == g_status_label ? UI_TEXT : RGB(62, 73, 96));
             return (LRESULT)g_brush_white;
         case WM_CTLCOLOREDIT:
             SetBkColor((HDC)wparam, RGB(255, 255, 255));
@@ -1775,6 +2302,21 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 case IDC_ENABLE:
                 case IDM_TOGGLE:
                     toggle_enabled();
+                    return 0;
+                case IDM_SPELLING:
+                    g_settings.spelling = g_settings.spelling == KS_SPELL_OFF
+                        ? g_settings.spelling_last_level : KS_SPELL_OFF;
+                    clear_word();
+                    g_undo.valid = 0;
+                    save_settings();
+                    update_controls_from_settings();
+                    set_activity(g_settings.spelling == KS_SPELL_OFF
+                        ? L"Spelling correction is off."
+                        : g_settings.spelling == KS_SPELL_CONSERVATIVE
+                            ? L"Spelling correction: conservative."
+                            : g_settings.spelling == KS_SPELL_AGGRESSIVE
+                                ? L"Spelling correction: aggressive."
+                                : L"Spelling correction: balanced.");
                     return 0;
                 case IDM_EXCLUDE_CURRENT:
                     if (g_last_typed_process[0]) {
@@ -1895,8 +2437,11 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             DeleteObject(g_font_medium);
             DeleteObject(g_font_title);
             DeleteObject(g_font_status);
+            DeleteObject(g_font_tile);
+            DeleteObject(g_font_small);
             DeleteObject(g_brush_white);
             DeleteObject(g_brush_background);
+            DeleteObject(g_brush_tile);
             PostQuitMessage(0);
             return 0;
     }
@@ -1964,8 +2509,33 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_lexicons.persian_prefixes = &g_persian_prefix_bloom;
     g_lexicons.english_common_prefixes = &g_english_common_prefix_bloom;
     g_lexicons.persian_common_prefixes = &g_persian_common_prefix_bloom;
+    /*
+     * Spelling correction needs the frequency tables. They are generated from
+     * wordfreq at build time; if a build shipped without them, the layout
+     * repair keeps working and the dashboard says spelling is unavailable.
+     */
+    g_spelling_available =
+        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
+        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table);
+    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
+    g_english_spelling.language = KS_LANG_ENGLISH;
+    g_english_spelling.ranks = &g_english_rank_table;
+    g_english_spelling.words = &g_english_bloom;
+    g_english_spelling.common = &g_english_common_bloom;
+    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
+    g_persian_spelling.language = KS_LANG_PERSIAN;
+    g_persian_spelling.ranks = &g_persian_rank_table;
+    g_persian_spelling.words = &g_persian_bloom;
+    g_persian_spelling.common = &g_persian_common_bloom;
+    g_english_spelling.vocabulary = &g_session_vocabulary;
+    g_persian_spelling.vocabulary = &g_session_vocabulary;
+    g_english_spelling.personal = &g_personal_vocabulary;
+    g_persian_spelling.personal = &g_personal_vocabulary;
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
     ks_context_reset(&g_intent_context);
     load_settings();
+    load_personal_dictionary();
     controls.dwSize = sizeof(controls);
     controls.dwICC = ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&controls);
@@ -1986,11 +2556,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     }
 
     {
-        /* Client area authored at 760×672 (96 DPI); let Windows add the frame. */
+        /* Client area authored at UI_CLIENT_WIDTH × UI_CLIENT_HEIGHT (96 DPI). */
         DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        RECT frame = {0, 0, scale(760), scale(672)};
+        RECT frame = {0, 0, scale(UI_CLIENT_WIDTH), scale(UI_CLIENT_HEIGHT)};
         AdjustWindowRectEx(&frame, style, FALSE, WS_EX_APPWINDOW);
-        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 2.8.0",
+        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 2.9.0",
                                    style, CW_USEDEFAULT, CW_USEDEFAULT,
                                    frame.right - frame.left, frame.bottom - frame.top,
                                    NULL, NULL, instance, NULL);

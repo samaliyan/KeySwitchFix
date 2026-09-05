@@ -53,16 +53,23 @@ static void hash_codepoint(uint32_t *first, uint32_t *second, uint32_t cp) {
     }
 }
 
+void ks_hash_text(const wchar_t *value, uint32_t *first, uint32_t *second) {
+    *first = 2166136261u;
+    *second = 5381u;
+    if (!value) return;
+    while (*value) {
+        hash_codepoint(first, second, (uint32_t)*value);
+        ++value;
+    }
+}
+
 int ks_bloom_contains(const KS_BLOOM *bloom, const wchar_t *value) {
-    uint32_t first = 2166136261u;
-    uint32_t second = 5381u;
+    uint32_t first;
+    uint32_t second;
     uint32_t i;
 
     if (!bloom || !bloom->valid || !value || !*value) return 0;
-    while (*value) {
-        hash_codepoint(&first, &second, (uint32_t)*value);
-        ++value;
-    }
+    ks_hash_text(value, &first, &second);
 
     second = (second << 1) | 1u;
     for (i = 0; i < bloom->hash_count; ++i) {
@@ -312,6 +319,23 @@ static int persian_word_known(const wchar_t *value, int count,
     return count <= 2
         ? short_persian_word(canonical)
         : word_bloom_contains(persian, persian_common, canonical);
+}
+
+int ks_text_known(const wchar_t *text, KS_LANGUAGE language,
+                  const KS_BLOOM *words, const KS_BLOOM *common) {
+    wchar_t lowered[KS_MAX_WORD + 1];
+    size_t length;
+
+    if (!text || !*text) return 0;
+    length = wcslen(text);
+    if (length > KS_MAX_WORD) return 0;
+    if (language == KS_LANG_PERSIAN)
+        return persian_word_known(text, (int)length, words, common);
+    if (language != KS_LANG_ENGLISH) return 0;
+    english_lower(text, lowered);
+    if (!english_word_shape(lowered)) return 0;
+    if (length <= 2) return short_english_word(lowered);
+    return word_bloom_contains(words, common, lowered);
 }
 
 int ks_word_membership(const KS_TOKEN *tokens, int count,

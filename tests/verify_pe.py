@@ -103,6 +103,12 @@ def main():
     assert digest(app.resource(10, 210)) == digest(
         (ROOT / "resources" / "fa-common-prefix.bloom").read_bytes()
     )
+    assert digest(app.resource(10, 211)) == digest(
+        (ROOT / "resources" / "en-rank.bin").read_bytes()
+    )
+    assert digest(app.resource(10, 212)) == digest(
+        (ROOT / "resources" / "fa-rank.bin").read_bytes()
+    )
     assert digest(setup.resource(10, 301)) == digest(app_path.read_bytes())
     assert digest(setup.resource(10, 302)) == digest(uninstall_path.read_bytes())
     print("PE verification passed: x64 GUI files and all embedded payloads are exact.")

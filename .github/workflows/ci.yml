@@ -24,6 +24,14 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install wordfreq for the spelling rank tables
+        run: python3 -m pip install --quiet wordfreq==3.1.1
+
       - name: Install Zig cross-compiler
         run: >-
           npm install

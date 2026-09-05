@@ -24,7 +24,7 @@ KeySwitchFix does not:
 - run a Windows service;
 - transmit process names or settings.
 
-Persistent settings contain only enabled state, sensitivity, startup preference, and the user-maintained excluded-process list.
+Persistent settings contain only enabled state, sensitivity, language mode, spelling level, startup preference, and the user-maintained excluded-process list. The spelling ignore list (64 words) and the learned vocabulary (1,024 words the user typed that no dictionary knows) live in process memory only. The personal dictionary is opt-in and off by default; when enabled, only words whose correction the user explicitly undid are appended to `personal-dictionary.txt` in the settings folder.
 
 ## Sensitive fields
 

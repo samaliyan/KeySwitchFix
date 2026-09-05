@@ -10,7 +10,7 @@
 #include "../resources/resource.h"
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"2.8.0"
+#define APP_VERSION L"2.9.0"
 #define APP_WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 #define WM_APP_EXIT (WM_APP + 9)
 
@@ -210,7 +210,7 @@ static void register_uninstaller(void) {
     wchar_t uninstall_command[MAX_PATH + 32];
     wchar_t quiet_command[MAX_PATH + 40];
     DWORD one = 1;
-    DWORD size_kb = 1400;
+    DWORD size_kb = 4300;
     if (RegCreateKeyExW(HKEY_CURRENT_USER,
                         L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\KeySwitchFix",
                         0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;

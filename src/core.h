@@ -87,6 +87,8 @@ typedef enum KS_EVALUATION_PHASE {
     KS_PHASE_BOUNDARY = 2
 } KS_EVALUATION_PHASE;
 
+/* FNV-1a / djb2 pair over the UTF-8 encoding; shared by every resource. */
+void ks_hash_text(const wchar_t *value, uint32_t *first, uint32_t *second);
 int ks_bloom_init(KS_BLOOM *bloom, const unsigned char *data, size_t size);
 int ks_bloom_contains(const KS_BLOOM *bloom, const wchar_t *value);
 wchar_t ks_canonical_persian(wchar_t character);
@@ -95,6 +97,10 @@ int ks_is_word_scancode(uint32_t scan_code);
 int ks_map_scancode(uint32_t scan_code, int shift_down, int caps_lock, KS_TOKEN *token);
 void ks_tokens_to_english(const KS_TOKEN *tokens, int count, wchar_t *output);
 void ks_tokens_to_persian(const KS_TOKEN *tokens, int count, wchar_t *output);
+/* Text-level membership with the same rules as token membership: exact short
+   lists, canonical initial alef, and diacritic-free lookup. */
+int ks_text_known(const wchar_t *text, KS_LANGUAGE language,
+                  const KS_BLOOM *words, const KS_BLOOM *common);
 int ks_word_membership(const KS_TOKEN *tokens, int count,
                        const KS_BLOOM *english, const KS_BLOOM *persian,
                        const KS_BLOOM *english_common,

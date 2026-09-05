@@ -1,5 +1,7 @@
 # Build output
 dist/
+resources/en-rank.bin
+resources/fa-rank.bin
 resources/*.res
 *.exe
 *.pdb

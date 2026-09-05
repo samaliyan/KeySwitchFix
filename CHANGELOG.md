@@ -2,6 +2,63 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [2.9.0] - 2026-09-05
+
+### Added
+
+- Offline spelling correction for Persian and English (`src/spell.c`). At a
+  word boundary, a word that is unknown in both layouts is scored against
+  every candidate within edit distance one using a noisy-channel model:
+  `10 × zipf(candidate)` plus an error model that rewards adjacent-letter
+  transpositions, neighbouring keys on the physical keyboard, doubled or
+  dropped letters, and Persian homophone confusions (ح/ه، ت/ط، س/ص/ث،
+  ز/ذ/ض/ظ، ق/غ، ا/آ/ع). `نسحه` → `نسخه`, `teh` → `the`, `wrold` → `world`.
+- Compact `KSRT` frequency-rank tables (256 KB per language, up to 32,768
+  words) generated from wordfreq 3.1.1 by `tools/generate_rank_tables.py`;
+  casual vocabulary (`thx`, `lol`, `میخوام`) is included so it is recognised,
+  not rewritten. Evaluation takes tens of microseconds inside the hook.
+- **Spelling** setting (Off / Conservative / Balanced / Aggressive) on the
+  dashboard and a **Fix spelling mistakes** toggle on the tray menu. Default:
+  Balanced.
+- One plain Backspace undoes a spelling fix exactly like a layout fix, and
+  teaches a 64-entry in-memory ignore list so the spelling is left alone for
+  the rest of the session. Nothing is written to disk.
+- `tests/spell_tests.c` with fixture rank tables built by the same generator,
+  proving Python/C parity of the table format and covering the decision
+  rules (ambiguity, names, acronyms, casual words, ZWNJ, digits, levels).
+- Half-space and missing-space repairs: `میپرسیدند` → `می‌پرسیدند` (verb-shaped
+  stems only; suffix joins such as `کتاب‌ها` are Aggressive-only), `inthe` →
+  `in the`, `alot` → `a lot`, `درخانه` → `در خانه`.
+- Learned vocabulary: a word unknown in both layouts that is typed twice in a
+  session becomes the user's word and is never corrected afterwards (in
+  memory only). Undoing a spelling fix trusts the word immediately.
+- Opt-in personal dictionary (**Remember undone words**): undone spellings
+  are saved to `personal-dictionary.txt` and trusted across restarts.
+- Frequency tables now hold up to 65,536 words per language (512 KB each).
+- A redesigned dashboard: header with a live Active/Paused pill, a 200 px
+  label column (no more clipped captions such as "Writing langua"), three
+  statistics tiles (keys, layout fixes, spelling fixes), DPI-scaled.
+- `docs/SPELLING.md` describing the model, thresholds, and limits, and
+  `docs/STRICT_REVIEW_2.9.0.md` with the three critic rounds and scores.
+
+### Changed
+
+- Capitalised English words are never spell-corrected (names, acronyms, code).
+- Dropping a word's final letter is offered only in Aggressive mode, so a
+  plural or inflection missing from the lexicon is never stripped to its stem.
+- Spelling correction is skipped below Aggressive in common code editors and
+  terminals (identifiers such as `bool` sit one edit from `book`); layout
+  repair still runs there.
+- The hamza forms `ئ ؤ أ إ ء` are part of the Persian alphabet, key map, and
+  confusion sets (`مسول` → `مسئول`).
+- The rank tables are a build product: `build-native.sh` generates them when
+  absent (requires `pip install wordfreq==3.1.1`), and the CI/release
+  workflows install wordfreq. A build without them still works; the dashboard
+  reports spelling as unavailable.
+- Diagnostics count layout fixes and spelling fixes separately.
+- `build-windows.ps1`: a native Windows build script (Python + Zig) that runs
+  the same tests and verification as `build-native.sh`.
+
 ## [2.8.0] - 2026-09-04
 
 ### Added

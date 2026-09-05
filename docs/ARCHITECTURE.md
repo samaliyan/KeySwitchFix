@@ -42,7 +42,12 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
     core strips Arabic combining marks before every dictionary lookup, so
     `حتماً` and `مدرّس` stay Persian-known while the exact keys the user
     typed are preserved for the replacement text.
-13. A watchdog timer compares `GetLastInputInfo` with the last event the hooks
+13. If the layout logic declines and the word is unknown in both layouts, the
+    spelling module scores every edit-distance-one candidate from the KSRT
+    frequency table with a noisy-channel model and, above a per-level margin,
+    replaces the word. See [Spelling](SPELLING.md). Undoing it adds the typed
+    spelling to an in-memory ignore list.
+14. A watchdog timer compares `GetLastInputInfo` with the last event the hooks
     delivered and reinstalls both hooks when Windows detached them. It re-arms
     once per quiet episode so that input to elevated windows, which UIPI hides
     from a non-elevated hook, does not cause churn.
@@ -58,11 +63,14 @@ reconstructed text to `KS_MAX_SEQUENCE_CHARS`.
 | Component | Responsibility |
 | --- | --- |
 | `src/core.c` | fallback scan-code mapping, membership, word/sequence scoring, decisions |
+| `src/spell.c` | KSRT rank table, keyboard geometry, candidate generation, noisy-channel spelling decision |
 | `src/app.c` | hooks, bounded phrase history, Undo, correction, settings, tray, dashboard |
 | `src/installer.c` | per-user install, shortcuts, startup, registration, uninstall |
 | `resources/*.bloom` | compact offline base, common-word, and proper-prefix membership resources |
 | `tools/generate_blooms.py` | reproducible dictionary normalization and Bloom-resource generation |
+| `tools/generate_rank_tables.py` | wordfreq-derived KSRT frequency tables for spelling correction |
 | `tests/core_tests.c` | native positive and negative detection tests |
+| `tests/spell_tests.c` | spelling decisions against fixture rank tables built by the generator |
 | `tests/verify_pe.py` | x64 GUI PE and embedded-payload verification |
 
 ## Installer model
