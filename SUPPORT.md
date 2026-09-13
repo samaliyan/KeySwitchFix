@@ -8,7 +8,7 @@ Before opening an issue:
 4. Check whether the target app runs as administrator.
 5. Review the excluded-process list.
 
-Use the [bug report form](https://github.com/silimore/KeySwitchFix/issues/new?template=bug_report.yml) for reproducible defects and the [feature request form](https://github.com/silimore/KeySwitchFix/issues/new?template=feature_request.yml) for improvements.
+Use the [bug report form](https://github.com/samaliyan/KeySwitchFix/issues/new?template=bug_report.yml) for reproducible defects and the [feature request form](https://github.com/samaliyan/KeySwitchFix/issues/new?template=feature_request.yml) for improvements.
 
 Do not include passwords, private typed text, or other secrets in screenshots or issue reports.
 

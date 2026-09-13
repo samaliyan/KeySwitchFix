@@ -12,7 +12,7 @@ KeySwitchFix یک برنامه سبک و کاملاً آفلاین برای وی
 
 ## دانلود و نصب
 
-1. وارد صفحه [آخرین نسخه](https://github.com/silimore/KeySwitchFix/releases/latest) شوید.
+1. وارد صفحه [آخرین نسخه](https://github.com/samaliyan/KeySwitchFix/releases/latest) شوید.
 2. فایل `KeySwitchFix-Setup.exe` را دانلود و اجرا کنید.
 3. روی **Install** و پس از پایان نصب روی **Finish** بزنید.
 

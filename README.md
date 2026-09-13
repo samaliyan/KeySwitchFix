@@ -3,12 +3,12 @@
   <h1>KeySwitchFix</h1>
   <p>Lightweight, private, automatic Persian ↔ English keyboard layout repair and spelling correction for Windows.</p>
 
-  [![CI](https://github.com/silimore/KeySwitchFix/actions/workflows/ci.yml/badge.svg)](https://github.com/silimore/KeySwitchFix/actions/workflows/ci.yml)
-  [![Latest release](https://img.shields.io/github/v/release/silimore/KeySwitchFix)](https://github.com/silimore/KeySwitchFix/releases/latest)
+  [![CI](https://github.com/samaliyan/KeySwitchFix/actions/workflows/ci.yml/badge.svg)](https://github.com/samaliyan/KeySwitchFix/actions/workflows/ci.yml)
+  [![Latest release](https://img.shields.io/github/v/release/samaliyan/KeySwitchFix)](https://github.com/samaliyan/KeySwitchFix/releases/latest)
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.txt)
   [![Windows x64](https://img.shields.io/badge/Windows-x64-0078D4.svg)](#requirements)
 
-  [Download](https://github.com/silimore/KeySwitchFix/releases/latest) · [Persian README](README_FA.md) · [Report a bug](https://github.com/silimore/KeySwitchFix/issues/new?template=bug_report.yml)
+  [Download](https://github.com/samaliyan/KeySwitchFix/releases/latest) · [Persian README](README_FA.md) · [Report a bug](https://github.com/samaliyan/KeySwitchFix/issues/new?template=bug_report.yml)
 </div>
 
 ## What it does
@@ -87,7 +87,7 @@ inferred from the available keys or context alone.
 
 ## Install
 
-1. Open the [latest release](https://github.com/silimore/KeySwitchFix/releases/latest).
+1. Open the [latest release](https://github.com/samaliyan/KeySwitchFix/releases/latest).
 2. Download `KeySwitchFix-Setup.exe`.
 3. Run Setup and select **Install**. Administrator access is not required.
 4. Select **Finish** to close Setup and launch KeySwitchFix.

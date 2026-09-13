@@ -416,15 +416,15 @@ All notable changes to KeySwitchFix are documented here. The project follows [Se
 - Native x64 Win32 application, per-user Setup, standalone Uninstaller, tray UI, diagnostics, and offline Bloom dictionaries.
 - Physical scan-code detection for Persian and English layout mismatches.
 
-[2.7.0]: https://github.com/silimore/KeySwitchFix/compare/v2.6.0...v2.7.0
-[2.6.0]: https://github.com/silimore/KeySwitchFix/compare/v2.5.0...v2.6.0
-[2.5.0]: https://github.com/silimore/KeySwitchFix/compare/v2.4.0...v2.5.0
-[2.4.0]: https://github.com/silimore/KeySwitchFix/compare/v2.3.1...v2.4.0
-[2.3.1]: https://github.com/silimore/KeySwitchFix/compare/v2.3.0...v2.3.1
-[2.3.0]: https://github.com/silimore/KeySwitchFix/compare/v2.2.0...v2.3.0
-[2.2.0]: https://github.com/silimore/KeySwitchFix/compare/v2.1.1...v2.2.0
-[2.1.1]: https://github.com/silimore/KeySwitchFix/compare/v2.1.0...v2.1.1
-[2.1.0]: https://github.com/silimore/KeySwitchFix/releases/tag/v2.1.0
-[2.0.2]: https://github.com/silimore/KeySwitchFix/compare/v2.0.2...v2.1.0
-[2.0.1]: https://github.com/silimore/KeySwitchFix/compare/v2.0.1...v2.0.2
-[2.0.0]: https://github.com/silimore/KeySwitchFix/releases/tag/v2.0.0
+[2.7.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.6.0...v2.7.0
+[2.6.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.5.0...v2.6.0
+[2.5.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.4.0...v2.5.0
+[2.4.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.3.1...v2.4.0
+[2.3.1]: https://github.com/samaliyan/KeySwitchFix/compare/v2.3.0...v2.3.1
+[2.3.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.1.1...v2.2.0
+[2.1.1]: https://github.com/samaliyan/KeySwitchFix/compare/v2.1.0...v2.1.1
+[2.1.0]: https://github.com/samaliyan/KeySwitchFix/releases/tag/v2.1.0
+[2.0.2]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.2...v2.1.0
+[2.0.1]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.1...v2.0.2
+[2.0.0]: https://github.com/samaliyan/KeySwitchFix/releases/tag/v2.0.0
