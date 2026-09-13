@@ -16,7 +16,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"3.0.0"
+#define APP_VERSION L"3.0.1"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -4118,7 +4118,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         frame.right = scale(UI_CLIENT_WIDTH);
         frame.bottom = scale(UI_CLIENT_HEIGHT);
         AdjustWindowRectEx(&frame, style, FALSE, WS_EX_APPWINDOW);
-        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 3.0.0",
+        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 3.0.1",
                                    style, CW_USEDEFAULT, CW_USEDEFAULT,
                                    frame.right - frame.left, frame.bottom - frame.top,
                                    NULL, NULL, instance, NULL);

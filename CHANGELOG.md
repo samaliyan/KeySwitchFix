@@ -2,6 +2,14 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.1] - 2026-09-13
+
+### Changed
+
+- Repository links in the README, Persian README, support page and changelog
+  point at the project's current GitHub home; release re-issued under a new
+  tag because v3.0.0 had already been published from an earlier commit.
+
 ## [3.0.0] - 2026-09-12
 
 ### Added
