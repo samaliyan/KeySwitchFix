@@ -26,6 +26,15 @@ application's layout automatically.
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
 
+Version 3.0 adds **typing helpers**: Persian digits and punctuation that
+follow the language you are writing, Arabic `ي ك` typed as Persian `ی ک`,
+English sentence capitalisation, snippets with Jalali and Gregorian date
+macros (`tarikh` → `۱۴۰۵/۰۶/۲۱`), a `Ctrl + Win + X` hotkey that cleans up any
+selected text, and usage statistics on the dashboard. It also fixes the
+layout switch in Store/UWP applications and in applications that ignore or
+delay the switch (`staدیشقی` → `standard`). See
+[Typing helpers](docs/TYPING_HELPERS.md).
+
 Version 2.9 adds offline spelling correction for both languages: `نسحه` →
 `نسخه`, `teh` → `the`. A noisy-channel model scores every candidate within
 one edit by corpus frequency and by how people actually mistype (transposed
@@ -64,6 +73,12 @@ inferred from the available keys or context alone.
 - Undo the latest correction with one plain **Backspace**; `Ctrl + Win + Backspace` remains a fallback
 - Treats Shift+Space as a Persian ZWNJ boundary, so `می‌خواهم` and `کتاب‌ها` are repaired and re-typed exactly
 - Re-arms its keyboard hook automatically if Windows silently detaches it
+- Types the keys itself while an application is slow to switch layouts, or never does, so `standard` never becomes `staدیشقی`; finds the real input window of Store/UWP apps
+- Digits that follow the language (`۱۲۳` in Persian, `123` in English), Persian `؟ ، ؛` after Persian words, Arabic `ي ك` typed as Persian `ی ک`
+- Capitalises English sentences and the lone `i`, without touching code editors
+- Snippets with date and time macros, including the Jalali calendar (`{jdate:long}` → `۲۱ شهریور ۱۴۰۵`)
+- `Ctrl + Win + X` cleans up selected text anywhere (letters, digits, punctuation), and puts your clipboard back
+- Statistics: fixes today and all time, keys, active days, time saved, most-corrected words
 - **Exclude this app** from the tray menu and `Ctrl + Win + K` to pause/resume
 - English-only dashboard, tray controls, sensitivity settings, and live diagnostics
 - Per-user installer, desktop/Start Menu shortcuts, startup option, and clean uninstaller
@@ -85,6 +100,8 @@ The executable is currently unsigned, so Microsoft Defender SmartScreen may disp
 - Double-click the tray icon or use the desktop shortcut to open the dashboard.
 - Right-click the tray icon to pause correction, choose **Writing language**, toggle **Fix spelling mistakes**, exclude the app you last typed in, or exit.
 - Press `Ctrl + Win + K` to pause or resume correction from anywhere.
+- Press `Ctrl + Win + X` to clean up the selected text in any application.
+- Type a snippet shortcut (for example `tarikh`) and press Space to expand it; **Edit snippets…** opens the list.
 - Closing the dashboard hides it to the tray; choosing **Exit** stops the program.
 - If Windows Explorer restarts, the tray icon restores itself automatically.
 

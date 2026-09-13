@@ -95,6 +95,9 @@ def main() -> None:
     require("src/app.c", "try_spelling_correction(")
     require("src/app.c", "ks_ignore_list_add(&g_spelling_ignore")
     require("src/spell.c", "int ks_spell_correct(")
+    require("src/typing.c", "void ks_gregorian_to_jalali(")
+    require("src/app.c", "expand_snippet_or_pronoun(")
+    require("src/app.c", "ID_HOTKEY_CLEANUP")
     require("resources/app.rc", 'IDR_EN_RANK_TABLE RCDATA "en-rank.bin"')
 
     app = read("src/app.c")

@@ -2,6 +2,99 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] - 2026-09-12
+
+### Added
+
+- Typing helpers, each with its own switch on the dashboard and the tray's
+  **Typing helpers** menu; none of them act in code editors, terminals,
+  remote-desktop clients, password fields, or excluded apps
+  (`docs/TYPING_HELPERS.md`):
+  - **Digits** follow the language: `۱۲۳` on the Persian layout, `123` on the
+    English layout (or always one form, or off). The numeric keypad is left
+    alone.
+  - **Persian punctuation**: `? , ;` after a Persian word become `؟ ، ؛`, and
+    the reverse after an English word. A manual layout switch clears the
+    context so a deliberate `؟` is never overruled.
+  - **Persian letters**: the legacy layout's Arabic `ي` and `ك` are typed as
+    Persian `ی` and `ک`.
+  - **Capitalise English sentences**: the first letter after `.` `!` `?` and
+    the lone `i` become capitals, with an abbreviation list (`dr.`, `e.g.`,
+    `etc.`, file extensions, months), number and code guards; a capitalised
+    word is still spell-checked, so `teh` at a sentence start becomes `The`.
+  - **Snippets**: `shortcut = text` lines in `snippets.txt` (UTF-8/UTF-16,
+    up to 256 entries, reloaded within two seconds of saving) expand at
+    Space/Enter/Tab with Undo on Backspace, and support date/time macros
+    including the Jalali calendar: `{jdate}`, `{jdate:en}`, `{jdate:long}`,
+    `{jweekday}`, `{date}`, `{date:long}`, `{weekday}`, `{time}`,
+    `{time:fa}`, and `\n`/`{t}` for Enter/Tab. **Edit snippets…** creates a
+    commented template and opens it.
+  - **Clean up selected text** with `Ctrl + Win + X` in any application:
+    Arabic letters and digits to Persian, digits per the setting, Persian
+    punctuation in Persian text, per word so URLs and e-mail addresses keep
+    their digits; the previous clipboard content (all text-like formats) is
+    restored afterwards unless something newer was copied.
+  - **Statistics** on the dashboard: layout and spelling fixes today, fixes
+    all time, keys today, active days, estimated time saved and the
+    most-corrected words (memory only). Counters persist in `stats.ini`
+    every ten minutes, at exit and at Windows shutdown.
+- `src/typing.c` (platform-free, 60+ native checks including a full
+  1900–2200 Jalali round trip) and `tests/typing_tests.c`.
+- Remote-desktop and virtual-machine clients (`mstsc`, `msrdc`, `vmconnect`,
+  VirtualBox, VMware, Citrix, AnyDesk, TeamViewer, RustDesk, Parsec) and
+  terminal emulators (`putty`, `kitty`, MobaXterm, SecureCRT) join the list
+  of applications where spelling and the helpers stay out of the way.
+
+### Changed
+
+- Dashboard redesigned on a 840×748 grid: a 100-pixel header that keeps the
+  name, tagline, status pill and version line inside the gradient; six
+  settings rows in three columns; four statistic tiles and a statistics
+  line; footer buttons. If the screen's work area is smaller than the scaled
+  window (small laptops, high scaling), the whole dashboard scales down so
+  the footer is always visible.
+- Version 3.0.0; the title bar and header show it.
+
+### Fixed
+
+- `standard` typed on the Persian layout became `staدیشقی` (the first three
+  keys were repaired, the rest kept rendering Persian), and the same happened
+  to every English word typed on the wrong layout in applications that
+  honour the layout switch late or not at all. Root causes: the layout was
+  read from, and the switch requested of, the *foreground* window's thread —
+  for Store/UWP applications (the Windows 11 Notepad, Settings, Mail,
+  WhatsApp, Telegram from the Store, …) that is ApplicationFrameHost.exe, not
+  the application, so the switch changed a layout nobody was typing with while
+  the hook believed it had succeeded; and a live correction discarded the
+  corrected keys, so the remainder of the word was judged on its own.
+- The real input thread is now resolved through the focused window or the
+  UWP `Windows.UI.Core.CoreWindow`; the switch is verified on that thread and
+  re-posted to the other windows of the thread when the focused one swallows
+  it; a blocked replacement no longer leaves a pending request behind.
+- While a requested switch is pending and keys still arrive in the old layout,
+  the hook types the characters of the requested layout itself (letters,
+  digits, punctuation, Shift+Space ZWNJ), so the wrong alphabet never reaches
+  the screen even if the application never switches; password fields are left
+  untouched; a manual switch, click, navigation key, or whole-word deletion
+  ends this immediately. The activity line and the diagnostics line name an
+  application that did not switch.
+- A live correction's word is resumed when the user keeps typing it, so the
+  whole word is evaluated (and the spelling model never sees the tail alone).
+- Exclusions and the developer-tool list match both the host process and the
+  focused control's process (UWP frame, embedded web view); the tray's
+  "Exclude this app" names the application rather than the frame host.
+- Key-ups of swallowed keys are tracked per key, so fast overlapping typing
+  no longer leaks a key-up without its key-down to the application.
+- The synchronous wait for the layout switch inside the low-level hook is
+  limited to one 50 ms attempt (previously up to 100 ms), staying well inside
+  the hook time budget Windows enforces before detaching a hook.
+- Shift is read from the physical key state for each key, so a Shift
+  transition the hook missed cannot mis-case a translated character.
+
+- The tracked Ctrl/Alt/Win state is cross-checked with the physical key
+  state, so a modifier transition the hook missed cannot turn `Ctrl+S` into a
+  typed letter.
+
 ## [2.9.0] - 2026-09-05
 
 ### Added
@@ -40,6 +133,17 @@ All notable changes to KeySwitchFix are documented here. The project follows [Se
   statistics tiles (keys, layout fixes, spelling fixes), DPI-scaled.
 - `docs/SPELLING.md` describing the model, thresholds, and limits, and
   `docs/STRICT_REVIEW_2.9.0.md` with the three critic rounds and scores.
+
+### Fixed
+
+- A word split across two layouts (`standard` rendered as `staدیشقی` because
+  the target application applied the requested layout switch a few keys late)
+  was abandoned at the switch and left as garbage. Each key now remembers the
+  layout that rendered it; when the switch is the one KeySwitchFix asked for,
+  the word is kept and repaired to the reading that is a real word
+  (`standard`, or `سلام` for `sgام`) live, after the adaptive pause, or at
+  Space. The layout switch is also requested before the replacement text is
+  injected, so it is queued ahead of the next keystrokes.
 
 ### Changed
 

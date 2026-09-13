@@ -15,7 +15,9 @@ native tray application with no runtime and no network.
    layout, or its other-layout reading is a known word (a layout mistake or a
    collision), spelling correction is not consulted.
 3. Only then is the word treated as a possible misspelling. English is limited
-   to all-lowercase words (a capital letter marks a name, an acronym, or code);
+   to all-lowercase words (a capital letter marks a name, an acronym, or code;
+   a capital that the 3.0 sentence-capitalisation helper itself added does not
+   count, so `Teh` at a sentence start still becomes `The`);
    Persian is limited to letter-only tokens (no digits, ZWNJ, or diacritics).
 4. Words the user has shown to be intentional are skipped: a word undone with
    Backspace, a word typed twice this session (learned vocabulary, in

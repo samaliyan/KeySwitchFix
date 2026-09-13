@@ -5,7 +5,15 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
 ## Input pipeline
 
 1. A `WH_KEYBOARD_LL` hook receives physical keyboard events.
-2. The foreground thread's keyboard layout is classified as English, Persian, or unsupported.
+2. The layout of the thread that really renders the keys is classified as
+   English, Persian, or unsupported. That thread is found through the focused
+   window (`GetGUIThreadInfo`), or, when the foreground window is a Store/UWP
+   frame (`ApplicationFrameWindow`, owned by ApplicationFrameHost.exe), through
+   the `Windows.UI.Core.CoreWindow` child that belongs to the application
+   itself. Reading the frame's thread instead would report a layout the app is
+   not using. Exclusions and developer-tool detection consider both the host
+   process and the focused control's process (a UWP app behind its frame, a
+   web view inside an IDE).
 3. Physical scan codes are translated through the actual installed/last-used
    Windows English and Persian layouts. The static core table is only a safe
    fallback, so both Persian layout variants are supported. Layouts are never
@@ -30,8 +38,13 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
    earlier words; mixed-language runs and partial dictionary matches are left
    unchanged. A word corrected live is held as pending until Space commits it,
    so it is not lost from sentence history.
-9. The original text is replaced with marked `SendInput` events and the target
-   window is asked to switch layout.
+9. The original text is replaced with marked `SendInput` events (all Unicode
+   or layout-independent keys), then the focused window is asked to switch
+   layout with `WM_INPUTLANGCHANGEREQUEST` — the message Windows itself posts
+   for the layout hotkey. One short synchronous send verifies the result on
+   the target thread; a busy thread gets the request posted instead, still
+   ahead of the keys the user types next; a window that swallows the message
+   is bypassed by asking the other windows of the same thread.
 10. The exact original and replacement are retained for 15 seconds. One plain
     Backspace restores the original word or phrase; the registered
     `Ctrl + Win + Backspace` hotkey is a fallback.
@@ -47,7 +60,58 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
     frequency table with a noisy-channel model and, above a per-level margin,
     replaces the word. See [Spelling](SPELLING.md). Undoing it adds the typed
     spelling to an in-memory ignore list.
-14. A watchdog timer compares `GetLastInputInfo` with the last event the hooks
+14. Late or ignored layout switches. Some applications honour the switch
+    only after the next keys were translated (a busy browser or Electron
+    app), and some never honour it (they never route the message to
+    `DefWindowProc`). Both used to produce `staدیشقی` for `standard`: the
+    three keys typed on the wrong layout were repaired, and the rest of the
+    word kept rendering in the old alphabet. Two mechanisms now cover this.
+    First, while a requested switch is pending — same window, less than three
+    seconds since the last key typed for it, ten seconds at most, and no
+    manual switch, click, navigation key or whole-word deletion since — every
+    key that still arrives in the old layout is treated as typed for the
+    requested one: the word model records it that way and the hook swallows
+    the physical key and types the character the requested layout would have
+    produced (letters, digits, punctuation, the ZWNJ of Shift+Space; never in
+    a password field, never for keys that are identical in both layouts). The
+    request is repeated non-blockingly on each such key. A live correction's
+    word is resumed rather than restarted when the user keeps typing it, so
+    `standard` is judged whole, not `dard`. The diagnostics line and the
+    activity line report an application that did not switch. Second, when
+    keys were nevertheless rendered by the wrong layout (a pause longer than
+    the window), each key of the word remembers the layout that rendered it
+    and, as soon as the physical key sequence spells a word in exactly one
+    language (or, at a boundary, in the document's language), the on-screen
+    mixture is replaced by that word. A manual layout switch still starts a
+    new word and closes the request.
+15. Typing helpers (3.0). The same delivery point that translates keys for
+    a pending layout switch (`deliver_key`) also shapes the character a key
+    is about to produce: digits per the digit policy and the layout,
+    `? , ;` per the language of the word being typed or just finished (five
+    seconds, same window, cleared by a manual switch), Arabic `ي ك` to
+    Persian `ی ک`, and a capital for the first letter of an English
+    sentence. When the shaped character differs from what the layout would
+    type, the physical key is swallowed and the character injected; the
+    key-up is swallowed too. Sentence capitalisation is a tiny state
+    machine: a period after a real English word (two letters or more, not an
+    abbreviation, not after a digit) or `!`/`?` after such a word *arms*;
+    the Space or Enter that follows makes the next English letter capital;
+    any other key disarms. The capitalised token is marked so spelling still
+    evaluates it lower-case. At a word boundary, before any correction, the
+    typed word is matched against the snippet table (loaded from
+    `snippets.txt` on a two-second timer, never inside the hook) and the
+    lone `i` in prose is replaced by `I`; both use the ordinary replacement
+    and Undo paths. All helpers are skipped in developer tools, remote
+    sessions, excluded apps and password fields, cached per focused window.
+16. `Ctrl + Win + X` clean-up is a timer-driven state machine on the UI
+    thread: wait until every modifier is released, snapshot every
+    HGLOBAL-based clipboard format, inject Ctrl+C, wait for the sequence
+    number to change, clean the text (`ks_clean_text`, per token so URLs
+    survive), set the clipboard, inject Ctrl+V, and restore the snapshot
+    unless the sequence number shows a newer copy. Statistics counters are
+    updated from the hook in memory and written by the window on a message,
+    a ten-minute timer, exit, and session end.
+17. A watchdog timer compares `GetLastInputInfo` with the last event the hooks
     delivered and reinstalls both hooks when Windows detached them. It re-arms
     once per quiet episode so that input to elevated windows, which UIPI hides
     from a non-elevated hook, does not cause churn.

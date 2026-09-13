@@ -467,6 +467,34 @@ int main(void) {
     CHECK(wcscmp(decision.replacement, L"مرسی") == 0,
           "merci replacement is Persian");
 
+    /*
+     * Regression for "staدیشقی": "standard" typed on the Persian layout is
+     * repaired live after the third key (سفش is not a Persian prefix). The
+     * hook must then treat the rest of the word as English even if the
+     * application has not activated the English layout yet, and must judge
+     * the whole word, not the remainder, at the boundary.
+     */
+    CHECK(make_ascii_tokens("standard", tokens) == 8, "standard physical keys map");
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_PERSIAN, 1,
+                                 KS_LANG_OTHER, 0, 0, KS_PHASE_LIVE,
+                                 &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
+          "sta typed on the Persian layout is repaired live after three keys");
+    CHECK(wcscmp(decision.replacement, L"sta") == 0, "sta replacement is English");
+    CHECK(ks_evaluate_contextual(tokens, 8, KS_LANG_ENGLISH, 1,
+                                 KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+                                 &lexicons, &decision) == KS_LIVE_NONE,
+          "the resumed word standard is left alone in the English layout");
+    CHECK(ks_evaluate_contextual(tokens + 3, 5, KS_LANG_ENGLISH, 1,
+                                 KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+                                 &lexicons, &decision) == KS_LIVE_NONE,
+          "dard on its own is not turned into Persian either");
+    for (int k = 1; k < 8; ++k) {
+        CHECK(ks_evaluate_contextual(tokens, k, KS_LANG_ENGLISH, 1,
+                                     KS_LANG_PERSIAN, 4, 0, KS_PHASE_LIVE,
+                                     &lexicons, &decision) == KS_LIVE_NONE,
+              "no prefix of standard typed in English is switched to Persian");
+    }
+
     CHECK(make_ascii_tokens("how", tokens) == 3, "how physical keys map");
     CHECK(ks_classify_word(tokens, 3, &lexicons,
                            &english_known, &persian_known, NULL, NULL),

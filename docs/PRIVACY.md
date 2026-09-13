@@ -24,7 +24,7 @@ KeySwitchFix does not:
 - run a Windows service;
 - transmit process names or settings.
 
-Persistent settings contain only enabled state, sensitivity, language mode, spelling level, startup preference, and the user-maintained excluded-process list. The spelling ignore list (64 words) and the learned vocabulary (1,024 words the user typed that no dictionary knows) live in process memory only. The personal dictionary is opt-in and off by default; when enabled, only words whose correction the user explicitly undid are appended to `personal-dictionary.txt` in the settings folder.
+Persistent settings contain only enabled state, sensitivity, language mode, spelling level, typing-helper switches, startup preference, and the user-maintained excluded-process list. `stats.ini` holds counters only (fixes and keys today and in total, active days, the date of the current day); the most-corrected words shown on the dashboard live in process memory. `snippets.txt` is written by the user; the application only creates the commented template and reads the file. The `Ctrl + Win + X` clean-up uses the clipboard for the duration of one copy-and-paste and restores the previous clipboard content afterwards; nothing is kept. The spelling ignore list (64 words) and the learned vocabulary (1,024 words the user typed that no dictionary knows) live in process memory only. The personal dictionary is opt-in and off by default; when enabled, only words whose correction the user explicitly undid are appended to `personal-dictionary.txt` in the settings folder.
 
 ## Sensitive fields
 

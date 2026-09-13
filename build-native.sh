@@ -22,12 +22,14 @@ gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c tests/core_tests.c -o /tmp/key
 /tmp/keyswitchfix-core-tests
 gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c src/spell.c tests/spell_tests.c -o /tmp/keyswitchfix-spell-tests
 /tmp/keyswitchfix-spell-tests
+gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c src/typing.c tests/typing_tests.c -o /tmp/keyswitchfix-typing-tests
+/tmp/keyswitchfix-typing-tests
 
 cd resources
 "$ZIG" rc /:auto-includes gnu /c 65001 /fo app.res app.rc
 cd ..
 "$ZIG" cc -target x86_64-windows-gnu -DUNICODE -D_UNICODE -std=c11 -O2 \
-  -Wall -Wextra -Werror -Isrc -Iresources src/app.c src/core.c src/spell.c resources/app.res \
+  -Wall -Wextra -Werror -Isrc -Iresources src/app.c src/core.c src/spell.c src/typing.c resources/app.res \
   -o dist/KeySwitchFix.exe -luser32 -lgdi32 -lcomctl32 -lshell32 -ladvapi32 \
   -Wl,/subsystem:windows
 
