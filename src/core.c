@@ -385,6 +385,17 @@ int ks_classify_word(const KS_TOKEN *tokens, int count,
     ks_tokens_to_english(tokens, count, en);
     ks_tokens_to_persian(tokens, count, fa);
     english_lower(en, en_lower);
+    if (count >= 3 && lexicons->extra && lexicons->extra->contains) {
+        const KS_EXTRA_WORDS *extra = lexicons->extra;
+        if (!en_known && english_word_shape(en_lower) &&
+            extra->contains(extra->context, KS_LANG_ENGLISH, en_lower))
+            en_known = 1;
+        if (!fa_known) {
+            wchar_t stripped[KS_MAX_WORD + 1];
+            strip_persian_diacritics(fa, stripped);
+            if (extra->contains(extra->context, KS_LANG_PERSIAN, stripped)) fa_known = 1;
+        }
+    }
     if (english_known) *english_known = en_known;
     if (persian_known) *persian_known = fa_known;
     if (english_frequent) {
@@ -735,6 +746,11 @@ KS_LIVE_RESULT ks_evaluate_contextual(
         active_common_prefixes = lexicons->persian_common_prefixes;
     }
     active_is_prefix = ks_bloom_contains(active_prefixes, active_word);
+    /* "kuber" on the English layout is the start of "kubernetes": the
+       vocabulary packs protect their words while they are being typed. */
+    if (!active_is_prefix && lexicons->extra && lexicons->extra->has_prefix)
+        active_is_prefix = lexicons->extra->has_prefix(
+            lexicons->extra->context, active_language, active_word);
     active_is_common_prefix =
         ks_bloom_contains(active_common_prefixes, active_word);
 

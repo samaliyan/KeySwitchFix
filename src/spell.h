@@ -72,7 +72,18 @@ typedef struct KS_SPELL_LEXICON {
     const KS_BLOOM *common;
     const KS_VOCAB *vocabulary;   /* optional: words seen this session */
     const KS_VOCAB *personal;     /* optional: the user's saved dictionary */
+    /*
+     * Optional: adjusts a word's rank (zipf * 10) beyond the table. Called
+     * with the table rank (-1 when absent); returns the rank to use (-1 =
+     * not a word). Vocabulary packs give their terms a rank, and the user's
+     * writing memory lifts the words this user actually writes.
+     */
+    int (*rank_adjust)(const void *context, const wchar_t *word, int table_rank);
+    const void *rank_adjust_context;
 } KS_SPELL_LEXICON;
+
+/* The lexicon's rank for a word: the table, then rank_adjust. */
+int ks_spell_rank(const KS_SPELL_LEXICON *lexicon, const wchar_t *word);
 
 typedef enum KS_SPELL_KIND {
     KS_SPELL_KIND_EDIT = 0,       /* one-letter repair */

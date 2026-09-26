@@ -1,0 +1,93 @@
+# IT and computing vocabulary (English). One lowercase word per line; letters only.
+# Words here are never "corrected", count as English for layout repair,
+# and are spelling candidates (so "kubernets" becomes "kubernetes").
+# Words whose Persian-layout reading is a common Persian word are left out
+# (cdn/زید, sdk/سین, vhd/رای, ...): adding them would make that Persian word
+# ambiguous when it is typed on the wrong layout.
+# Two-word phrases (high availability, ip address, active directory, ...) are
+# left out on purpose: joined, they are the missing-space typo the spelling
+# model repairs. Closed compounds IT people write as one word stay.
+# General computing
+api apis  sdks cli gui ui ux url urls uri http https html css xml json yaml yml toml csv tsv pdf utf ascii unicode
+ajax dom  dns ftp sftp ssh ssl tls smtp imap pop tcp udp icmp arp dhcp nat vpn vlan vlans lan wan wlan wifi lte
+ipv ipsec ospf bgp rip mpls qos snmp ntp ldap ldaps kerberos radius saml oauth oidc jwt sso mfa totp otp
+cpu cpus gpu gpus ram rom ssd ssds hdd nvme sata raid bios uefi firmware usb hdmi vga dvi psu ups nas san
+os kernel kernels linux ubuntu debian centos rhel fedora redhat suse alpine unix freebsd macos ios android
+windows powershell cmd bash zsh shell shells sudo chmod chown grep awk sed curl wget cron crontab systemd systemctl
+journalctl dmesg htop iptables nftables firewalld ufw selinux apparmor ssh sshd rsync scp tar gzip zip unzip
+vim nano emacs tmux screen git github gitlab bitbucket svn mercurial repo repos commit commits rebase merge
+pull push fork branch branches checkout stash diff diffs patch patches changelog readme dockerfile makefile
+docker dockerhub podman kubernetes kubectl minikube helm istio openshift rancher containerd cri nginx apache
+httpd tomcat iis haproxy traefik envoy varnish memcached redis rabbitmq kafka zookeeper activemq mqtt
+elasticsearch kibana logstash grafana prometheus zabbix nagios splunk datadog sentry jenkins ansible terraform
+puppet chef vagrant packer consul vault jira confluence trello slack teams zoom outlook exchange sharepoint
+onedrive dropbox azure aws gcp lambda cloudfront route iam vpc subnet subnets cidr gateway gateways
+ proxy proxies reverse cache caching cached backend backends frontend frontends fullstack devops
+devsecops sre mlops cicd pipeline pipelines deploy deploys deployment deployments rollback rollout hotfix
+hotfixes bugfix bugfixes debug debugging debugger breakpoint breakpoints stacktrace traceback segfault
+runtime runtimes compile compiler compilers linker bytecode interpreter transpile transpiler minify minified
+localhost hostname hostnames subdomain subdomains webhook webhooks websocket websockets endpoint endpoints
+microservice microservices monolith serverless middleware framework frameworks library libraries plugin plugins
+addon addons extension extensions package packages npm yarn pnpm pip pypi conda maven gradle nuget cargo
+composer gem gems homebrew brew apt yum dnf rpm deb msi exe dll jar war ear apk ipa iso img vmdk  vhdx ova
+virtualization hypervisor hypervisors vmware vsphere vcenter esxi hyperv proxmox virtualbox qemu kvm xen
+container containers containerized orchestration namespace namespaces pod pods replica replicas replicaset
+daemonset statefulset ingress egress configmap sidecar cluster clusters node nodes failover failback
+  scalability autoscaling throughput latency bandwidth uptime downtime
+backup backups restore restores snapshot snapshots replication replicate replicated sync async asynchronous
+synchronous multithreading multithreaded thread threads mutex semaphore deadlock deadlocks callback callbacks
+promise promises coroutine coroutines lambda lambdas closure closures iterator iterators generator generators
+boolean booleans integer integers float floats double char chars string strings array arrays struct structs
+enum enums tuple tuples dict dicts hashmap hashmaps hashtable hashtables linkedlist queue queues stack stacks
+heap heaps tree trees graph graphs vector vectors matrix pointer pointers null nullable undefined nan
+int uint bool varchar nvarchar clob blob datetime timestamp timestamps timezone utc epoch uuid guid
+regex regexes regexp wildcard wildcards glob parser parsers parsing tokenizer lexer serializer serialize
+deserialize serialization deserialization encode decode encoding decoding encrypt decrypt encryption
+decryption hash hashing hashed salt salted checksum checksums sha md aes rsa ecdsa ecc pki certificate
+certificates cert certs csr keystore truststore openssl letsencrypt https hsts cors csrf xss sqli ddos dos
+malware ransomware phishing spyware trojan rootkit botnet exploit exploits vulnerability vulnerabilities cve
+pentest pentesting siem soc ids ips waf edr xdr antivirus sandbox sandboxed honeypot  patching
+authentication authorization authenticate authorize login logins logout signin signup username usernames
+passwd password passwords passphrase credential credentials token tokens refresh session sessions cookie cookies
+database databases db dbs dba dbms rdbms sql nosql mysql mariadb postgres postgresql sqlite mongodb mongo
+cassandra couchdb dynamodb neo influxdb clickhouse snowflake bigquery redshift oracle mssql sqlserver
+plsql tsql sqlplus sqlcl sqldeveloper toad dbeaver pgadmin schema schemas table tables view views
+index indexes indices query queries subquery subqueries join joins select insert update upsert truncate
+rownum rowid rowtype cursor cursors trigger triggers procedure procedures function functions package
+sequence sequences synonym synonyms constraint constraints primary foreign unique partition partitions
+partitioned partitioning tablespace tablespaces datafile datafiles tempfile tempfiles controlfile
+controlfiles redo undo archivelog archivelogs flashback rman dataguard asm grid crs crsctl srvctl
+dbca netca netmgr lsnrctl listener listeners tnsnames tnsping sqlnet pdb pdbs cdb cdbs rac awr ash
+addm sga pga spfile pfile orapwd opatch datapump expdp impdp exp imp sqlldr goldengate exadata
+standby primary switchover failover mrp  dgmgrl oem opatch patchset rollforward recover recovery
+checkpoint checkpoints commit rollback savepoint deadlock latch latches enqueue wait waits
+etl elt olap oltp  warehouse datamart datalake lakehouse bi powerbi tableau qlik ssrs ssis
+ssas dax mdx pivot dashboards dashboard kpi kpis metrics metric analytics
+python java javascript typescript kotlin swift golang rust ruby perl php scala haskell lua dart
+csharp cpp objc fortran cobol matlab julia groovy elixir erlang clojure fsharp vbnet vba
+react reactjs angular vue vuejs svelte nextjs nuxt jquery bootstrap tailwind sass scss less webpack vite
+babel eslint prettier jest mocha pytest junit selenium cypress playwright postman swagger openapi graphql
+grpc protobuf rest restful soap wsdl rpc odata dotnet aspnet netcore django flask fastapi spring
+springboot hibernate laravel symfony rails express nodejs node deno bun electron flutter xamarin
+tensorflow pytorch keras numpy pandas scipy sklearn jupyter notebook notebooks llm llms gpt chatgpt
+ai ml nlp cnn rnn transformer transformers embedding embeddings dataset datasets
+frontend ux wireframe wireframes mockup mockups prototype prototypes figma sketch
+agile scrum kanban sprint sprints backlog standup retrospective roadmap stakeholder stakeholders
+itil sla slas slo slos kpi incident incidents helpdesk servicedesk ticket tickets escalation
+onboarding offboarding sysadmin sysadmins admin admins administrator administrators netadmin
+server servers client clients workstation workstations laptop laptops desktop desktops 
+router routers switch switches firewall firewalls modem modems  mikrotik cisco juniper fortinet
+fortigate paloalto sophos checkpoint ubiquiti huawei zyxel netgear tplink dlink hp dell lenovo intel amd nvidia
+ ad dc gpo gpos ou  wsus sccm intune entra azuread exchange smb cifs nfs iscsi fc
+fiber ethernet utp stp cat rj poe mac   netmask subnetting traceroute tracert
+nslookup dig ping ipconfig ifconfig netstat telnet putty winscp filezilla mstsc rdp vnc teamviewer anydesk
+syslog syslogs logfile logfiles logging logger loggers verbose stderr stdout stdin
+config configs configuration configurations settings setup installer installers uninstall reinstall
+upgrade upgrades downgrade update updates patching reboot restart shutdown boot bootloader grub
+hotplug driver drivers device devices peripheral peripherals printer printers scanner scanners
+storage filesystem filesystems ntfs fat exfat ext  btrfs zfs lvm mount unmount partition directory
+directories folder folders symlink symlinks inode inodes permission permissions acl acls
+bytes byte kilobyte megabyte gigabyte terabyte petabyte kb mb gb tb pb kbps mbps gbps hz mhz ghz
+bit bits bitrate baud pixel pixels dpi resolution framerate fps codec codecs
+spam inbox email emails attachment attachments smtp dkim dmarc spf mx
+browser browsers chrome chromium firefox edge safari opera brave tor

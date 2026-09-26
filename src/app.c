@@ -9,6 +9,8 @@
 #include "core.h"
 #include "spell.h"
 #include "typing.h"
+#include "domain.h"
+#include "memory.h"
 #include "../resources/resource.h"
 
 #ifndef MOD_NOREPEAT
@@ -16,7 +18,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"3.0.1"
+#define APP_VERSION L"3.1.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -65,6 +67,8 @@
 #define IDC_SNIPPETS 117
 #define IDC_EDIT_SNIPPETS 118
 #define IDC_STATS_LABEL 119
+#define IDC_LEARN_WRITING 140
+#define IDC_VOCAB_IT 141
 #define IDC_TILE_VALUE 120      /* 120..123 */
 #define IDC_TILE_CAPTION 130    /* 130..133 */
 #define UI_TILE_COUNT 4
@@ -86,6 +90,10 @@
 #define IDM_SNIPPETS 211
 #define IDM_EDIT_SNIPPETS 212
 #define IDM_CLEANUP 213
+#define IDM_LEARN_WRITING 214
+#define IDM_OPEN_MEMORY 215
+#define IDM_FORGET_MEMORY 216
+#define IDM_VOCAB_IT 217
 
 #define INPUT_MARKER ((ULONG_PTR)0x4B534632u)
 #define KS_MAX_PHRASE_CHARS KS_MAX_SEQUENCE_CHARS
@@ -110,6 +118,10 @@ typedef struct SETTINGS {
     int persian_letters;
     int auto_capitalize;
     int snippets;
+    /* 3.1: remember the user's words and hand repairs on this PC (opt-in),
+       and the IT & computing vocabulary pack. */
+    int learn_writing;
+    int vocab_it;
     wchar_t excluded[512];
 } SETTINGS;
 
@@ -121,6 +133,8 @@ typedef struct UNDO_RECORD {
     int delimiter_zwnj;
     /* 1 when this was a spelling fix; undoing it teaches the ignore list. */
     int spelling;
+    /* 1 when this was a repair learned from the user; undoing unlearns it. */
+    int learned;
     ULONGLONG created_at;
     wchar_t original[KS_MAX_PHRASE_CHARS + 1];
     wchar_t replacement[KS_MAX_PHRASE_CHARS + 1];
@@ -173,6 +187,39 @@ static DWORD g_snippets_checked_at;
 /* Usage statistics: counters persist (stats.ini); words stay in memory. */
 static KS_STATS g_stats;
 static wchar_t g_stats_path[MAX_PATH];
+/* Writing memory (opt-in) and the vocabulary packs. */
+static KS_WRITING_MEMORY g_memory;
+static int g_memory_active;
+static wchar_t g_memory_path[MAX_PATH];
+static DWORD g_memory_saved_at;
+/* Last-write time of writing-memory.txt as this process last read or wrote
+   it: a newer file means the user edited it, and the file wins. */
+static FILETIME g_memory_file_time;
+static KS_EXTRA_WORDS g_extra_words;
+static const KS_LANGUAGE g_rank_language_en = KS_LANG_ENGLISH;
+static const KS_LANGUAGE g_rank_language_fa = KS_LANG_PERSIAN;
+/* Hand-repair tracking. The "peak" is the longest text the current word
+   had before the user started deleting; if the finished word differs, the
+   pair is a repair the memory can learn ("عسیسم" → "عزیزم"). */
+static unsigned long g_key_serial;
+static wchar_t g_word_peak[KS_MAX_WORD + 1];
+static int g_word_peak_length;
+/* 1 when the peak is a finished word (reopened after its Space). */
+static int g_word_peak_complete;
+static wchar_t g_orphan_peak[KS_MAX_WORD + 1];
+static HWND g_orphan_window;
+static unsigned long g_orphan_serial;
+static int g_orphan_complete;
+/* The word most recently counted, so an Undo right after can take it back. */
+static wchar_t g_last_noted[KS_MAX_WORD + 1];
+/* The last word finished with Space or Enter, so a Backspace straight after
+   it can reopen it for editing. */
+static KS_TOKEN g_prev_word[KS_MAX_WORD];
+static int g_prev_word_count;
+static KS_LANGUAGE g_prev_word_language;
+static HWND g_prev_word_window;
+static unsigned long g_prev_word_serial;
+static DWORD g_prev_word_at;
 /* English auto-capitalisation state machine (see arm_capitalization). */
 static int g_capitalize_armed;
 static int g_capitalize_next;
@@ -383,6 +430,8 @@ static void build_paths(void) {
              L"%ls\\snippets.txt", g_data_directory);
     swprintf(g_stats_path, sizeof(g_stats_path) / sizeof(g_stats_path[0]),
              L"%ls\\stats.ini", g_data_directory);
+    swprintf(g_memory_path, sizeof(g_memory_path) / sizeof(g_memory_path[0]),
+             L"%ls\\writing-memory.txt", g_data_directory);
 }
 
 static void load_settings(void) {
@@ -413,6 +462,8 @@ static void load_settings(void) {
     g_settings.persian_letters = GetPrivateProfileIntW(L"Typing", L"PersianLetters", 1, g_settings_path) != 0;
     g_settings.auto_capitalize = GetPrivateProfileIntW(L"Typing", L"Capitalize", 1, g_settings_path) != 0;
     g_settings.snippets = GetPrivateProfileIntW(L"Typing", L"Snippets", 1, g_settings_path) != 0;
+    g_settings.learn_writing = GetPrivateProfileIntW(L"Memory", L"LearnWriting", 0, g_settings_path) != 0;
+    g_settings.vocab_it = GetPrivateProfileIntW(L"Vocabulary", L"IT", 1, g_settings_path) != 0;
     GetPrivateProfileStringW(L"General", L"ExcludedProcesses",
                              L"1Password.exe,Bitwarden.exe,CredentialUIBroker.exe,KeePass.exe,KeePassXC.exe,LastPass.exe,LockApp.exe",
                              g_settings.excluded,
@@ -464,6 +515,10 @@ static void save_settings(void) {
     WritePrivateProfileStringW(L"Typing", L"Capitalize", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.snippets);
     WritePrivateProfileStringW(L"Typing", L"Snippets", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.learn_writing);
+    WritePrivateProfileStringW(L"Memory", L"LearnWriting", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.vocab_it);
+    WritePrivateProfileStringW(L"Vocabulary", L"IT", number, g_settings_path);
     update_startup_registry();
 }
 
@@ -671,6 +726,149 @@ static void open_snippets_file(void) {
     set_activity(L"snippets.txt opened; save it and the new shortcuts are live within seconds.");
 }
 
+/* ---- Writing memory ------------------------------------------------------ */
+
+static int memory_file_time(FILETIME *time) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    if (!GetFileAttributesExW(g_memory_path, GetFileExInfoStandard, &attributes)) return 0;
+    *time = attributes.ftLastWriteTime;
+    return 1;
+}
+
+static void memory_load(void);
+
+/* The user saved the file in an editor since we last touched it. */
+static int memory_file_edited(void) {
+    FILETIME now;
+    return memory_file_time(&now) && CompareFileTime(&now, &g_memory_file_time) != 0;
+}
+
+static void memory_save(void) {
+    size_t length;
+    wchar_t *text;
+    if (!g_memory_active) return;
+    if (memory_file_edited()) {
+        /* Hand edits win over what was learned since the last save. */
+        memory_load();
+        set_activity(L"writing-memory.txt was edited; KeySwitchFix reloaded it.");
+        return;
+    }
+    if (!g_memory.dirty) return;
+    length = ks_memory_serialize(&g_memory, NULL, 0);
+    text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, (length + 1) * sizeof(wchar_t));
+    if (!text) return;
+    ks_memory_serialize(&g_memory, text, length + 1);
+    if (write_text_file(g_memory_path, text)) {
+        g_memory.dirty = 0;
+        memory_file_time(&g_memory_file_time);
+    } else {
+        set_activity(L"Could not save writing-memory.txt in the KeySwitchFix data folder.");
+    }
+    HeapFree(GetProcessHeap(), 0, text);
+    g_memory_saved_at = GetTickCount();
+}
+
+static void memory_load(void) {
+    wchar_t *text;
+    ks_memory_reset(&g_memory);
+    g_memory_active = 0;
+    if (!g_settings.learn_writing) return;
+    ZeroMemory(&g_memory_file_time, sizeof(g_memory_file_time));
+    text = read_text_file(g_memory_path, &g_memory_file_time);
+    if (text) {
+        ks_memory_parse(&g_memory, text);
+        HeapFree(GetProcessHeap(), 0, text);
+    }
+    g_memory_active = 1;
+}
+
+/* Settings changed: start or stop learning without losing what was learned. */
+static void memory_apply_setting(void) {
+    if (g_settings.learn_writing && !g_memory_active) memory_load();
+    else if (!g_settings.learn_writing && g_memory_active) {
+        memory_save();
+        ks_memory_reset(&g_memory);
+        g_memory_active = 0;
+    }
+}
+
+static void memory_forget(void) {
+    ks_memory_reset(&g_memory);
+    DeleteFileW(g_memory_path);
+    set_activity(L"Writing memory cleared: every learned word and repair is forgotten.");
+}
+
+static void open_memory_file(void) {
+    if (g_memory_active) {
+        g_memory.dirty = 1;
+        memory_save();
+    } else if (GetFileAttributesW(g_memory_path) == INVALID_FILE_ATTRIBUTES) {
+        set_activity(L"Turn on \u201cLearn my writing\u201d first; the memory file is created as you type.");
+        return;
+    }
+    ShellExecuteW(NULL, L"open", L"notepad.exe", g_memory_path, NULL, SW_SHOWNORMAL);
+    set_activity(L"writing-memory.txt opened. Save it and your edits apply within seconds.");
+}
+
+/* Known words beyond the Blooms: the vocabulary pack, and words this user
+   types often. English arrives lower-case, Persian without diacritics. */
+static int extra_word_known(const void *context, KS_LANGUAGE language, const wchar_t *word) {
+    (void)context;
+    if (g_settings.vocab_it && ks_domain_contains(KS_DOMAIN_IT, language, word)) return 1;
+    return g_memory_active && ks_memory_word_count(&g_memory, word) >= KS_MEMORY_KNOWN_COUNT;
+}
+
+static int extra_word_prefix(const void *context, KS_LANGUAGE language, const wchar_t *prefix) {
+    (void)context;
+    return g_settings.vocab_it && ks_domain_has_prefix(KS_DOMAIN_IT, language, prefix);
+}
+
+/* Spelling ranks: pack terms rank as everyday words (zipf 4.0); the user's
+   frequent words rank by how often they are typed, and dictionary words the
+   user favours are lifted a little, so ambiguous typos resolve toward the
+   words this person writes. */
+static int spell_rank_adjust(const void *context, const wchar_t *word, int table_rank) {
+    KS_LANGUAGE language = *(const KS_LANGUAGE *)context;
+    if (table_rank < 0 && g_settings.vocab_it && ks_domain_contains(KS_DOMAIN_IT, language, word))
+        table_rank = 40;
+    return g_memory_active ? ks_memory_rank_adjust(&g_memory, word, table_rank) : table_rank;
+}
+
+static int letters_only_word(const wchar_t *text, KS_LANGUAGE language) {
+    if (!text || !text[0] || !text[1]) return 0;
+    for (; *text; ++text) {
+        if (language == KS_LANG_ENGLISH ? !ks_is_latin_letter(*text) : !ks_is_persian_letter(*text))
+            return 0;
+    }
+    return 1;
+}
+
+/* all lower-case, or only the first letter capital ("Teh" at a sentence
+   start); ALL-CAPS and camelCase are names, acronyms or code. */
+static int ordinary_case(const wchar_t *text) {
+    const wchar_t *cursor;
+    for (cursor = text; *cursor; ++cursor)
+        if (*cursor >= L'A' && *cursor <= L'Z' && cursor != text) return 0;
+    return 1;
+}
+
+static void lower_first(wchar_t *text) {
+    for (; *text; ++text)
+        if (*text >= L'A' && *text <= L'Z') *text = (wchar_t)(*text - L'A' + L'a');
+}
+
+/* One finished word, as it now stands on screen. Never called for
+   developer tools, excluded apps or password fields (typing_helpers). */
+static void memory_note_word(const wchar_t *text, KS_LANGUAGE language) {
+    wchar_t word[KS_MAX_WORD + 1];
+    if (!g_memory_active || !text || wcslen(text) > KS_MAX_WORD) return;
+    safe_copy(word, KS_MAX_WORD + 1, text);
+    if (language == KS_LANG_ENGLISH) lower_first(word);
+    if (!letters_only_word(word, language)) return;
+    ks_memory_observe_word(&g_memory, word);
+    safe_copy(g_last_noted, KS_MAX_WORD + 1, word);
+}
+
 static void current_date_info(KS_DATE_INFO *info) {
     SYSTEMTIME now;
     GetLocalTime(&now);
@@ -698,6 +896,9 @@ static void cancel_smart_correction(void) {
 static void clear_word(void) {
     cancel_smart_correction();
     g_word_auto_capitalized = 0;
+    g_word_peak[0] = 0;
+    g_word_peak_length = 0;
+    g_word_peak_complete = 0;
     g_word_count = 0;
     g_word_mixed = 0;
     g_overflow_count = 0;
@@ -2054,6 +2255,25 @@ static int try_undo(int consume_delimiter) {
         set_activity_pair(L"Restored", g_undo.replacement, g_undo.original);
         /* The user rejected a spelling fix: that spelling is now theirs.
            It is written to disk only when the personal dictionary is on. */
+        if (g_memory_active && g_last_noted[0] && wcslen(g_undo.replacement) <= KS_MAX_WORD) {
+            /* The replacement was just counted as the user's word; it was
+               not their word after all. */
+            wchar_t noted[KS_MAX_WORD + 1];
+            safe_copy(noted, KS_MAX_WORD + 1, g_undo.replacement);
+            lower_first(noted);
+            if (wcscmp(noted, g_last_noted) == 0) ks_memory_unobserve_word(&g_memory, noted);
+            g_last_noted[0] = 0;
+        }
+        if (g_undo.learned) {
+            /* The user rejected a learned repair: unlearn it and leave the
+               word alone for the rest of the session. */
+            wchar_t typo[KS_MAX_WORD + 1];
+            safe_copy(typo, KS_MAX_WORD + 1, g_undo.original);
+            if (g_undo.source_language == KS_LANG_ENGLISH) lower_first(typo);
+            ks_memory_reject_fix(&g_memory, typo);
+            ks_ignore_list_add(&g_spelling_ignore, g_undo.original);
+            if (g_spelling_fixes > 0) InterlockedDecrement(&g_spelling_fixes);
+        }
         if (g_undo.spelling) {
             /* One undo makes the word trusted for this session. It reaches
                the personal dictionary only when the user has typed or
@@ -2207,6 +2427,91 @@ static int expand_snippet_or_pronoun(HWND foreground, UINT boundary_key, int zwn
 }
 
 
+static void remember_prev_word(HWND foreground, const KS_TOKEN *tokens, int count,
+                               KS_LANGUAGE language) {
+    if (count < 1 || count > KS_MAX_WORD ||
+        (language != KS_LANG_ENGLISH && language != KS_LANG_PERSIAN)) return;
+    memcpy(g_prev_word, tokens, (size_t)count * sizeof(tokens[0]));
+    g_prev_word_count = count;
+    g_prev_word_language = language;
+    g_prev_word_window = foreground;
+    g_prev_word_serial = g_key_serial;
+    g_prev_word_at = GetTickCount();
+}
+
+/*
+ * At a word boundary, with the writing memory on:
+ *  - the word was repaired by hand (its peak differs from what is there now):
+ *    record the repair, provided the result is a real word or one the user
+ *    types often — never apply anything to a word the user just fixed;
+ *  - otherwise, if this exact typo has a learned repair, apply it (Undo
+ *    with Backspace, which also unlearns it).
+ * Returns 1 when the text was replaced.
+ */
+static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, int learn) {
+    wchar_t typed[KS_MAX_WORD + 1];
+    wchar_t key[KS_MAX_WORD + 1];
+    const KS_SPELL_LEXICON *lexicon;
+    const wchar_t *fix;
+    int typo_known;
+    if (g_word_language != KS_LANG_ENGLISH && g_word_language != KS_LANG_PERSIAN) return 0;
+    lexicon = g_word_language == KS_LANG_PERSIAN ? &g_persian_spelling : &g_english_spelling;
+    tokens_to_language(g_word, g_word_count, g_word_language, typed);
+    if (g_word_language == KS_LANG_ENGLISH && !ordinary_case(typed)) return 0;
+    safe_copy(key, KS_MAX_WORD + 1, typed);
+    if (g_word_language == KS_LANG_ENGLISH) lower_first(key);
+    if (!letters_only_word(key, g_word_language)) return 0;
+
+    if (g_word_peak[0]) {
+        wchar_t peak[KS_MAX_WORD + 1];
+        int pair;
+        if (!learn) return 0;
+        safe_copy(peak, KS_MAX_WORD + 1, g_word_peak);
+        if (g_word_language == KS_LANG_ENGLISH) {
+            if (!ordinary_case(peak)) return 0;
+            lower_first(peak);
+        }
+        pair = g_word_peak_complete ? ks_memory_is_fix_pair(peak, key)
+                                    : ks_memory_is_fix_pair_midword(peak, key);
+        if (pair && letters_only_word(peak, g_word_language) &&
+            (ks_spell_known(key, lexicon) ||
+             ks_memory_word_count(&g_memory, key) >= KS_MEMORY_KNOWN_COUNT)) {
+            int seen = ks_memory_observe_fix(&g_memory, peak, key);
+            if (seen == KS_MEMORY_FIX_COUNT)
+                set_activity_pair(L"Learned your repair", peak, key);
+        }
+        return 0;
+    }
+
+    typo_known = ks_spell_known(key, lexicon);
+    fix = ks_memory_lookup_fix(&g_memory, key, typo_known);
+    /* A real word the user also types on purpose ("then" for "than"): the
+       repair must have been made more often than the word was left alone. */
+    if (fix && typo_known &&
+        (int)ks_memory_word_count(&g_memory, key) >= ks_memory_fix_count(&g_memory, key))
+        fix = NULL;
+    if (!fix || is_protected_field(foreground)) return 0;
+    {
+        wchar_t replacement[KS_MAX_WORD + 1];
+        safe_copy(replacement, KS_MAX_WORD + 1, fix);
+        /* Keep a capital the user (or sentence capitalisation) typed. */
+        if (g_word_language == KS_LANG_ENGLISH && typed[0] >= L'A' && typed[0] <= L'Z' &&
+            replacement[0] >= L'a' && replacement[0] <= L'z')
+            replacement[0] = (wchar_t)(replacement[0] - L'a' + L'A');
+        if (!send_replacement(foreground, g_word_count, replacement, boundary_key, zwnj,
+                              g_word_language))
+            return 0;
+        store_phrase_undo(foreground, g_word_language, boundary_key, zwnj, typed, replacement);
+        g_undo.learned = 1;
+        mark_sentence_word(foreground);
+        InterlockedIncrement(&g_spelling_fixes);
+        stats_count_correction(typed, 1);
+        if (learn) memory_note_word(replacement, g_word_language);
+        set_activity_pair(L"Your repair", typed, replacement);
+    }
+    return 1;
+}
+
 /* is_protected_field costs a message round trip for Edit controls; while
    keys are being translated it is asked once per focused window. */
 static int translation_target_protected(HWND foreground) {
@@ -2321,6 +2626,8 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             clear_word();
             clear_history();
             forget_layout_request();
+            g_prev_word_count = 0;
+            g_orphan_peak[0] = 0;
             g_undo.valid = 0;
         }
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
@@ -2349,6 +2656,8 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
     }
     if (wparam != WM_KEYDOWN && wparam != WM_SYSKEYDOWN)
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+    /* Every physical key-down: "the key right after X" tests use it. */
+    ++g_key_serial;
     if (data->vkCode == VK_BACK && g_control_down && g_windows_down) {
         clear_word();
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
@@ -2429,12 +2738,60 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
         g_last_key_was_digit = 0;
         cancel_smart_correction();
         g_last_word_key_at = 0;
+        if (!had_word && !g_has_context && g_memory_active && g_prev_word_count > 0 &&
+            g_prev_word_window == foreground && g_prev_word_serial + 1 == g_key_serial &&
+            GetTickCount() - g_prev_word_at < 30000u) {
+            /*
+             * Backspace straight after "word␣": this key deletes the space
+             * and the caret is back at the end of the word. Reopen it, so
+             * the edit the user is about to make is seen as a repair of that
+             * word ("عسیسم␣" ← ← ← … "عزیزم␣").
+             */
+            int i;
+            memcpy(g_word, g_prev_word, (size_t)g_prev_word_count * sizeof(g_word[0]));
+            for (i = 0; i < g_prev_word_count; ++i) g_word_visible[i] = g_prev_word_language;
+            g_word_count = g_prev_word_count;
+            g_overflow_count = 0;
+            g_word_mixed = 0;
+            g_has_context = 1;
+            g_word_window = foreground;
+            g_word_language = g_prev_word_language;
+            g_skip_word = process_is_excluded(foreground);
+            tokens_to_language(g_word, g_word_count, g_word_language, g_word_peak);
+            g_word_peak_length = g_word_count;
+            g_word_peak_complete = 1;
+            /* It was counted at its Space; it is being edited now. */
+            {
+                wchar_t noted[KS_MAX_WORD + 1];
+                safe_copy(noted, KS_MAX_WORD + 1, g_word_peak);
+                if (g_word_language == KS_LANG_ENGLISH) lower_first(noted);
+                ks_memory_unobserve_word(&g_memory, noted);
+            }
+            g_prev_word_count = 0;
+            clear_history();
+            return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+        }
+        g_prev_word_count = 0;
+        /* Remember the longest form of the word before the deletions. */
+        if (g_memory_active && had_word && !g_overflow_count && !g_word_mixed && g_word_count >= 2 &&
+            g_word_count >= g_word_peak_length) {
+            tokens_to_language(g_word, g_word_count, g_word_language, g_word_peak);
+            g_word_peak_length = g_word_count;
+        }
         if (g_overflow_count > 0) --g_overflow_count;
         else if (g_word_count > 0) --g_word_count;
         if (!g_word_count && !g_overflow_count) {
             /* The user deleted the whole word, a rejected correction
                included: stop typing for the layout we asked for. Deleting
-               a separator that follows a finished word is not that. */
+               a separator that follows a finished word is not that. The
+               deleted word is kept for a moment: if the very next key starts
+               a new word, that word is its replacement. */
+            if (g_memory_active && had_word && g_word_peak_length >= 3) {
+                safe_copy(g_orphan_peak, KS_MAX_WORD + 1, g_word_peak);
+                g_orphan_window = foreground;
+                g_orphan_serial = g_key_serial;
+                g_orphan_complete = g_word_peak_complete;
+            }
             clear_word();
             clear_history();
             if (had_word) forget_layout_request();
@@ -2508,7 +2865,16 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             g_word_window = foreground;
             g_word_language = language;
             g_skip_word = process_is_excluded(foreground);
+            /* Retyping a word that was just deleted in full. */
+            if (g_orphan_peak[0] && g_orphan_window == foreground &&
+                g_orphan_serial + 1 == g_key_serial) {
+                safe_copy(g_word_peak, KS_MAX_WORD + 1, g_orphan_peak);
+                g_word_peak_length = (int)wcslen(g_word_peak);
+                g_word_peak_complete = g_orphan_complete;
+            }
         }
+        g_orphan_peak[0] = 0;
+        g_prev_word_count = 0;
         /* First letter of a sentence: capitalise it (English only, no Shift
            or Caps Lock, never in code editors). Any letter disarms. */
         capitalize = g_settings.auto_capitalize && typing_helpers && g_capitalize_next &&
@@ -2584,6 +2950,8 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
         int persian_frequent = 0;
         int had_word = g_word_count > 0 || g_overflow_count > 0;
         int retained_word = 0;
+        int memory_learning;
+        int note_word = 1;
         /*
          * Shift+Space is the zero-width non-joiner on both Windows Persian
          * layouts. It ends the current token exactly like Space, but the
@@ -2627,9 +2995,30 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             clear_word();
             return 1;
         }
+        /* Writing memory: learn a hand repair, or apply a learned one. */
+        /* Learning (and noting words) happens only at a Space: a password
+           in a field Windows cannot identify ends with Enter or Tab. */
+        memory_learning = typing_helpers && g_memory_active && boundary_key == VK_SPACE;
+        if (!g_skip_word && !g_overflow_count && !g_word_mixed && g_word_count > 0 &&
+            typing_helpers && g_memory_active && boundary_key != VK_TAB &&
+            memory_learn_or_repair(foreground, boundary_key, zwnj, memory_learning)) {
+            suppress_key_up(data->vkCode);
+            if (terminates_sentence) start_new_sentence(foreground);
+            clear_history();
+            clear_word();
+            return 1;
+        }
         if (!had_word && g_pending_word_valid) {
             if (boundary_key == VK_SPACE &&
                 g_pending_word_window == foreground) {
+                if (memory_learning && g_pending_word.count > 0) {
+                    wchar_t text[KS_MAX_WORD + 1];
+                    tokens_to_language(g_pending_word.tokens, g_pending_word.count,
+                                       g_pending_word.visible_language, text);
+                    memory_note_word(text, g_pending_word.visible_language);
+                    remember_prev_word(foreground, g_pending_word.tokens, g_pending_word.count,
+                                       g_pending_word.visible_language);
+                }
                 commit_pending_word(foreground, boundary_key, zwnj);
                 mark_sentence_word(foreground);
                 clear_word();
@@ -2644,6 +3033,7 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             KS_LIVE_RESULT mixed = evaluate_mixed_word(foreground, KS_PHASE_BOUNDARY, &decision);
             if (mixed == KS_LIVE_CORRECT_NOW &&
                 apply_decision(foreground, &decision, g_word_count, boundary_key, zwnj)) {
+                if (memory_learning) memory_note_word(decision.replacement, decision.target_language);
                 history_push(foreground, g_word, g_word_count,
                              decision.target_language, boundary_key, zwnj);
                 suppress_key_up(data->vkCode);
@@ -2682,8 +3072,12 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
                 intent, intent_strength, sentence_start(foreground),
                 KS_PHASE_BOUNDARY, &g_lexicons,
                 &decision) == KS_LIVE_CORRECT_NOW) {
+            /* If the replacement fails below, the text on screen is a
+               layout mistake, not the user's word. */
+            note_word = 0;
             if (apply_decision(foreground, &decision, g_word_count,
                                boundary_key, zwnj)) {
+                if (memory_learning) memory_note_word(decision.replacement, decision.target_language);
                 history_push(foreground, g_word, g_word_count,
                              decision.target_language, boundary_key, zwnj);
                 suppress_key_up(data->vkCode);
@@ -2708,6 +3102,9 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
                 remember_intent(foreground, g_word_language,
                                 ambiguous ? 1 : active_frequent ? 3 : 2);
             }
+            /* A word that is gibberish here but a word in the other layout
+               is an uncorrected layout mistake: never learn it. */
+            if (target_known && !active_known) note_word = 0;
             /*
              * When is the spelling model consulted?
              *  - the word is unknown in both layouts: a misspelling or the
@@ -2732,6 +3129,7 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             if (consult_spelling) {
                 int outcome = try_spelling_correction(foreground, boundary_key, zwnj);
                 if (outcome == SPELL_APPLIED) {
+                    if (memory_learning) memory_note_word(g_undo.replacement, g_word_language);
                     suppress_key_up(data->vkCode);
                     if (terminates_sentence) start_new_sentence(foreground);
                     clear_word();
@@ -2741,6 +3139,12 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             }
         }
         if (!g_skip_word && !g_overflow_count && g_word_count > 0) {
+            if (memory_learning && !g_word_mixed && note_word) {
+                wchar_t text[KS_MAX_WORD + 1];
+                tokens_to_language(g_word, g_word_count, g_word_language, text);
+                memory_note_word(text, g_word_language);
+                remember_prev_word(foreground, g_word, g_word_count, g_word_language);
+            }
             history_push(foreground, g_word, g_word_count,
                          g_word_language, boundary_key, zwnj);
             retained_word = boundary_key == VK_SPACE;
@@ -2793,6 +3197,9 @@ static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) 
             clear_word();
             clear_history();
             forget_layout_request();
+            /* The caret may be anywhere now. */
+            g_prev_word_count = 0;
+            g_orphan_peak[0] = 0;
             g_capitalize_armed = 0;
             g_capitalize_next = 0;
             /*
@@ -3188,10 +3595,20 @@ static void show_tray_menu(void) {
         AppendMenuW(helpers_menu, MF_STRING | (g_settings.snippets ? MF_CHECKED : 0),
                     IDM_SNIPPETS, L"Expand snippets");
         AppendMenuW(helpers_menu, MF_STRING, IDM_EDIT_SNIPPETS, L"Edit snippets…");
+        AppendMenuW(helpers_menu, MF_STRING | (g_settings.vocab_it ? MF_CHECKED : 0),
+                    IDM_VOCAB_IT, L"IT && computing vocabulary");
         AppendMenuW(helpers_menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(helpers_menu, MF_STRING | MF_GRAYED, IDM_CLEANUP,
                     L"Clean up selected text:  Ctrl + Win + X");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)helpers_menu, L"Typing helpers");
+    }
+    {
+        HMENU memory_menu = CreatePopupMenu();
+        AppendMenuW(memory_menu, MF_STRING | (g_settings.learn_writing ? MF_CHECKED : 0),
+                    IDM_LEARN_WRITING, L"Learn my writing");
+        AppendMenuW(memory_menu, MF_STRING, IDM_OPEN_MEMORY, L"Open writing memory…");
+        AppendMenuW(memory_menu, MF_STRING, IDM_FORGET_MEMORY, L"Forget everything learned…");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)memory_menu, L"Writing memory");
     }
     if (g_last_typed_process[0]) {
         wchar_t label[MAX_PATH + 48];
@@ -3233,7 +3650,7 @@ static void show_main_window(void) {
 /* ------------------------------------------------------------------------ */
 
 #define UI_CLIENT_WIDTH 840
-#define UI_CLIENT_HEIGHT 748
+#define UI_CLIENT_HEIGHT 762
 #define UI_HEADER_HEIGHT 100
 #define UI_MARGIN 32
 #define UI_CARD_LEFT UI_MARGIN
@@ -3265,6 +3682,8 @@ static HWND g_persian_letters;
 static HWND g_capitalize;
 static HWND g_snippets_check;
 static HWND g_stats_label;
+static HWND g_learn_writing;
+static HWND g_vocab_it;
 
 static int scale(int value) {
     return MulDiv(value, g_dpi, 96);
@@ -3298,6 +3717,8 @@ static void update_controls_from_settings(void) {
     SendMessageW(g_persian_letters, BM_SETCHECK, g_settings.persian_letters ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_capitalize, BM_SETCHECK, g_settings.auto_capitalize ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_snippets_check, BM_SETCHECK, g_settings.snippets ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_learn_writing, BM_SETCHECK, g_settings.learn_writing ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_vocab_it, BM_SETCHECK, g_settings.vocab_it ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_excluded, g_settings.excluded);
     InvalidateRect(g_enable_button, NULL, TRUE);
     if (g_window) {
@@ -3330,6 +3751,8 @@ static void read_controls_to_settings(void) {
     g_settings.persian_letters = SendMessageW(g_persian_letters, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_settings.auto_capitalize = SendMessageW(g_capitalize, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_settings.snippets = SendMessageW(g_snippets_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_settings.learn_writing = SendMessageW(g_learn_writing, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_settings.vocab_it = SendMessageW(g_vocab_it, BM_GETCHECK, 0, 0) == BST_CHECKED;
     GetWindowTextW(g_excluded, g_settings.excluded,
                    (int)(sizeof(g_settings.excluded) / sizeof(wchar_t)));
 }
@@ -3412,10 +3835,16 @@ static void update_diagnostics_ui(void) {
             else
                 swprintf(top, 160, L"  •  most corrected: %ls (%u)", word, count);
         }
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Session: %ld keys, %ld fixes  •  %ld active days  •  about %ld minute%ls saved in total%ls",
-                 (long)g_keys_seen, (long)(g_corrections + g_spelling_fixes + g_snippets_used),
-                 g_stats.days_active, minutes, minutes == 1 ? L"" : L"s", top);
+        if (g_memory_active)
+            swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                     L"Memory: %d words, %d learned repairs  •  %ld active days  •  about %ld minute%ls saved%ls",
+                     g_memory.word_count, ks_memory_active_fix_count(&g_memory),
+                     g_stats.days_active, minutes, minutes == 1 ? L"" : L"s", top);
+        else
+            swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                     L"Session: %ld keys, %ld fixes  •  %ld active days  •  about %ld minute%ls saved in total%ls",
+                     (long)g_keys_seen, (long)(g_corrections + g_spelling_fixes + g_snippets_used),
+                     g_stats.days_active, minutes, minutes == 1 ? L"" : L"s", top);
         set_label_text(g_stats_label, buffer);
     }
     InvalidateRect(g_enable_button, NULL, TRUE);
@@ -3437,9 +3866,9 @@ static void create_tile(HWND window, int index, int left, int top, const wchar_t
 #define UI_CARD1_TOP (UI_HEADER_HEIGHT + 16)
 #define UI_CARD1_BOTTOM (UI_CARD1_TOP + 72)
 #define UI_CARD2_TOP (UI_CARD1_BOTTOM + 16)
-#define UI_ROW_PITCH 40
+#define UI_ROW_PITCH 36
 #define UI_ROW(index) (UI_CARD2_TOP + 50 + (index) * UI_ROW_PITCH)
-#define UI_CARD2_BOTTOM (UI_ROW(5) + 46)
+#define UI_CARD2_BOTTOM (UI_ROW(6) + 44)
 #define UI_CARD3_TOP (UI_CARD2_BOTTOM + 16)
 #define UI_TILE_TOP (UI_CARD3_TOP + 40)
 #define UI_TILE_HEIGHT 52
@@ -3513,6 +3942,12 @@ static void create_ui(HWND window) {
                               UI_CONTROL_LEFT, UI_ROW(5), UI_CONTROL_WIDTH, 28, window, IDC_EXCLUDED);
     create_child(L"BUTTON", L"Edit snippets…", BS_OWNERDRAW, 0,
                  UI_SIDE_LEFT, UI_ROW(5) - 2, 150, 32, window, IDC_EDIT_SNIPPETS);
+
+    g_learn_writing = create_child(L"BUTTON", L"Learn my writing (kept on this PC)", BS_AUTOCHECKBOX, 0,
+                                   UI_CONTROL_LEFT, UI_ROW(6) + 2, UI_CONTROL_WIDTH, 24, window,
+                                   IDC_LEARN_WRITING);
+    g_vocab_it = create_child(L"BUTTON", L"IT && computing terms", BS_AUTOCHECKBOX, 0,
+                              UI_SIDE_LEFT, UI_ROW(6) + 2, UI_SIDE_WIDTH, 24, window, IDC_VOCAB_IT);
 
     /* Card 3: diagnostics and statistics */
     create_tile(window, 0, UI_LABEL_LEFT, UI_TILE_TOP, L"layout fixes today");
@@ -3676,6 +4111,7 @@ static void paint_main_window(HWND window) {
     draw_text(dc, UI_LABEL_LEFT, UI_ROW(3) + 4, L"Digits");
     draw_text(dc, UI_LABEL_LEFT, UI_ROW(4) + 4, L"Typing helpers");
     draw_text(dc, UI_LABEL_LEFT, UI_ROW(5) + 4, L"Excluded apps");
+    draw_text(dc, UI_LABEL_LEFT, UI_ROW(6) + 4, L"Memory & vocabulary");
     SelectObject(dc, g_font_small);
     draw_text_right(dc, UI_CARD_RIGHT, UI_BUTTON_TOP + 10, L"No cloud, no logging, no background service");
     SelectObject(dc, old_font);
@@ -3818,6 +4254,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     return 0;
                 case IDC_SAVE:
                     read_controls_to_settings();
+                    memory_apply_setting();
                     clear_word();
                     clear_history();
                     g_undo.valid = 0;
@@ -3830,6 +4267,32 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 case IDC_EDIT_SNIPPETS:
                 case IDM_EDIT_SNIPPETS:
                     open_snippets_file();
+                    return 0;
+                case IDM_LEARN_WRITING:
+                    g_settings.learn_writing = !g_settings.learn_writing;
+                    memory_apply_setting();
+                    save_settings();
+                    update_controls_from_settings();
+                    set_activity(g_settings.learn_writing
+                        ? L"Learning your writing: words and hand repairs are remembered on this PC."
+                        : L"Learning paused. What was learned is kept; nothing new is recorded.");
+                    return 0;
+                case IDM_OPEN_MEMORY:
+                    open_memory_file();
+                    return 0;
+                case IDM_FORGET_MEMORY:
+                    if (MessageBoxW(window,
+                                    L"Forget every word and repair KeySwitchFix has learned from your typing?\n\n"
+                                    L"This deletes writing-memory.txt and cannot be undone.",
+                                    APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                        memory_forget();
+                    return 0;
+                case IDM_VOCAB_IT:
+                    g_settings.vocab_it = !g_settings.vocab_it;
+                    save_settings();
+                    update_controls_from_settings();
+                    set_activity(g_settings.vocab_it ? L"IT & computing vocabulary: on."
+                                                     : L"IT & computing vocabulary: off.");
                     return 0;
                 case IDM_PUNCTUATION:
                 case IDM_CAPITALIZE:
@@ -3920,6 +4383,12 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             }
             if (wparam == ID_TIMER_SNIPPETS) {
                 if (g_settings.snippets) snippets_reload(0);
+                /* Hand edits of the file are picked up within two seconds;
+                   learned words reach the disk at most once a minute. */
+                if (g_memory_active && memory_file_edited()) memory_save();
+                else if (g_memory_active && g_memory.dirty &&
+                         GetTickCount() - g_memory_saved_at > 60000u)
+                    memory_save();
                 return 0;
             }
             break;
@@ -3931,10 +4400,14 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             return 0;
         case WM_QUERYENDSESSION:
             stats_save();
+            memory_save();
             save_settings();
             return TRUE;
         case WM_ENDSESSION:
-            if (wparam) stats_save();
+            if (wparam) {
+                stats_save();
+                memory_save();
+            }
             return 0;
         case WM_APP_TRAY:
             if (LOWORD(lparam) == WM_LBUTTONDBLCLK) show_main_window();
@@ -3959,6 +4432,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             KillTimer(window, ID_TIMER_STATS);
             KillTimer(window, ID_TIMER_SNIPPETS);
             stats_save();
+            memory_save();
             clipboard_snapshot_free(&g_cleanup_saved_clipboard);
             if (g_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_UNDO);
             if (g_toggle_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_TOGGLE);
@@ -4043,6 +4517,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_lexicons.persian_prefixes = &g_persian_prefix_bloom;
     g_lexicons.english_common_prefixes = &g_english_common_prefix_bloom;
     g_lexicons.persian_common_prefixes = &g_persian_common_prefix_bloom;
+    g_extra_words.contains = extra_word_known;
+    g_extra_words.has_prefix = extra_word_prefix;
+    g_extra_words.context = NULL;
+    g_lexicons.extra = &g_extra_words;
     /*
      * Spelling correction needs the frequency tables. They are generated from
      * wordfreq at build time; if a build shipped without them, the layout
@@ -4065,6 +4543,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_persian_spelling.vocabulary = &g_session_vocabulary;
     g_english_spelling.personal = &g_personal_vocabulary;
     g_persian_spelling.personal = &g_personal_vocabulary;
+    g_english_spelling.rank_adjust = spell_rank_adjust;
+    g_english_spelling.rank_adjust_context = &g_rank_language_en;
+    g_persian_spelling.rank_adjust = spell_rank_adjust;
+    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_context_reset(&g_intent_context);
@@ -4118,7 +4600,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         frame.right = scale(UI_CLIENT_WIDTH);
         frame.bottom = scale(UI_CLIENT_HEIGHT);
         AdjustWindowRectEx(&frame, style, FALSE, WS_EX_APPWINDOW);
-        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 3.0.1",
+        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 3.1.0",
                                    style, CW_USEDEFAULT, CW_USEDEFAULT,
                                    frame.right - frame.left, frame.bottom - frame.top,
                                    NULL, NULL, instance, NULL);
@@ -4131,6 +4613,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
 
     stats_load();
     snippets_reload(1);
+    memory_load();
     install_hooks();
     if (!g_keyboard_hook) set_activity(L"Keyboard hook FAILED. Restart the app or check security software.");
     else if (!g_mouse_hook) set_activity(L"Mouse hook FAILED; caret clicks cannot be observed. Check security software.");

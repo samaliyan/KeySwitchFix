@@ -32,6 +32,19 @@ typedef struct KS_BLOOM {
     int valid;
 } KS_BLOOM;
 
+/*
+ * Words known outside the Bloom resources: vocabulary packs compiled into the
+ * application (IT and computing terms) and the user's own writing memory.
+ * Consulted only for words of three or more letters, after the Blooms.
+ * Either callback may be NULL.
+ */
+typedef struct KS_EXTRA_WORDS {
+    int (*contains)(const void *context, KS_LANGUAGE language, const wchar_t *word);
+    /* 1 when `prefix` begins (or equals) a known extra word. */
+    int (*has_prefix)(const void *context, KS_LANGUAGE language, const wchar_t *prefix);
+    const void *context;
+} KS_EXTRA_WORDS;
+
 typedef struct KS_LEXICONS {
     const KS_BLOOM *english_words;
     const KS_BLOOM *persian_words;
@@ -43,6 +56,7 @@ typedef struct KS_LEXICONS {
     const KS_BLOOM *persian_prefixes;
     const KS_BLOOM *english_common_prefixes;
     const KS_BLOOM *persian_common_prefixes;
+    const KS_EXTRA_WORDS *extra;   /* optional */
 } KS_LEXICONS;
 
 typedef struct KS_LANGUAGE_CONTEXT {

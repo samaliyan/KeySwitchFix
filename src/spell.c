@@ -270,6 +270,15 @@ typedef struct KS_SEARCH {
     int distinct;
 } KS_SEARCH;
 
+int ks_spell_rank(const KS_SPELL_LEXICON *lexicon, const wchar_t *word) {
+    int rank;
+    if (!lexicon || !word) return -1;
+    rank = ks_rank_lookup(lexicon->ranks, word);
+    if (lexicon->rank_adjust) rank = lexicon->rank_adjust(lexicon->rank_adjust_context, word, rank);
+    if (rank > 255) rank = 255;
+    return rank;
+}
+
 static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
                             int bonus, KS_SPELL_KIND kind) {
     int score;
@@ -320,7 +329,7 @@ static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
 }
 
 static void consider(KS_SEARCH *search, const wchar_t *text, int bonus) {
-    consider_ranked(search, text, ks_rank_lookup(search->lexicon->ranks, text),
+    consider_ranked(search, text, ks_spell_rank(search->lexicon, text),
                     bonus, KS_SPELL_KIND_EDIT);
 }
 
@@ -336,7 +345,7 @@ static const wchar_t *const ZWNJ_SUFFIXES[] = {
 };
 
 static int known_rank(const KS_SEARCH *search, const wchar_t *text) {
-    return ks_rank_lookup(search->lexicon->ranks, text);
+    return ks_spell_rank(search->lexicon, text);
 }
 
 static void enumerate_joins(KS_SEARCH *search) {
@@ -524,7 +533,7 @@ static int persian_letters_only(const wchar_t *word) {
 
 int ks_spell_known(const wchar_t *word, const KS_SPELL_LEXICON *lexicon) {
     if (!word || !*word || !lexicon) return 0;
-    if (ks_rank_lookup(lexicon->ranks, word) >= 0) return 1;
+    if (ks_spell_rank(lexicon, word) >= 0) return 1;
     if (ks_vocab_trusted(lexicon->vocabulary, word) ||
         ks_vocab_trusted(lexicon->personal, word)) return 1;
     /*
@@ -574,6 +583,9 @@ int ks_spell_correct(const wchar_t *word, int level,
      */
     if (lexicon->language == KS_LANG_PERSIAN && level >= KS_SPELL_BALANCED &&
         ks_rank_lookup(lexicon->ranks, word) < 0) {
+        /* The corpus table alone decides here: vocabulary packs and the
+           writing memory store joined forms (سرورها) and must not stop the
+           joiner from being restored. */
         memset(&search, 0, sizeof(search));
         search.lexicon = lexicon;
         search.typed = word;

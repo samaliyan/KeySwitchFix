@@ -77,6 +77,9 @@ if (-not $SkipTests) {
     Step "Typing helper tests"
     Run $Zig ($common + @("src\core.c", "src\typing.c", "tests\typing_tests.c", "-o", "dist\typing_tests.exe"))
     Run "dist\typing_tests.exe" @()
+    Step "Writing memory and vocabulary tests"
+    Run $Zig ($common + @("src\core.c", "src\spell.c", "src\domain.c", "src\memory.c", "tests\memory_tests.c", "-o", "dist\memory_tests.exe"))
+    Run "dist\memory_tests.exe" @()
 }
 
 # --- application ----------------------------------------------------------
@@ -84,7 +87,7 @@ Step "KeySwitchFix.exe"
 Push-Location resources
 Run $Zig @("rc", "/:auto-includes", "gnu", "/c", "65001", "/fo", "app.res", "app.rc")
 Pop-Location
-Run $Zig ($common + @("src\app.c", "src\core.c", "src\spell.c", "src\typing.c", "resources\app.res",
+Run $Zig ($common + @("src\app.c", "src\core.c", "src\spell.c", "src\typing.c", "src\domain.c", "src\memory.c", "resources\app.res",
           "-o", "dist\KeySwitchFix.exe",
           "-luser32", "-lgdi32", "-lcomctl32", "-lshell32", "-ladvapi32", "-Wl,/subsystem:windows"))
 

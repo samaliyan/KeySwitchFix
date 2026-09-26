@@ -26,6 +26,12 @@ application's layout automatically.
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
 
+Version 3.1 adds an opt-in **writing memory** that learns the repairs you
+make by hand (`عسیسم` → `عزیزم` after you fix it twice) and the words you
+use most, kept only on your PC, and an **IT & computing vocabulary** of
+1,400 terms (`kubernetes`, `tablespace`, `کانفیگ`, `دیتابیس`). See
+[Writing memory](docs/WRITING_MEMORY.md).
+
 Version 3.0 adds **typing helpers**: Persian digits and punctuation that
 follow the language you are writing, Arabic `ي ك` typed as Persian `ی ک`,
 English sentence capitalisation, snippets with Jalali and Gregorian date

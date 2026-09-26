@@ -16,6 +16,7 @@ if [ ! -f resources/en-rank.bin ] || [ ! -f resources/fa-rank.bin ]; then
   python3 tools/generate_rank_tables.py --if-missing
 fi
 
+python3 tools/generate_domain_words.py
 python3 tests/verify_metadata.py
 
 gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c tests/core_tests.c -o /tmp/keyswitchfix-core-tests
@@ -24,12 +25,14 @@ gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c src/spell.c tests/spell_tests.
 /tmp/keyswitchfix-spell-tests
 gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c src/typing.c tests/typing_tests.c -o /tmp/keyswitchfix-typing-tests
 /tmp/keyswitchfix-typing-tests
+gcc -std=c11 -Wall -Wextra -Werror -O2 src/core.c src/spell.c src/domain.c src/memory.c tests/memory_tests.c -o /tmp/keyswitchfix-memory-tests
+/tmp/keyswitchfix-memory-tests
 
 cd resources
 "$ZIG" rc /:auto-includes gnu /c 65001 /fo app.res app.rc
 cd ..
 "$ZIG" cc -target x86_64-windows-gnu -DUNICODE -D_UNICODE -std=c11 -O2 \
-  -Wall -Wextra -Werror -Isrc -Iresources src/app.c src/core.c src/spell.c src/typing.c resources/app.res \
+  -Wall -Wextra -Werror -Isrc -Iresources src/app.c src/core.c src/spell.c src/typing.c src/domain.c src/memory.c resources/app.res \
   -o dist/KeySwitchFix.exe -luser32 -lgdi32 -lcomctl32 -lshell32 -ladvapi32 \
   -Wl,/subsystem:windows
 

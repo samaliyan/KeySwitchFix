@@ -2,6 +2,39 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] - 2026-09-26
+
+### Added
+
+- **Writing memory** (opt-in, *Learn my writing*): learns the repairs you make
+  by hand — retyping the end of a word, deleting and retyping it, or
+  Backspace back into it after the Space — and applies a repair once it has
+  been seen twice (three times, and only while repaired more often than left
+  alone, when the typo is itself a real word). Backspace undoes and unlearns.
+  It also counts the words you finish with Space: a word typed three times
+  is known (never corrected, repaired to, recognised by layout repair), and
+  dictionary words you use often rank higher in spelling suggestions. Stored
+  only on this PC in `writing-memory.txt` (words typed at least twice, 4,096
+  words and 512 repairs at most); editable in Notepad, with *Forget
+  everything learned* in the tray. Never learns in identifiable password
+  fields, excluded apps, developer tools, terminals, remote sessions, or at
+  Enter/Tab boundaries. See `docs/WRITING_MEMORY.md`.
+- **IT & computing vocabulary pack** (on by default): ~1,100 English and ~320
+  Persian terms (`kubernetes`, `tablespace`, `rman`, `failover`, `کانفیگ`,
+  `دیتابیس`, …) count as real words for spelling and layout repair, and
+  their typos are repaired to them. Lists in `tools/domains/`, compiled by
+  `tools/generate_domain_words.py`.
+- `src/memory.c`, `src/domain.c`, `tests/memory_tests.c`; core and spelling
+  accept extra word sources (`KS_EXTRA_WORDS`, `rank_adjust`).
+
+### Changed
+
+- Dashboard: a seventh settings row, *Memory & vocabulary*; rows are 36
+  pixels apart (client area 762 pixels tall). The statistics line shows the
+  memory's size when learning is on.
+- The Persian half-space restoration consults only the corpus table, so
+  joined forms in a pack or in the memory never block it.
+
 ## [3.0.1] - 2026-09-13
 
 ### Changed
