@@ -20,7 +20,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"3.2.0"
+#define APP_VERSION L"3.2.1"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -254,8 +254,13 @@ static int g_focus_event_protected;
    the outer operation, which no longer knows what is on screen, gives up. */
 static int g_engine_depth;
 static int g_engine_interrupted;
+static int g_com_ready;           /* COM initialised on the UI thread (MSAA queries) */
 static int g_word_skip_untrusted;   /* the current word is skipped only because it is untrusted */
-static DWORD g_hook_entered_at;   /* tick when the hook call being handled began */
+static DWORD g_hook_entered_at;
+/* How long the hook may work on one key before Windows may already have
+   passed the key on: half of LowLevelHooksTimeout when that is set lower
+   than usual, never more than 150 ms. */
+static DWORD g_hook_budget_ms = 150u;   /* tick when the hook call being handled began */
 /* Excel: 1 while the active cell's content is exactly what was typed since
    the cell was entered (Enter, Tab, arrows, a single click), so the rest of
    an AutoComplete suggestion may sit selected after the caret. F2 or a
@@ -307,7 +312,10 @@ typedef struct CLIPBOARD_SNAPSHOT {
 } CLIPBOARD_SNAPSHOT;
 static CLIPBOARD_SNAPSHOT g_cleanup_saved_clipboard;
 static int g_dpi = 96;
-static DWORD g_last_hook_tick;
+static DWORD g_last_hook_tick;       /* any hook event */
+static DWORD g_last_keyboard_tick;   /* keyboard hook events only */
+static DWORD g_last_mouse_tick;      /* mouse hook events only */
+static DWORD g_hook_reinstall_wall;  /* tick of the last reinstall attempt */
 static int g_hook_reinstalls;
 static DWORD g_hook_reinstalled_at;
 static wchar_t g_last_typed_process[MAX_PATH];
@@ -471,27 +479,57 @@ static int load_rank_resource(int identifier, KS_RANK_TABLE *table) {
     return data && ks_rank_table_init(table, data, (size_t)size);
 }
 
-static void build_paths(void) {
-    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", g_data_directory,
-                                            (DWORD)(sizeof(g_data_directory) / sizeof(wchar_t)));
-    if (length == 0 || length >= sizeof(g_data_directory) / sizeof(wchar_t)) {
-        GetTempPathW((DWORD)(sizeof(g_data_directory) / sizeof(wchar_t)), g_data_directory);
-        wcscat(g_data_directory, L"KeySwitchFix");
-    } else {
-        wcscat(g_data_directory, L"\\KeySwitchFix");
+/* dir + separator + name into out (capacity in characters); 0 when it
+   does not fit, and then out is empty rather than a truncated path. */
+static int path_join(wchar_t *out, size_t capacity, const wchar_t *dir, const wchar_t *separator,
+                     const wchar_t *name) {
+    size_t a = wcslen(dir), b = wcslen(separator), c = wcslen(name);
+    if (!capacity) return 0;
+    if (a + b + c + 1 > capacity) {
+        out[0] = 0;
+        return 0;
     }
-    CreateDirectoryW(g_data_directory, NULL);
-    swprintf(g_settings_path, sizeof(g_settings_path) / sizeof(g_settings_path[0]),
-             L"%ls\\settings.ini", g_data_directory);
-    swprintf(g_personal_dictionary_path,
-             sizeof(g_personal_dictionary_path) / sizeof(g_personal_dictionary_path[0]),
-             L"%ls\\personal-dictionary.txt", g_data_directory);
-    swprintf(g_snippets_path, sizeof(g_snippets_path) / sizeof(g_snippets_path[0]),
-             L"%ls\\snippets.txt", g_data_directory);
-    swprintf(g_stats_path, sizeof(g_stats_path) / sizeof(g_stats_path[0]),
-             L"%ls\\stats.ini", g_data_directory);
-    swprintf(g_memory_path, sizeof(g_memory_path) / sizeof(g_memory_path[0]),
-             L"%ls\\writing-memory.txt", g_data_directory);
+    memmove(out, dir, a * sizeof(wchar_t));
+    memcpy(out + a, separator, b * sizeof(wchar_t));
+    memcpy(out + a + b, name, (c + 1) * sizeof(wchar_t));
+    return 1;
+}
+
+/* The longest file name derived from the data folder, plus ".tmp". */
+#define DATA_NAME_ROOM (sizeof("\\personal-dictionary.txt.bak.tmp") - 1)
+
+static int g_paths_ok;
+
+/* The data folder: %LOCALAPPDATA%\KeySwitchFix, or the temp folder when that
+   path is too long for every file name below to fit (a very long user name
+   or a redirected profile). Without either, nothing is written. */
+static void build_paths(void) {
+    wchar_t base[MAX_PATH];
+    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    size_t capacity = sizeof(g_data_directory) / sizeof(g_data_directory[0]);
+    int ok = length > 0 && length < MAX_PATH &&
+             path_join(g_data_directory, capacity - DATA_NAME_ROOM, base, L"\\", L"KeySwitchFix");
+    if (!ok) {
+        length = GetTempPathW(MAX_PATH, base);
+        ok = length > 0 && length < MAX_PATH &&
+             path_join(g_data_directory, capacity - DATA_NAME_ROOM, base,
+                       base[length - 1] == L'\\' ? L"" : L"\\", L"KeySwitchFix");
+    }
+    g_paths_ok = ok;
+    if (!ok) {
+        /* Never fall back to a relative path (the current directory). */
+        g_data_directory[0] = 0;
+        g_settings_path[0] = g_personal_dictionary_path[0] = g_snippets_path[0] = 0;
+        g_stats_path[0] = g_memory_path[0] = 0;
+        return;
+    }
+    if (!CreateDirectoryW(g_data_directory, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        g_paths_ok = 0;
+    path_join(g_settings_path, MAX_PATH, g_data_directory, L"\\", L"settings.ini");
+    path_join(g_personal_dictionary_path, MAX_PATH, g_data_directory, L"\\", L"personal-dictionary.txt");
+    path_join(g_snippets_path, MAX_PATH, g_data_directory, L"\\", L"snippets.txt");
+    path_join(g_stats_path, MAX_PATH, g_data_directory, L"\\", L"stats.ini");
+    path_join(g_memory_path, MAX_PATH, g_data_directory, L"\\", L"writing-memory.txt");
 }
 
 /* True when this copy is the installed one (%LOCALAPPDATA%\Programs\KeySwitchFix).
@@ -503,9 +541,11 @@ static int running_installed_copy(void) {
     wchar_t local[MAX_PATH];
     DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
     size_t prefix;
+    DWORD self_length;
     if (!length || length >= MAX_PATH) return 0;
-    if (!GetModuleFileNameW(NULL, self, MAX_PATH)) return 0;
-    swprintf(expected, MAX_PATH, L"%ls\\Programs\\KeySwitchFix\\", local);
+    self_length = GetModuleFileNameW(NULL, self, MAX_PATH);
+    if (!self_length || self_length >= MAX_PATH) return 0;   /* truncated */
+    if (!path_join(expected, MAX_PATH, local, L"\\", L"Programs\\KeySwitchFix\\")) return 0;
     prefix = wcslen(expected);
     return wcslen(self) > prefix && _wcsnicmp(self, expected, prefix) == 0;
 }
@@ -556,7 +596,13 @@ static void update_startup_registry(void) {
                         L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, NULL, 0,
                         KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
     if (g_settings.start_with_windows) {
-        GetModuleFileNameW(NULL, executable, MAX_PATH);
+        DWORD length = GetModuleFileNameW(NULL, executable, MAX_PATH);
+        if (!length || length >= MAX_PATH) {
+            /* A truncated path would register a program that does not exist. */
+            RegCloseKey(key);
+            set_activity(L"Start with Windows is not available: the program's folder path is too long.");
+            return;
+        }
         swprintf(command, sizeof(command) / sizeof(command[0]), L"\"%ls\"", executable);
         RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE *)command,
                        (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
@@ -569,6 +615,10 @@ static void update_startup_registry(void) {
 static void save_settings(void) {
     wchar_t number[16];
     ++g_settings_generation;   /* cached per-focus facts depend on settings */
+    if (!g_settings_path[0]) {   /* no usable data folder: never write elsewhere */
+        update_startup_registry();
+        return;
+    }
     swprintf(number, 16, L"%d", g_settings.enabled);
     WritePrivateProfileStringW(L"General", L"Enabled", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.sensitivity);
@@ -629,6 +679,7 @@ static void stats_save(void) {
     };
     wchar_t number[24];
     size_t i;
+    if (!g_stats_path[0]) return;
     for (i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
         swprintf(number, 24, L"%ld", *fields[i].value);
         WritePrivateProfileStringW(L"Stats", fields[i].key, number, g_stats_path);
@@ -718,7 +769,7 @@ static wchar_t *read_text_file(const wchar_t *path, FILETIME *written) {
 }
 
 static int write_text_file(const wchar_t *path, const wchar_t *text) {
-    wchar_t temporary[MAX_PATH];
+    wchar_t temporary[MAX_PATH + 8];
     HANDLE file;
     int length;
     char *utf8;
@@ -732,7 +783,10 @@ static int write_text_file(const wchar_t *path, const wchar_t *text) {
     WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8 + 3, length, NULL, NULL);
     /* Write a sibling temporary file and swap it in, so a crash or a full
        disk never leaves a half-written memory or dictionary behind. */
-    swprintf(temporary, MAX_PATH, L"%ls.tmp", path);
+    if (!path || !*path || !path_join(temporary, MAX_PATH, path, L"", L".tmp")) {
+        HeapFree(GetProcessHeap(), 0, utf8);
+        return 0;   /* fail closed: never write a truncated name */
+    }
     file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file != INVALID_HANDLE_VALUE) {
         DWORD size = (DWORD)(length - 1 + 3);
@@ -782,12 +836,16 @@ static void snippets_reload(int force) {
     ZeroMemory(&written, sizeof(written));
     text = read_text_file(g_snippets_path, &written);
     if (!text) {
-        /* Unreadable (sharing violation, over 4 MB): remembered so the
-           attempt is not repeated every two seconds until the file changes. */
+        /* Too large: remembered, so it is not read again until it changes.
+           Anything else (an editor or a virus scanner holding the file for
+           a moment) is transient: the working table stays and the next
+           check tries again. */
         WIN32_FILE_ATTRIBUTE_DATA attributes;
-        if (GetFileAttributesExW(g_snippets_path, GetFileExInfoStandard, &attributes))
+        if (GetFileAttributesExW(g_snippets_path, GetFileExInfoStandard, &attributes) &&
+            (attributes.nFileSizeHigh || attributes.nFileSizeLow > 4u * 1024u * 1024u)) {
             g_snippets_loaded_time = attributes.ftLastWriteTime;
-        g_snippets.count = 0;
+            g_snippets.count = 0;
+        }
         return;
     }
     g_snippets_loaded_time = written;
@@ -866,11 +924,11 @@ static void memory_save(void) {
     if (write_text_file(g_memory_path, text)) {
         g_memory.dirty = 0;
         memory_file_time(&g_memory_file_time);
+        g_memory_saved_at = GetTickCount();   /* only a real save delays the next */
     } else {
         set_activity(L"Could not save writing-memory.txt in the KeySwitchFix data folder.");
     }
     HeapFree(GetProcessHeap(), 0, text);
-    g_memory_saved_at = GetTickCount();
 }
 
 static void memory_load(void) {
@@ -900,6 +958,8 @@ static void memory_apply_setting(void) {
 static void memory_forget(void) {
     ks_memory_reset(&g_memory);
     DeleteFileW(g_memory_path);
+    ZeroMemory(&g_memory_file_time, sizeof(g_memory_file_time));
+    g_memory_saved_at = 0;
     set_activity(L"Writing memory cleared: every learned word and repair is forgotten.");
 }
 
@@ -1471,7 +1531,9 @@ static void excluded_list_toggle(const wchar_t *name) {
             removed = 1;
             continue;
         }
-        if (used + length + 2 >= sizeof(rebuilt) / sizeof(rebuilt[0])) break;
+        /* Cannot happen (the rebuilt list is never longer than the old
+           one), but never drop entries: keep the list unchanged instead. */
+        if (used + length + 2 >= sizeof(rebuilt) / sizeof(rebuilt[0])) return;
         if (used) rebuilt[used++] = L',';
         memcpy(rebuilt + used, start, length * sizeof(wchar_t));
         used += length;
@@ -1479,12 +1541,15 @@ static void excluded_list_toggle(const wchar_t *name) {
     }
     if (!removed) {
         size_t length = wcslen(name);
-        if (used + length + 2 < sizeof(rebuilt) / sizeof(rebuilt[0])) {
-            if (used) rebuilt[used++] = L',';
-            memcpy(rebuilt + used, name, length * sizeof(wchar_t));
-            used += length;
-            rebuilt[used] = 0;
+        if (used + length + 2 >= sizeof(rebuilt) / sizeof(rebuilt[0]) ||
+            used + length + 2 >= sizeof(g_settings.excluded) / sizeof(wchar_t)) {
+            set_activity(L"The excluded-apps list is full; remove an entry on the dashboard first.");
+            return;
         }
+        if (used) rebuilt[used++] = L',';
+        memcpy(rebuilt + used, name, length * sizeof(wchar_t));
+        used += length;
+        rebuilt[used] = 0;
     }
     safe_copy(g_settings.excluded, sizeof(g_settings.excluded) / sizeof(wchar_t), rebuilt);
 }
@@ -1586,10 +1651,11 @@ static HKL find_layout(KS_LANGUAGE language) {
     return NULL;
 }
 
-static const wchar_t *missing_layout_name(void) {
-    if (!find_layout(KS_LANG_PERSIAN)) return L"Persian";
-    if (!find_layout(KS_LANG_ENGLISH)) return L"English";
-    return NULL;
+/* The keyboard layout Windows lacks: KS_LANG_OTHER when both exist. */
+static KS_LANGUAGE missing_layout(void) {
+    if (!find_layout(KS_LANG_PERSIAN)) return KS_LANG_PERSIAN;
+    if (!find_layout(KS_LANG_ENGLISH)) return KS_LANG_ENGLISH;
+    return KS_LANG_OTHER;
 }
 
 static int translated_layout_character(HKL layout, DWORD scan_code,
@@ -1850,7 +1916,7 @@ static int send_replacement(HWND foreground, int delete_count, const wchar_t *re
     if (g_engine_interrupted) return 0;
     /* Windows passes a key on by itself when the hook takes too long; if it
        did, the key is already in the application and the count is off. */
-    if (g_hook_entered_at && GetTickCount() - g_hook_entered_at > 150u) {
+    if (g_hook_entered_at && GetTickCount() - g_hook_entered_at > g_hook_budget_ms) {
         set_activity(L"A correction was skipped because the system was busy.");
         return 0;
     }
@@ -2040,7 +2106,11 @@ static int try_sequence_correction(HWND foreground,
         if (!send_replacement(foreground, (int)wcslen(original), replacement,
                               delimiter, delimiter_zwnj, result.language))
             return 0;
-        store_phrase_undo(foreground, current_visible_language, delimiter,
+        /* The restored text is the phrase as typed: mostly the language
+           the replaced words were typed in, the opposite of the result. */
+        store_phrase_undo(foreground,
+                          result.language == KS_LANG_ENGLISH ? KS_LANG_PERSIAN : KS_LANG_ENGLISH,
+                          delimiter,
                           delimiter_zwnj, original, replacement);
         /*
          * Keep monitoring from the beginning of the sentence. Only the
@@ -2074,23 +2144,30 @@ static int try_sequence_correction(HWND foreground,
 static int personal_dictionary_lines;
 
 static void save_personal_dictionary(void) {
-    HANDLE file;
+    /* Written whole and swapped in (write_text_file), so a failed write
+       never destroys the existing dictionary. */
+    size_t capacity = 1;
+    wchar_t *text;
+    size_t used = 0;
     int i;
-    file = CreateFileW(g_personal_dictionary_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) return;
+    for (i = 0; i < g_personal_vocabulary.count; ++i)
+        capacity += wcslen(g_personal_vocabulary.entries[i].text) + 2;
+    text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(wchar_t));
+    if (!text) return;
     for (i = 0; i < g_personal_vocabulary.count; ++i) {
-        char utf8[KS_MAX_WORD * 4 + 4];
-        DWORD written = 0;
-        int length = WideCharToMultiByte(CP_UTF8, 0, g_personal_vocabulary.entries[i].text, -1,
-                                         utf8, (int)sizeof(utf8) - 3, NULL, NULL);
-        if (length <= 1) continue;
-        utf8[length - 1] = '\r';
-        utf8[length] = '\n';
-        WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL);
+        size_t length = wcslen(g_personal_vocabulary.entries[i].text);
+        if (!length) continue;
+        memcpy(text + used, g_personal_vocabulary.entries[i].text, length * sizeof(wchar_t));
+        used += length;
+        text[used++] = L'\r';
+        text[used++] = L'\n';
     }
-    CloseHandle(file);
-    personal_dictionary_lines = g_personal_vocabulary.count;
+    text[used] = 0;
+    if (write_text_file(g_personal_dictionary_path, text))
+        personal_dictionary_lines = g_personal_vocabulary.count;
+    else
+        set_activity(L"The personal dictionary could not be saved.");
+    HeapFree(GetProcessHeap(), 0, text);
 }
 
 static void load_personal_dictionary(void) {
@@ -2203,9 +2280,11 @@ static void append_personal_dictionary(const wchar_t *word) {
         set_activity(L"The personal dictionary could not be written.");
         return;
     }
-    WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL);
+    if (WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL) && written == (DWORD)(length + 1))
+        ++personal_dictionary_lines;
+    else
+        set_activity(L"The personal dictionary could not be written.");
     CloseHandle(file);
-    ++personal_dictionary_lines;
 }
 
 /*
@@ -2343,6 +2422,9 @@ static void engine_reset_for_focus(void) {
     /* The Excel cell state is left alone: F2 or a double-click may move the
        focus to the cell editor, which is exactly the "editing" state. */
     g_word_untrusted = 0;
+    /* The cached focused control belongs to the old field (Tab between
+       fields keeps the same top-level window). */
+    g_target.thread = 0;
     clear_word();
     clear_history();
     forget_layout_request();
@@ -2358,6 +2440,7 @@ static int accessible_is_protected(HWND window, LONG object_id, LONG child_id) {
     IAccessible *accessible = NULL;
     VARIANT child;
     int protected_now = 0;
+    if (!g_com_ready) return 0;   /* only Windows' own password edits are known then */
     VariantInit(&child);
     if (SUCCEEDED(AccessibleObjectFromEvent(window, (DWORD)object_id, (DWORD)child_id,
                                             &accessible, &child)) && accessible) {
@@ -2376,6 +2459,17 @@ static int accessible_is_protected(HWND window, LONG object_id, LONG child_id) {
 static void run_focus_query(void);
 static int g_focus_query_posted;
 static int g_focus_query_running;
+
+static void read_hook_budget(void) {
+    HKEY key;
+    DWORD value = 0, type = 0, size = sizeof(value);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return;
+    if (RegQueryValueExW(key, L"LowLevelHooksTimeout", NULL, &type, (BYTE *)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && value >= 20 && value / 2 < g_hook_budget_ms)
+        g_hook_budget_ms = value / 2;
+    RegCloseKey(key);
+}
 
 static void CALLBACK focus_event_proc(HWINEVENTHOOK hook, DWORD event, HWND window, LONG object_id,
                                       LONG child_id, DWORD thread_id, DWORD event_time) {
@@ -3028,7 +3122,7 @@ static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
     if (!translate && !helpers) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     /* Windows already passed the key on (the hook took too long), or keys
        slipped past meanwhile: injecting now would type it twice. */
-    if (g_engine_interrupted || (g_hook_entered_at && GetTickCount() - g_hook_entered_at > 150u))
+    if (g_engine_interrupted || (g_hook_entered_at && GetTickCount() - g_hook_entered_at > g_hook_budget_ms))
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     /* Numeric keypad keys depend on Num Lock, not on the layout. */
     if ((data->vkCode >= VK_NUMPAD0 && data->vkCode <= VK_DIVIDE) || (data->flags & LLKHF_EXTENDED))
@@ -3116,7 +3210,7 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
     if (g_engine_depth > 0) {
         /* See g_engine_depth: never interpret a key in the middle of
            another key's operation. */
-        g_last_hook_tick = GetTickCount();
+        g_last_hook_tick = g_last_keyboard_tick = GetTickCount();
         if (key_down_event || foreign_key_down) {
             g_engine_interrupted = 1;
             g_engine_key_interrupted = 1;
@@ -3166,7 +3260,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     int pronoun_context = 0;
 
     if (code < 0) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
-    g_last_hook_tick = GetTickCount();
+    g_last_hook_tick = g_last_keyboard_tick = GetTickCount();
     data = (KBDLLHOOKSTRUCT *)lparam;
     if (data->flags & LLKHF_INJECTED) {
         if (data->dwExtraInfo != INPUT_MARKER) {
@@ -3759,7 +3853,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
 
 static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
     MSLLHOOKSTRUCT *data;
-    if (code >= 0) g_last_hook_tick = GetTickCount();
+    if (code >= 0) g_last_hook_tick = g_last_mouse_tick = GetTickCount();
     if (code >= 0 && (wparam == WM_LBUTTONDOWN || wparam == WM_RBUTTONDOWN ||
                       wparam == WM_MBUTTONDOWN || wparam == WM_XBUTTONDOWN)) {
         data = (MSLLHOOKSTRUCT *)lparam;
@@ -3805,11 +3899,14 @@ static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) 
  */
 static int install_hooks(void) {
     int was_detached = 0;
-    if (g_keyboard_hook && !UnhookWindowsHookEx(g_keyboard_hook)) was_detached = 1;
-    if (g_mouse_hook && !UnhookWindowsHookEx(g_mouse_hook)) was_detached = 1;
+    /* Only ERROR_INVALID_HOOK_HANDLE means Windows had already removed it. */
+    if (g_keyboard_hook && !UnhookWindowsHookEx(g_keyboard_hook) &&
+        GetLastError() == ERROR_INVALID_HOOK_HANDLE) was_detached = 1;
+    if (g_mouse_hook && !UnhookWindowsHookEx(g_mouse_hook) &&
+        GetLastError() == ERROR_INVALID_HOOK_HANDLE) was_detached = 1;
     g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard_hook_proc, g_instance, 0);
     g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook_proc, g_instance, 0);
-    g_last_hook_tick = GetTickCount();
+    g_last_hook_tick = g_last_keyboard_tick = g_last_mouse_tick = GetTickCount();
     clear_word();
     clear_history();
     g_undo.valid = 0;
@@ -3833,7 +3930,7 @@ static void check_hook_health(void) {
         if (!g_mouse_hook)
             g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook_proc, g_instance, 0);
         if (keyboard_was_down && g_keyboard_hook) {
-            g_last_hook_tick = GetTickCount();
+            g_last_hook_tick = g_last_keyboard_tick = GetTickCount();
             set_activity(L"Keyboard hook is running again.");
         }
         return;
@@ -3851,11 +3948,21 @@ static void check_hook_health(void) {
      * considering another reinstall, instead of churning every interval.
      */
     silence = info.dwTime - g_last_hook_tick;
-    if ((LONG)silence <= (LONG)HOOK_SILENCE_LIMIT_MS) return;
+    /* The mouse hook must not hide a dead keyboard hook: when the newest
+       input was not a mouse event (the mouse hook did not see it) and the
+       keyboard hook has been quiet since, the keyboard hook missed it. */
+    if ((LONG)silence <= (LONG)HOOK_SILENCE_LIMIT_MS &&
+        !((LONG)(info.dwTime - g_last_mouse_tick) > 250 &&
+          (LONG)(info.dwTime - g_last_keyboard_tick) > (LONG)HOOK_SILENCE_LIMIT_MS))
+        return;
+    /* One attempt per quiet episode, but a failed attempt (events still
+       missing) is retried every five minutes rather than never. */
     if (g_hook_reinstalled_at &&
-        (LONG)(g_last_hook_tick - g_hook_reinstalled_at) <= 0) return;
+        (LONG)(g_last_hook_tick - g_hook_reinstalled_at) <= 0 &&
+        GetTickCount() - g_hook_reinstall_wall < 300000u) return;
     was_detached = install_hooks();
     g_hook_reinstalled_at = g_last_hook_tick;
+    g_hook_reinstall_wall = GetTickCount();
     if (!g_keyboard_hook || !g_mouse_hook) {
         set_activity(L"Keyboard hook FAILED to reinstall. Restart the app or check security software.");
         return;
@@ -4017,7 +4124,7 @@ static int clipboard_set_text(const wchar_t *text) {
     return ok;
 }
 
-static void send_shortcut(WORD key) {
+static int send_shortcut(WORD key) {
     INPUT inputs[4];
     UINT count = 0;
     ZeroMemory(inputs, sizeof(inputs));
@@ -4031,7 +4138,8 @@ static void send_shortcut(WORD key) {
     inputs[count].ki.dwFlags = KEYEVENTF_KEYUP;
     inputs[count].ki.dwExtraInfo = INPUT_MARKER;
     ++count;
-    SendInput(count, inputs, sizeof(INPUT));
+    /* 0 when Windows blocked it (an elevated window ignores our input). */
+    return SendInput(count, inputs, sizeof(INPUT)) == count;
 }
 
 static void finish_selection_cleanup(void) {
@@ -4101,7 +4209,11 @@ static void continue_selection_cleanup(void) {
             }
             clipboard_snapshot_take(&g_cleanup_saved_clipboard);
             g_cleanup_sequence = GetClipboardSequenceNumber();
-            send_shortcut('C');
+            if (!send_shortcut('C')) {
+                set_activity(L"Clean-up is not possible here: the window runs as administrator.");
+                finish_selection_cleanup();
+                return;
+            }
             g_cleanup_key_serial = g_key_serial;
             g_cleanup_step = 2;
             SetTimer(g_window, ID_TIMER_CLEANUP, 120, NULL);
@@ -4118,7 +4230,30 @@ static void continue_selection_cleanup(void) {
             /* The clipboard now holds the selection: that is the state a
                later restore must find untouched. */
             g_cleanup_sequence = GetClipboardSequenceNumber();
+            {
+                /* The copy must come from the application being cleaned up,
+                   not from another program that copied meanwhile. */
+                HWND owner = GetClipboardOwner();
+                DWORD owner_process = 0;
+                DWORD target_process = 0;
+                DWORD focus_process = 0;
+                if (owner) GetWindowThreadProcessId(owner, &owner_process);
+                GetWindowThreadProcessId(g_cleanup_target, &target_process);
+                /* Store apps: the frame and the app are different processes. */
+                GetWindowThreadProcessId(focused_window(g_cleanup_target), &focus_process);
+                if (owner && owner_process != target_process && owner_process != focus_process) {
+                    set_activity(L"Clean-up cancelled: another program changed the clipboard.");
+                    finish_selection_cleanup();
+                    return;
+                }
+            }
             text = clipboard_text_copy();
+            if (text && GetClipboardSequenceNumber() != g_cleanup_sequence) {
+                set_activity(L"Clean-up cancelled: the clipboard changed while it was read.");
+                HeapFree(GetProcessHeap(), 0, text);
+                finish_selection_cleanup();
+                return;
+            }
             if (!text || !*text) {
                 set_activity(L"The selection is not text.");
                 if (text) HeapFree(GetProcessHeap(), 0, text);
@@ -4333,6 +4468,9 @@ static int g_monitor_dpi = 96;
 static int g_fit_percent = 100;
 static HICON g_icon_normal;
 static HICON g_icon_paused;
+static int g_icon_normal_owned;
+static int g_tray_dirty = 1;
+static int g_undo_timer_ticks;   /* loaded with LoadImage (not shared) */
 
 static int scale(int value) {
     return MulDiv(value, g_dpi, 96);
@@ -4471,11 +4609,13 @@ static HICON make_grey_icon(HICON source) {
     int count;
     int i;
     if (!source || !GetIconInfo(source, &info)) return NULL;
-    if (!info.hbmColor) {
+    ZeroMemory(&bitmap, sizeof(bitmap));
+    if (!info.hbmColor || !GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) ||
+        bitmap.bmWidth <= 0 || bitmap.bmHeight <= 0 || bitmap.bmWidth > 256 || bitmap.bmHeight > 256) {
+        if (info.hbmColor) DeleteObject(info.hbmColor);
         DeleteObject(info.hbmMask);
         return NULL;
     }
-    GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap);
     ZeroMemory(&header, sizeof(header));
     header.bmiHeader.biSize = sizeof(header.bmiHeader);
     header.bmiHeader.biWidth = bitmap.bmWidth;
@@ -4517,14 +4657,14 @@ static HICON make_grey_icon(HICON source) {
 
 /* 0 active, 1 paused, 2 not working (reason in *why). */
 static int app_state(const wchar_t **why) {
-    const wchar_t *missing = missing_layout_name();
+    KS_LANGUAGE missing = missing_layout();
     if (why) *why = L"";
     if (!g_keyboard_hook) {
         if (why) *why = L"keyboard hook blocked";
         return 2;
     }
-    if (missing) {
-        if (why) *why = missing[0] == L'P' ? L"Persian layout missing" : L"English layout missing";
+    if (missing != KS_LANG_OTHER) {
+        if (why) *why = missing == KS_LANG_PERSIAN ? L"Persian layout missing" : L"English layout missing";
         return 2;
     }
     return g_settings.enabled ? 0 : 1;
@@ -4534,6 +4674,8 @@ static void load_tray_icons(void) {
     int size = GetSystemMetrics(SM_CXSMICON);
     if (!g_icon_normal)
         g_icon_normal = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, size, size, 0);
+    g_icon_normal_owned = g_icon_normal != NULL;
+    /* LoadIcon returns a shared icon that must never be destroyed. */
     if (!g_icon_normal) g_icon_normal = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP));
     if (!g_icon_paused) g_icon_paused = make_grey_icon(g_icon_normal);
 }
@@ -4542,7 +4684,7 @@ static void load_tray_icons(void) {
    taskbar): the small-icon size may differ, so the icons are rebuilt. */
 static void reload_tray_icons(void) {
     if (g_icon_paused) DestroyIcon(g_icon_paused);
-    if (g_icon_normal) DestroyIcon(g_icon_normal);
+    if (g_icon_normal && g_icon_normal_owned) DestroyIcon(g_icon_normal);
     g_icon_paused = NULL;
     g_icon_normal = NULL;
     load_tray_icons();
@@ -4568,15 +4710,26 @@ static void add_tray_icon(void) {
     g_tray_retries = 0;
     g_tray.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
+    g_tray_dirty = 1;   /* a new icon: always send the state */
     update_tray_tip();
 }
 
 static void update_tray_tip(void) {
+    static int shown_state = -1;
+    static HICON shown_icon;
     const wchar_t *why;
     int state = app_state(&why);
+    HICON icon;
     load_tray_icons();
+    icon = state == 0 || !g_icon_paused ? g_icon_normal : g_icon_paused;
+    /* The watchdog calls this every few seconds: skip it when nothing
+       changed (a tooltip being shown would flicker). */
+    if (!g_tray_dirty && state == shown_state && icon == shown_icon) return;
+    g_tray_dirty = 0;
+    shown_state = state;
+    shown_icon = icon;
     g_tray.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_ICON;
-    g_tray.hIcon = state == 0 || !g_icon_paused ? g_icon_normal : g_icon_paused;
+    g_tray.hIcon = icon;
     safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t),
               state == 0 ? L"KeySwitchFix — Active"
                          : state == 1 ? (g_toggle_hotkey_registered ? L"KeySwitchFix — Paused (Ctrl + Win + K resumes)"
@@ -4588,11 +4741,12 @@ static void update_tray_tip(void) {
 static void show_balloon(const wchar_t *title, const wchar_t *text) {
     /* NIF_REALTIME: a note that cannot be shown now is dropped rather than
        queued in the notification centre. */
-    g_tray.uFlags = NIF_INFO | NIF_REALTIME;
-    g_tray.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
-    safe_copy(g_tray.szInfoTitle, sizeof(g_tray.szInfoTitle) / sizeof(wchar_t), title);
-    safe_copy(g_tray.szInfo, sizeof(g_tray.szInfo) / sizeof(wchar_t), text);
-    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+    NOTIFYICONDATAW note = g_tray;   /* the shared record keeps its flags */
+    note.uFlags = NIF_INFO | NIF_REALTIME;
+    note.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    safe_copy(note.szInfoTitle, sizeof(note.szInfoTitle) / sizeof(wchar_t), title);
+    safe_copy(note.szInfo, sizeof(note.szInfo) / sizeof(wchar_t), text);
+    Shell_NotifyIconW(NIM_MODIFY, &note);
 }
 
 /* ---- Settings <-> controls ----------------------------------------------- */
@@ -4683,8 +4837,10 @@ static void set_label_text(HWND label, const wchar_t *text) {
     wchar_t current[512];
     if (!label) return;
     current[0] = 0;
-    GetWindowTextW(label, current, (int)(sizeof(current) / sizeof(current[0])));
-    if (wcscmp(current, text) != 0) SetWindowTextW(label, text);
+    /* Longer texts cannot be compared in the buffer: just set them. */
+    if (wcslen(text) >= sizeof(current) / sizeof(current[0]) ||
+        (GetWindowTextW(label, current, (int)(sizeof(current) / sizeof(current[0]))), wcscmp(current, text) != 0))
+        SetWindowTextW(label, text);
 }
 
 static void set_tile_value(int index, LONG value) {
@@ -5267,7 +5423,14 @@ static void paint_main_window(HWND window) {
     GetClientRect(window, &client);
     /* Double-buffered: the whole frame is composed off screen, then copied. */
     dc = CreateCompatibleDC(target);
-    bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+    bitmap = (dc && client.right > 0 && client.bottom > 0)
+                 ? CreateCompatibleBitmap(target, client.right, client.bottom) : NULL;
+    if (!bitmap) {
+        /* Out of GDI resources or an empty client area: nothing to draw. */
+        if (dc) DeleteDC(dc);
+        EndPaint(window, &paint);
+        return;
+    }
     old_bitmap = SelectObject(dc, bitmap);
     SetBkMode(dc, TRANSPARENT);
     FillRect(dc, &client, g_high_contrast ? GetSysColorBrush(COLOR_WINDOW) : g_brush_background);
@@ -5590,7 +5753,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                         (GetWindowLongPtrW(focus, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW &&
                         GetDlgCtrlID(focus) != IDC_EXCLUDED)
                         SendMessageW(focus, BM_CLICK, 0, 0);
-                    else if (focus == g_excluded)
+                    else if (focus == g_excluded && excluded_edit_changed())
                         apply_controls();
                     return 0;
                 }
@@ -5720,6 +5883,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
         }
         case WM_HOTKEY:
             if (wparam == ID_HOTKEY_UNDO) {
+                g_undo_timer_ticks = 0;
                 SetTimer(window, ID_TIMER_UNDO, 40, NULL);
                 return 0;
             }
@@ -5752,6 +5916,12 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 return 0;
             }
             if (wparam == ID_TIMER_UNDO) {
+                /* Give up after about two seconds (keys held, or the
+                   engine busy) instead of polling for ever. */
+                if (++g_undo_timer_ticks > 50) {
+                    KillTimer(window, ID_TIMER_UNDO);
+                    return 0;
+                }
                 if (!key_down(VK_CONTROL) && !key_down(VK_LWIN) && !key_down(VK_RWIN) && !key_down(VK_BACK)) {
                     if (engine_enter()) {
                         KillTimer(window, ID_TIMER_UNDO);
@@ -5869,10 +6039,25 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             Shell_NotifyIconW(NIM_DELETE, &g_tray);
             destroy_ui(window);
             if (g_icon_paused) DestroyIcon(g_icon_paused);
+            if (g_icon_normal && g_icon_normal_owned) DestroyIcon(g_icon_normal);
+            g_icon_paused = g_icon_normal = NULL;
             PostQuitMessage(0);
             return 0;
     }
     return DefWindowProcW(window, message, wparam, lparam);
+}
+
+/* A whole command-line argument, not a substring (--showcase is not --show). */
+static int command_line_has(const wchar_t *name) {
+    int count = 0;
+    int i;
+    int found = 0;
+    LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!arguments) return 0;
+    for (i = 1; i < count && !found; ++i)
+        if (_wcsicmp(arguments[i], name) == 0) found = 1;
+    LocalFree(arguments);
+    return found;
 }
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_ansi, int show_command) {
@@ -5886,8 +6071,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     (void)command_line_ansi;
 
     g_instance = instance;
-    /* MSAA queries in focus_event_proc need COM on this (the UI) thread. */
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    /* MSAA queries in focus_event_proc need COM on this (the UI) thread.
+       Without it the password check fails closed (see g_com_ready). */
+    {
+        HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        g_com_ready = SUCCEEDED(com);
+    }
+    read_hook_budget();
     /* DPI awareness (PerMonitorV2) is declared in the manifest. */
     g_taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
     g_shift_down = key_down(VK_SHIFT) || key_down(VK_LSHIFT) || key_down(VK_RSHIFT);
@@ -5897,7 +6087,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_show_message = RegisterWindowMessageW(L"KeySwitchFix.ShowDashboard");
     mutex = CreateMutexW(NULL, TRUE, APP_MUTEX);
     if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existing = FindWindowW(WINDOW_CLASS, NULL);
+        HWND existing = NULL;
+        int attempt;
+        /* The first copy may still be starting: wait up to three seconds
+           for its window. */
+        for (attempt = 0; attempt < 30 && !existing; ++attempt) {
+            existing = FindWindowW(WINDOW_CLASS, NULL);
+            if (!existing) Sleep(100);
+        }
         if (existing) {
             /* The running copy shows itself (centred, refreshed); this one
                lets it take the foreground. */
@@ -5970,6 +6167,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     ks_context_reset(&g_intent_context);
     load_settings();
     load_personal_dictionary();
+    if (!g_paths_ok)
+        set_activity(L"The settings folder could not be created (path too long or no access); settings are not saved.");
     controls.dwSize = sizeof(controls);
     controls.dwICC = ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&controls);
@@ -6025,7 +6224,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
                                          WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     if (!g_keyboard_hook) set_activity(L"Keyboard hook FAILED. Restart the app or check security software.");
     else if (!g_mouse_hook) set_activity(L"Mouse hook FAILED; caret clicks cannot be observed. Check security software.");
-    else if (missing_layout_name()) {
+    else if (missing_layout() != KS_LANG_OTHER) {
         set_activity(L"Both English and Persian keyboard layouts must be installed in Windows.");
     } else set_activity(L"Ready. Type normally in any app; correction is automatic.");
     g_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_UNDO,
@@ -6042,7 +6241,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     add_tray_icon();
     update_diagnostics_ui();
 
-    show_window = g_first_run || wcsstr(GetCommandLineW(), L"--show") != NULL;
+    show_window = g_first_run || command_line_has(L"--show");
     if (show_window) show_main_window();
     else ShowWindow(g_window, SW_HIDE);
 
@@ -6052,6 +6251,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (g_com_ready) CoUninitialize();
     CloseHandle(mutex);
     return (int)message.wParam;
 }

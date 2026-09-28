@@ -2,6 +2,41 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.2.1] - 2026-09-28
+
+Fixes from an outside code review.
+
+### Fixed
+
+- Long paths: the data folder, the temporary file of every save and the
+  installed-copy check no longer overflow or truncate on a very long
+  `%LOCALAPPDATA%` (long user name, redirected profile). When the path is
+  too long the temp folder is used, and nothing is ever written to the
+  current directory. A program path too long for the Run entry is reported
+  instead of registering a broken one.
+- The personal dictionary is rewritten atomically; failed writes are
+  reported and no longer counted.
+- Hook watchdog: keyboard and mouse activity are tracked separately, so
+  mouse use no longer hides a dead keyboard hook, and a reinstall that did
+  not help is retried every five minutes instead of never. Only a real
+  detachment (`ERROR_INVALID_HOOK_HANDLE`) is reported as one. The time a
+  key may take follows a lowered `LowLevelHooksTimeout`.
+- A snippets file that is briefly locked (editor saving, virus scan) no
+  longer switches snippets off until the next edit.
+- Ctrl+Win+X: text copied by another program in the meantime is never
+  cleaned and pasted; a window running as administrator is reported at once.
+- The focused-control cache is reset when focus moves inside a window.
+- Writing memory: a failed save is retried at the next tick; "Forget
+  everything" also resets the file bookkeeping.
+- Excluded apps: toggling from the tray can no longer drop other entries.
+- Tray: the shared icon is never destroyed, balloons no longer change the
+  tray record, and the tooltip is only updated when the state changes.
+- Grey icon, painting and COM start-up handle failures; COM is released at
+  exit.
+- A second copy started while the first is still starting now shows it;
+  `--show` and the uninstaller switches are matched as whole arguments.
+- The Undo hotkey stops waiting after about two seconds.
+
 ## [3.2.0] - 2026-09-28
 
 A reliability and design release, the result of three rounds of strict review.
