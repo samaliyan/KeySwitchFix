@@ -102,13 +102,17 @@ Macros inside the text are expanded at the moment of typing:
 | `{jdate:long}` | `۲۱ شهریور ۱۴۰۵` | `{weekday}` | `Saturday` |
 | `{jweekday}` | `شنبه` | `{time}` | `14:05` |
 | `{jyear}` `{jmonth}` `{jday}` | `۱۴۰۵` `شهریور` `۲۱` | `{time:fa}` | `۱۴:۰۵` |
-| `{year}` `{month}` `{day}` `{hour}` `{minute}` | Gregorian parts | `\n`, `{n}`, `{t}` | Enter, Enter, Tab |
+| `{year}` `{month}` `{day}` `{hour}` `{minute}` | Gregorian parts | `{n}`, `{t}`, `{{`, `}}` | Enter, Tab, `{`, `}` |
 
 The Jalali date is computed with the 33-year-cycle algorithm (the same one
 `jalaali-js` and most Persian calendar libraries use), verified against known
 dates and by a full round trip of every day from 1900 to 2200 in the tests.
-`\n` is replayed as the Enter key: in chat applications that sends the
-message, so keep multi-line snippets for editors and e-mail.
+`{n}` is replayed as the Enter key: in chat applications that sends the
+message, so keep multi-line snippets for editors and e-mail. Backslashes are
+typed as they are (since 3.2), so Windows paths such as `C:\new\temp` work
+in snippets. A `snippets.txt` from 3.0/3.1 that used `\n` or `\t` is
+converted to `{n}` and `{t}` the first time 3.2 loads it (the old file is kept
+as `snippets.txt.bak`).
 
 ## Clean up selected text
 
@@ -124,7 +128,9 @@ Select text — a paragraph pasted from a web page, an old document, a message
   is on.
 
 Words that contain Latin letters — a URL, an e-mail address, a product code —
-keep their digits and marks even inside Persian text. The clean-up works
+and machine text such as IP addresses, version numbers and paths
+(`192.168.1.10`, `1.2.3`, `D:\backup`) keep their digits and marks even inside
+Persian text; a date such as `1403/05/12` gets Persian digits. The clean-up works
 through the clipboard (copy, clean, paste); your own clipboard content, in
 every text-like format, is put back afterwards unless something new was copied
 meanwhile. The hotkey does nothing in terminals, remote sessions, password
@@ -133,7 +139,7 @@ else.
 
 ## Statistics
 
-The dashboard's **Live diagnostics and statistics** card shows layout and
+The dashboard's **Statistics** page shows layout and
 spelling fixes today, all-time fixes, keys today, active days, an estimate of
 time saved (four seconds per fix), and the words you mistype most often.
 Counters are saved to `stats.ini` in the settings folder every ten minutes, at

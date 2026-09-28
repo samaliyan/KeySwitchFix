@@ -109,9 +109,15 @@ def main():
     assert digest(app.resource(10, 212)) == digest(
         (ROOT / "resources" / "fa-rank.bin").read_bytes()
     )
+    # Every executable carries the manifest: visual styles (comctl32 v6),
+    # per-monitor DPI awareness and no elevation request.
+    for pe in (app, uninstall, setup):
+        manifest = pe.resource(24, 1)
+        for needle in (b"Microsoft.Windows.Common-Controls", b"PerMonitorV2", b'level="asInvoker"'):
+            assert needle in manifest, f"{pe.path}: manifest lacks {needle.decode()}"
     assert digest(setup.resource(10, 301)) == digest(app_path.read_bytes())
     assert digest(setup.resource(10, 302)) == digest(uninstall_path.read_bytes())
-    print("PE verification passed: x64 GUI files and all embedded payloads are exact.")
+    print("PE verification passed: x64 GUI files and all embedded payloads are exact; manifests present.")
 
 
 if __name__ == "__main__":

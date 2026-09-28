@@ -52,6 +52,7 @@ typedef struct KS_WRITING_MEMORY {
     KS_MEMORY_FIX fixes[KS_MEMORY_FIXES];
     int fix_count;
     unsigned clock;                          /* sightings so far, for recency */
+    unsigned aged_at;                        /* clock at the last eviction */
     int dirty;                               /* changed since last save */
 } KS_WRITING_MEMORY;
 

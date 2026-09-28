@@ -280,9 +280,25 @@ static int short_persian_word(const wchar_t *value) {
         L"رو", L"زن", L"سر", L"سن", L"سه", L"شب", L"شد", L"حق",
         L"حل", L"کم", L"کن", L"که", L"کل", L"کی", L"گل", L"لب",
         L"ما", L"من", L"می", L"نه", L"نو", L"ها", L"هم", L"هر",
-        L"هی", L"یا", L"یک", L"وی"
+        L"هی", L"یا", L"یک", L"وی", L"یخ", L"شی", L"شه"
     };
     return exact_word(value, words, sizeof(words) / sizeof(words[0]));
+}
+
+/* The letters of an English reading without the punctuation that English
+   text really puts around a word: an opening quote, and a closing quote,
+   comma or semicolon (`'file'` → file, `no,` → no). Brackets are not
+   stripped: ] and [ are the Persian letters چ and ج, which end common words
+   (هیچ is typed id]). Returns the core's length; target may be the source. */
+static size_t english_core(const wchar_t *source, wchar_t *target) {
+    size_t start = 0;
+    size_t end = wcslen(source);
+    while (start < end && (source[start] == L'\'' || source[start] == L'"')) ++start;
+    while (end > start && (source[end - 1] == L'\'' || source[end - 1] == L'"' ||
+                           source[end - 1] == L',' || source[end - 1] == L';')) --end;
+    memmove(target, source + start, (end - start) * sizeof(wchar_t));
+    target[end - start] = 0;
+    return end - start;
 }
 
 static int word_bloom_contains(const KS_BLOOM *primary,
@@ -376,6 +392,8 @@ int ks_classify_word(const KS_TOKEN *tokens, int count,
     wchar_t fa[KS_MAX_WORD + 1];
     int en_known = 0;
     int fa_known = 0;
+    int extra_english;
+    int extra_persian;
 
     if (!lexicons ||
         !ks_word_membership(tokens, count,
@@ -385,28 +403,53 @@ int ks_classify_word(const KS_TOKEN *tokens, int count,
     ks_tokens_to_english(tokens, count, en);
     ks_tokens_to_persian(tokens, count, fa);
     english_lower(en, en_lower);
+    /*
+     * English text with quote or comma keys at its edges: `no,` or `'file'`.
+     * Those keys are Persian letters, so the English reading fails the word
+     * shape and the Persian reading would win unopposed. The letters between
+     * the punctuation decide the English side (two letters at least, so a
+     * Persian word such as چه, typed as `]i`, is not mistaken for English).
+     */
+    if (!en_known) {
+        wchar_t core[KS_MAX_WORD + 1];
+        size_t core_length = english_core(en_lower, core);
+        if (core_length >= 2 && wcscmp(core, en_lower) != 0 && english_word_shape(core)) {
+            if (core_length == 2 ? short_english_word(core)
+                                 : word_bloom_contains(lexicons->english_words,
+                                                       lexicons->english_common, core)) {
+                en_known = 1;
+                wcscpy(en_lower, core);
+            }
+        }
+    }
+    extra_english = extra_persian = 0;
     if (count >= 3 && lexicons->extra && lexicons->extra->contains) {
         const KS_EXTRA_WORDS *extra = lexicons->extra;
-        if (!en_known && english_word_shape(en_lower) &&
+        /* Checked even for dictionary words: `int` or `svn` in the IT pack
+           must count as frequent, or a collision goes against them. */
+        if (english_word_shape(en_lower) &&
             extra->contains(extra->context, KS_LANG_ENGLISH, en_lower))
-            en_known = 1;
-        if (!fa_known) {
+            en_known = extra_english = 1;
+        {
             wchar_t stripped[KS_MAX_WORD + 1];
             strip_persian_diacritics(fa, stripped);
-            if (extra->contains(extra->context, KS_LANG_PERSIAN, stripped)) fa_known = 1;
+            if (extra->contains(extra->context, KS_LANG_PERSIAN, stripped))
+                fa_known = extra_persian = 1;
         }
     }
     if (english_known) *english_known = en_known;
     if (persian_known) *persian_known = fa_known;
+    /* Pack and memory words are the user's everyday vocabulary: they count
+       as frequent, so a collision never goes against them on frequency. */
     if (english_frequent) {
-        *english_frequent =
-            en_known && ks_bloom_contains(lexicons->english_frequent, en_lower);
+        *english_frequent = extra_english ||
+            (en_known && ks_bloom_contains(lexicons->english_frequent, en_lower));
     }
     if (persian_frequent) {
         wchar_t stripped[KS_MAX_WORD + 1];
         strip_persian_diacritics(fa, stripped);
-        *persian_frequent =
-            fa_known && ks_bloom_contains(lexicons->persian_frequent, stripped);
+        *persian_frequent = extra_persian ||
+            (fa_known && ks_bloom_contains(lexicons->persian_frequent, stripped));
     }
     return 1;
 }
@@ -601,6 +644,41 @@ static void fill_decision(const KS_TOKEN *tokens, int count,
     }
 }
 
+/* The target reading is among the 20,000 common words of its language. */
+static int target_is_common(const KS_TOKEN *tokens, int count, KS_LANGUAGE target_language,
+                            const KS_LEXICONS *lexicons) {
+    wchar_t word[KS_MAX_WORD + 1];
+    wchar_t normal[KS_MAX_WORD + 1];
+    const KS_BLOOM *common = target_language == KS_LANG_ENGLISH ? lexicons->english_common
+                                                                : lexicons->persian_common;
+    if (!common) return 1;   /* no frequency tiers loaded: nothing to judge by */
+    if (target_language == KS_LANG_ENGLISH) {
+        ks_tokens_to_english(tokens, count, word);
+        english_lower(word, normal);
+        return ks_bloom_contains(lexicons->english_common, normal);
+    }
+    ks_tokens_to_persian(tokens, count, word);
+    strip_persian_diacritics(word, normal);
+    return ks_bloom_contains(lexicons->persian_common, normal);
+}
+
+/* The active reading is a vocabulary-pack or writing-memory word. */
+static int active_reading_is_extra(const KS_TOKEN *tokens, int count, KS_LANGUAGE active_language,
+                                   const KS_LEXICONS *lexicons) {
+    wchar_t word[KS_MAX_WORD + 1];
+    wchar_t normal[KS_MAX_WORD + 1];
+    if (count < 3 || !lexicons->extra || !lexicons->extra->contains) return 0;
+    if (active_language == KS_LANG_ENGLISH) {
+        ks_tokens_to_english(tokens, count, word);
+        english_lower(word, normal);
+        if (!english_word_shape(normal)) return 0;
+    } else {
+        ks_tokens_to_persian(tokens, count, word);
+        strip_persian_diacritics(word, normal);
+    }
+    return lexicons->extra->contains(lexicons->extra->context, active_language, normal);
+}
+
 KS_LIVE_RESULT ks_evaluate_contextual(
                                  const KS_TOKEN *tokens, int count,
                                  KS_LANGUAGE active_language, int sensitivity,
@@ -665,6 +743,21 @@ KS_LIVE_RESULT ks_evaluate_contextual(
      * Persian mode.
      */
     if (!active_known) {
+        /*
+         * Up to three keys is where abbreviations live: src, mv, cfg, pg
+         * are not dictionary words, but their Persian readings are. Inside
+         * a clearly English (or Persian) sentence such a short reading does
+         * not overrule the sentence, and without context a rare target
+         * waits for the end of the word instead of being rewritten while
+         * the user may still be typing mkdir or srv.
+         */
+        if ((count == 2 || (count == 3 && !target_frequent)) &&
+            active_language == KS_LANG_ENGLISH && context_language == KS_LANG_ENGLISH &&
+            context_strength >= 3 && context_strength < 5)
+            return KS_LIVE_NONE;
+        if (count <= 3 && !target_frequent && phase != KS_PHASE_BOUNDARY &&
+            !target_is_common(tokens, count, target_language, lexicons))
+            return KS_LIVE_NONE;
         confidence = 90;
         if (count >= 5) confidence += 10;
         else if (count >= 3) confidence += 5;
@@ -684,9 +777,20 @@ KS_LIVE_RESULT ks_evaluate_contextual(
             if (context_strength < 0) context_strength = 0;
             if (context_strength > 4) context_strength = 4;
             evidence = 0;
-            if (context_language == target_language)
-                evidence += context_strength * 30;
-            else if (context_language == active_language)
+            if (context_language == target_language) {
+                int support = context_strength * 30;
+                /* A vocabulary-pack or memory word (hdd, svn, int) is the
+                   user's own word: the sentence alone may not turn it into
+                   a rare word of the other language. */
+                if (support > 30 && !target_frequent &&
+                    active_reading_is_extra(tokens, count, active_language, lexicons))
+                    support = 30;
+                /* Nor a frequent word into a rare one (آخر -> Hov). */
+                if (active_frequent && !target_frequent &&
+                    !target_is_common(tokens, count, target_language, lexicons))
+                    return KS_LIVE_NONE;
+                evidence += support;
+            } else if (context_language == active_language)
                 evidence -= context_strength * 30;
             if (target_frequent && !active_frequent)
                 evidence += 45;
@@ -697,6 +801,9 @@ KS_LIVE_RESULT ks_evaluate_contextual(
             english_lower(en, en_lower);
             prior = ks_collision_prior_points(en_lower);
             if (target_language == KS_LANG_ENGLISH) prior = -prior;
+            /* A pack or memory word is the user's own vocabulary: corpus
+               priors say nothing about how this user writes it. */
+            if (active_reading_is_extra(tokens, count, active_language, lexicons)) prior = 0;
             /*
              * Two-key collisions carry too little information for a
              * corpus-only sentence-start rewrite (of/خب is the canonical
@@ -727,15 +834,26 @@ KS_LIVE_RESULT ks_evaluate_contextual(
     }
 
     if (phase == KS_PHASE_BOUNDARY) return KS_LIVE_CORRECT_NOW;
-    if (count == 2) {
-        if (phase == KS_PHASE_LIVE) return KS_LIVE_WAIT_FOR_IDLE;
-        return KS_LIVE_CORRECT_NOW;
-    }
+    /*
+     * Two keys are the beginning of too many words ("fi" is به, and also
+     * the start of first, find, file): a two-key word is repaired only when
+     * the user ends it, never on a pause.
+     */
+    if (count == 2) return KS_LIVE_NONE;
 
     ks_tokens_to_english(tokens, count, en);
     ks_tokens_to_persian(tokens, count, fa);
     if (active_language == KS_LANG_ENGLISH) {
         english_lower(en, en_lower);
+        /* 'first' or "file": the quote keys are Persian letters, but on the
+           English layout they are punctuation around the word being typed.
+           Behind a quote, fewer than three letters say too little to act on
+           before the word is finished. */
+        {
+            int opening_quote = en_lower[0] == L'\'' || en_lower[0] == L'"';
+            size_t core_length = english_core(en_lower, en_lower);
+            if (opening_quote && core_length < 3) return KS_LIVE_NONE;
+        }
         active_word = en_lower;
         active_prefixes = lexicons->english_prefixes;
         active_common_prefixes = lexicons->english_common_prefixes;
@@ -748,11 +866,24 @@ KS_LIVE_RESULT ks_evaluate_contextual(
     active_is_prefix = ks_bloom_contains(active_prefixes, active_word);
     /* "kuber" on the English layout is the start of "kubernetes": the
        vocabulary packs protect their words while they are being typed. */
-    if (!active_is_prefix && lexicons->extra && lexicons->extra->has_prefix)
-        active_is_prefix = lexicons->extra->has_prefix(
-            lexicons->extra->context, active_language, active_word);
     active_is_common_prefix =
         ks_bloom_contains(active_common_prefixes, active_word);
+    /* Pack words are everyday words for their users: their beginnings are
+       protected at a pause too, like common words. */
+    if (lexicons->extra && lexicons->extra->has_prefix &&
+        lexicons->extra->has_prefix(lexicons->extra->context, active_language, active_word)) {
+        active_is_prefix = 1;
+        active_is_common_prefix = 1;
+    }
+
+    /*
+     * A collision (both readings are words) is decided on the complete word.
+     * While the letters typed so far can still become a longer word in the
+     * active layout ("int" → internet, "col" → column), neither context nor
+     * a pause may rewrite them.
+     */
+    if (active_known && (active_is_prefix || active_is_common_prefix))
+        return KS_LIVE_NONE;
 
     if (phase == KS_PHASE_LIVE) {
         if (active_known && context_language == target_language &&

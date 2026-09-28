@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <windowsx.h>
+#include <oleacc.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,7 +20,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"3.1.0"
+#define APP_VERSION L"3.2.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -27,6 +29,7 @@
 #define WM_APP_EXIT (WM_APP + 9)
 /* Posted from the hook: work that must not run inside the hook callback. */
 #define WM_APP_SAVE_STATS (WM_APP + 3)
+#define WM_APP_FOCUS_QUERY (WM_APP + 4)
 
 #define ID_TRAY 1
 #define ID_TIMER_STATUS 10
@@ -39,6 +42,8 @@
 #define ID_TIMER_CLEANUP 17
 #define ID_TIMER_STATS 18
 #define ID_TIMER_SNIPPETS 19
+#define ID_TIMER_TRAY_RETRY 20
+#define ID_TIMER_FOCUS_QUERY 21
 
 /*
  * Windows silently removes a low-level hook whose callback exceeds the
@@ -56,7 +61,6 @@
 #define IDC_APP_STARTUP 102
 #define IDC_EXCLUDED 103
 #define IDC_LANGUAGE_MODE 104
-#define IDC_SAVE 105
 #define IDC_HIDE 106
 #define IDC_SPELLING 107
 #define IDC_PERSONAL_DICTIONARY 108
@@ -128,6 +132,9 @@ typedef struct SETTINGS {
 typedef struct UNDO_RECORD {
     int valid;
     HWND window;
+    /* The control that had keyboard focus: an undo is only ever typed back
+       into the same field (after Tab the caret is in another one). */
+    HWND focus;
     KS_LANGUAGE source_language;
     UINT delimiter;
     int delimiter_zwnj;
@@ -212,6 +219,53 @@ static unsigned long g_orphan_serial;
 static int g_orphan_complete;
 /* The word most recently counted, so an Undo right after can take it back. */
 static wchar_t g_last_noted[KS_MAX_WORD + 1];
+/*
+ * Facts about the focused control, computed once per focus instead of per
+ * key: process-based exclusions, developer tools and remote sessions,
+ * password fields (Win32 Edit styles, and MSAA's "protected" state, which
+ * browsers, Electron and WPF expose for password inputs), Excel cells
+ * (AutoComplete selections) and Office apps with AutoCorrect.
+ */
+typedef struct FOCUS_FACTS FOCUS_FACTS;
+struct FOCUS_FACTS {
+    HWND focus;
+    unsigned long focus_serial;
+    unsigned long settings_generation;
+    DWORD computed_at;
+    int excluded;
+    int developer_tool;
+    int remote;
+    int protected_field;
+    int excel;
+    int autocorrect_app;
+};
+static FOCUS_FACTS g_facts;
+static unsigned long g_settings_generation = 1;
+/* Focus changes reported by the WinEvent hook. */
+static HWINEVENTHOOK g_focus_event_hook;
+static unsigned long g_focus_serial;
+static HWND g_focus_event_window;
+static LONG g_focus_event_object;
+static LONG g_focus_event_child;
+static int g_focus_event_protected;
+/* Re-entrancy: a low-level hook call is delivered as a sent message, so a
+   new key can arrive while this thread waits inside SendMessageTimeout on
+   behalf of an earlier key. The nested key passes through untouched, and
+   the outer operation, which no longer knows what is on screen, gives up. */
+static int g_engine_depth;
+static int g_engine_interrupted;
+static int g_word_skip_untrusted;   /* the current word is skipped only because it is untrusted */
+static DWORD g_hook_entered_at;   /* tick when the hook call being handled began */
+/* Excel: 1 while the active cell's content is exactly what was typed since
+   the cell was entered (Enter, Tab, arrows, a single click), so the rest of
+   an AutoComplete suggestion may sit selected after the caret. F2 or a
+   double-click edits existing text: then nothing may be deleted forward. */
+static int g_cell_fresh = 1;
+static int g_cell_edit_mode;
+static DWORD g_last_click_at;
+/* Set by every path that swallows the current key-down. */
+static int g_key_swallowed;
+
 /* The last word finished with Space or Enter, so a Backspace straight after
    it can reopen it for editing. */
 static KS_TOKEN g_prev_word[KS_MAX_WORD];
@@ -360,6 +414,12 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
 static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam);
 static void update_diagnostics_ui(void);
+static void update_tray_tip(void);
+static int is_protected_field(HWND foreground);
+static int spelling_skipped_process(HWND foreground);
+static int process_is_excluded(HWND foreground);
+static void engine_reset_for_focus(void);
+static const FOCUS_FACTS *focus_facts(HWND foreground);
 
 static void safe_copy(wchar_t *destination, size_t capacity, const wchar_t *source) {
     if (!destination || capacity == 0) return;
@@ -434,6 +494,22 @@ static void build_paths(void) {
              L"%ls\\writing-memory.txt", g_data_directory);
 }
 
+/* True when this copy is the installed one (%LOCALAPPDATA%\Programs\KeySwitchFix).
+   A copy run from Downloads must not register itself to start with Windows
+   unless the user asks for it. */
+static int running_installed_copy(void) {
+    wchar_t self[MAX_PATH];
+    wchar_t expected[MAX_PATH];
+    wchar_t local[MAX_PATH];
+    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    size_t prefix;
+    if (!length || length >= MAX_PATH) return 0;
+    if (!GetModuleFileNameW(NULL, self, MAX_PATH)) return 0;
+    swprintf(expected, MAX_PATH, L"%ls\\Programs\\KeySwitchFix\\", local);
+    prefix = wcslen(expected);
+    return wcslen(self) > prefix && _wcsnicmp(self, expected, prefix) == 0;
+}
+
 static void load_settings(void) {
     DWORD attributes;
     build_paths();
@@ -444,7 +520,9 @@ static void load_settings(void) {
     if (g_settings.sensitivity < 0 || g_settings.sensitivity > 2) g_settings.sensitivity = 1;
     g_settings.language_mode = GetPrivateProfileIntW(L"General", L"LanguageMode", 0, g_settings_path);
     if (g_settings.language_mode < 0 || g_settings.language_mode > 2) g_settings.language_mode = 0;
-    g_settings.start_with_windows = GetPrivateProfileIntW(L"General", L"StartWithWindows", 1, g_settings_path);
+    g_settings.start_with_windows = GetPrivateProfileIntW(L"General", L"StartWithWindows",
+                                                          running_installed_copy() ? 1 : 0,
+                                                          g_settings_path);
     g_settings.spelling = GetPrivateProfileIntW(L"Spelling", L"Level", KS_SPELL_BALANCED, g_settings_path);
     if (g_settings.spelling < KS_SPELL_OFF || g_settings.spelling > KS_SPELL_AGGRESSIVE)
         g_settings.spelling = KS_SPELL_BALANCED;
@@ -490,6 +568,7 @@ static void update_startup_registry(void) {
 
 static void save_settings(void) {
     wchar_t number[16];
+    ++g_settings_generation;   /* cached per-focus facts depend on settings */
     swprintf(number, 16, L"%d", g_settings.enabled);
     WritePrivateProfileStringW(L"General", L"Enabled", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.sensitivity);
@@ -639,6 +718,7 @@ static wchar_t *read_text_file(const wchar_t *path, FILETIME *written) {
 }
 
 static int write_text_file(const wchar_t *path, const wchar_t *text) {
+    wchar_t temporary[MAX_PATH];
     HANDLE file;
     int length;
     char *utf8;
@@ -650,10 +730,17 @@ static int write_text_file(const wchar_t *path, const wchar_t *text) {
     if (!utf8) return 0;
     utf8[0] = (char)0xEF; utf8[1] = (char)0xBB; utf8[2] = (char)0xBF;
     WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8 + 3, length, NULL, NULL);
-    file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* Write a sibling temporary file and swap it in, so a crash or a full
+       disk never leaves a half-written memory or dictionary behind. */
+    swprintf(temporary, MAX_PATH, L"%ls.tmp", path);
+    file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file != INVALID_HANDLE_VALUE) {
-        ok = WriteFile(file, utf8, (DWORD)(length - 1 + 3), &written, NULL) != 0;
+        DWORD size = (DWORD)(length - 1 + 3);
+        ok = WriteFile(file, utf8, size, &written, NULL) != 0 && written == size;
+        if (ok) ok = FlushFileBuffers(file) != 0;
         CloseHandle(file);
+        if (ok) ok = MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        if (!ok) DeleteFileW(temporary);
     }
     HeapFree(GetProcessHeap(), 0, utf8);
     return ok;
@@ -668,7 +755,8 @@ static const wchar_t SNIPPETS_TEMPLATE[] =
     L"# Pick shortcuts that are not real words (they would expand every time you type them).\r\n"
     L"# Macros: {jdate} ۱۴۰۵/۰۶/۲۱   {jdate:en} 1405/06/21   {jdate:long} ۲۱ شهریور ۱۴۰۵   {jweekday} شنبه\r\n"
     L"#         {date} 2026-09-12   {date:long} 12 September 2026   {weekday} Saturday\r\n"
-    L"#         {time} 14:05   {time:fa} ۱۴:۰۵   \\n = new line (Enter; in chat apps that sends the message)\r\n"
+    L"#         {time} 14:05   {time:fa} ۱۴:۰۵\r\n"
+    L"#         {n} new line (Enter; in chat apps that sends the message)   {t} Tab   {{ }} literal braces\r\n"
     L"# Lines starting with # are comments. Save the file; changes apply within two seconds.\r\n"
     L"\r\n"
     L"tarikh = {jdate}\r\n"
@@ -710,6 +798,23 @@ static void snippets_reload(int force) {
         g_snippets.count = 0;
         set_activity(L"snippets.txt is too large (over 256 K characters) and was not loaded.");
         return;
+    }
+    {
+        /* A 3.0/3.1 file used \\n and \\t: rewrite it once to {n} and {t}
+           so existing multi-line snippets keep working. */
+        size_t capacity = wcslen(text) * 2 + 16;
+        wchar_t *migrated = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(wchar_t));
+        wchar_t backup[MAX_PATH + 8];
+        swprintf(backup, sizeof(backup) / sizeof(backup[0]), L"%ls.bak", g_snippets_path);
+        if (migrated && ks_snippets_migrate(text, migrated, capacity) &&
+            CopyFileW(g_snippets_path, backup, FALSE) && write_text_file(g_snippets_path, migrated)) {
+            HeapFree(GetProcessHeap(), 0, text);
+            text = migrated;
+            migrated = NULL;
+            ZeroMemory(&g_snippets_loaded_time, sizeof(g_snippets_loaded_time));
+            set_activity(L"snippets.txt was updated: \\n and \\t are now written {n} and {t}.");
+        }
+        if (migrated) HeapFree(GetProcessHeap(), 0, migrated);
     }
     ks_snippets_parse(&g_snippets, text);
     HeapFree(GetProcessHeap(), 0, text);
@@ -883,6 +988,7 @@ static void current_date_info(KS_DATE_INFO *info) {
 
 
 static void suppress_key_up(DWORD virtual_key) {
+    g_key_swallowed = 1;
     if (virtual_key < 256) {
         DWORD now = GetTickCount();
         g_suppressed_at[virtual_key] = now ? now : 1;
@@ -895,6 +1001,7 @@ static void cancel_smart_correction(void) {
 
 static void clear_word(void) {
     cancel_smart_correction();
+    g_word_skip_untrusted = 0;
     g_word_auto_capitalized = 0;
     g_word_peak[0] = 0;
     g_word_peak_length = 0;
@@ -916,6 +1023,42 @@ static void clear_history(void) {
     g_history_window = NULL;
     g_pending_word_valid = 0;
     g_pending_word_window = NULL;
+}
+
+/*
+ * Every engine operation (a key in the hook, the pause timer, Undo, the
+ * clean-up hotkey, the focus query) runs inside engine_enter/engine_leave.
+ * A key that arrives while one is running (hooks are re-entered whenever
+ * the thread pumps messages) is let through untouched and marks the
+ * operation interrupted: whatever it was about to do would count keys that
+ * are no longer on the screen. The letters that follow such a key belong
+ * to a word the engine did not see begin, so that word is left alone.
+ */
+static int g_word_untrusted;
+static int g_engine_key_interrupted;
+
+static int engine_enter(void) {
+    if (g_engine_depth > 0) return 0;
+    ++g_engine_depth;
+    g_engine_interrupted = 0;
+    g_engine_key_interrupted = 0;
+    return 1;
+}
+
+static void engine_leave(void) {
+    if (g_engine_interrupted) {
+        clear_word();
+        clear_history();
+        g_undo.valid = 0;
+        g_prev_word_count = 0;
+        g_orphan_peak[0] = 0;
+        /* Only a key that slipped through leaves a word whose beginning the
+           engine did not see; a click or a focus change starts clean. */
+        if (g_engine_key_interrupted) g_word_untrusted = 1;
+    }
+    g_engine_interrupted = 0;
+    g_engine_key_interrupted = 0;
+    --g_engine_depth;
 }
 
 static void abandon_history(void) {
@@ -1085,11 +1228,19 @@ static int key_down(int virtual_key) {
     return (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
 }
 
+/* The tracked flags are resynchronised from the physical state on every
+   key-down (see keyboard_hook_proc): a key-up the hook never saw — on the
+   secure desktop after Win+L, in an elevated window after Alt+Tab — must
+   not leave a modifier "stuck" and the engine silently disabled. */
+static void resync_modifiers(void) {
+    g_shift_down = key_down(VK_SHIFT);
+    g_control_down = key_down(VK_CONTROL);
+    g_alt_down = key_down(VK_MENU);
+    g_windows_down = key_down(VK_LWIN) || key_down(VK_RWIN);
+}
+
 static int shortcut_modifier_down(void) {
-    /* Tracked state plus the physical state: a Ctrl transition the hook
-       missed must never turn Ctrl+S into a typed "s". */
-    return g_control_down || g_alt_down || g_windows_down ||
-           key_down(VK_CONTROL) || key_down(VK_MENU) || key_down(VK_LWIN) || key_down(VK_RWIN);
+    return g_control_down || g_alt_down || g_windows_down;
 }
 
 static int is_modifier(UINT key) {
@@ -1138,12 +1289,50 @@ static int is_sentence_terminator(UINT key) {
     return 0;
 }
 
+/*
+ * Which alphabet a keyboard layout types. The language ID of the HKL is the
+ * input *language*, not the keyboard: a Persian keyboard can be added under
+ * English and vice versa. So the layout is asked what the A and Q keys
+ * produce; the language ID is only the fallback. Cached per HKL.
+ */
 static KS_LANGUAGE language_from_layout(HKL layout) {
+    static HKL cached_layouts[16];
+    static KS_LANGUAGE cached_languages[16];
+    static int cached_count;
     LANGID language_id = LOWORD((ULONG_PTR)layout);
     WORD primary = PRIMARYLANGID(language_id);
-    if (primary == LANG_ENGLISH) return KS_LANG_ENGLISH;
-    if (primary == 0x29) return KS_LANG_PERSIAN;
-    return KS_LANG_OTHER;
+    KS_LANGUAGE language = KS_LANG_OTHER;
+    static const UINT probes[2] = {0x1E, 0x10};
+    int i;
+    if (!layout) return KS_LANG_OTHER;
+    for (i = 0; i < cached_count; ++i)
+        if (cached_layouts[i] == layout) return cached_languages[i];
+    for (i = 0; i < 2 && language == KS_LANG_OTHER; ++i) {
+        BYTE state[256];
+        wchar_t output[4];
+        UINT virtual_key = MapVirtualKeyExW(probes[i], MAPVK_VSC_TO_VK_EX, layout);
+        int count;
+        if (!virtual_key) continue;
+        ZeroMemory(state, sizeof(state));
+        count = ToUnicodeEx(virtual_key, probes[i], state, output, 4, 4, layout);
+        if (count != 1) continue;
+        if ((output[0] >= L'a' && output[0] <= L'z') || (output[0] >= L'A' && output[0] <= L'Z'))
+            language = KS_LANG_ENGLISH;
+        else if (output[0] >= 0x0600 && output[0] <= 0x06FF)
+            language = primary == 0x29 || primary == LANG_ENGLISH || primary == 0 ? KS_LANG_PERSIAN
+                                                                                  : KS_LANG_OTHER;
+    }
+    /* An Arabic, Urdu or Kurdish keyboard also types Arabic script; only a
+       Persian one (or one filed under English) is ours. Latin keyboards
+       for other languages (German, French) stay unsupported. */
+    if (language == KS_LANG_ENGLISH && primary != LANG_ENGLISH && primary != 0x29) language = KS_LANG_OTHER;
+    if (language == KS_LANG_OTHER && primary == LANG_ENGLISH) language = KS_LANG_ENGLISH;
+    if (language == KS_LANG_OTHER && primary == 0x29) language = KS_LANG_PERSIAN;
+    if (cached_count < 16) {
+        cached_layouts[cached_count] = layout;
+        cached_languages[cached_count++] = language;
+    }
+    return language;
 }
 
 static void resolve_input_target(HWND foreground, KS_INPUT_TARGET *target) {
@@ -1302,7 +1491,7 @@ static void excluded_list_toggle(const wchar_t *name) {
 
 static HWND focused_window(HWND foreground);
 
-static int process_is_excluded(HWND foreground) {
+static int compute_process_excluded(HWND foreground) {
     DWORD process_id = 0;
     wchar_t name[MAX_PATH];
 
@@ -1335,7 +1524,7 @@ static HWND focused_window(HWND foreground) {
     return target->focus ? target->focus : foreground;
 }
 
-static int is_protected_field(HWND foreground) {
+static int edit_control_protected(HWND foreground) {
     HWND focus = focused_window(foreground);
     LONG_PTR style;
     wchar_t class_name[64];
@@ -1344,8 +1533,23 @@ static int is_protected_field(HWND foreground) {
     class_name[0] = 0;
     GetClassNameW(focus, class_name, 64);
     /* ES_PASSWORD is an Edit-control style bit; on other classes the same
-       bit means something else. */
-    if (_wcsicmp(class_name, L"Edit") != 0 && _wcsnicmp(class_name, L"RichEdit", 8) != 0) return 0;
+       bit means something else. Superclassed edits (WinForms
+       "WindowsForms10.EDIT…", Delphi TEdit, VB6 text boxes) report "Edit"
+       as their real class. */
+    if (_wcsicmp(class_name, L"Edit") != 0 && _wcsnicmp(class_name, L"RichEdit", 8) != 0) {
+        wchar_t real_class[64];
+        real_class[0] = 0;
+        RealGetWindowClassW(focus, real_class, 64);
+        if (_wcsicmp(real_class, L"Edit") != 0) {
+            /* Unknown text-box classes: only the password character, which
+               non-edit classes simply do not answer, is asked. */
+            if (!wcsstr(class_name, L"EDIT") && !wcsstr(class_name, L"Edit") &&
+                !wcsstr(class_name, L"TextBox")) return 0;
+            if (SendMessageTimeoutW(focus, EM_GETPASSWORDCHAR, 0, 0, SMTO_ABORTIFHUNG, 40, &result) && result)
+                return 1;
+            return 0;
+        }
+    }
     style = GetWindowLongPtrW(focus, GWL_STYLE);
     if ((style & ES_PASSWORD) != 0) return 1;
     if (SendMessageTimeoutW(focus, EM_GETPASSWORDCHAR, 0, 0, SMTO_ABORTIFHUNG, 40, &result) && result)
@@ -1412,6 +1616,16 @@ static int translated_layout_character(HKL layout, DWORD scan_code,
     if (count != 1 || output[0] < 0x20) return 0;
     *character = output[0];
     return 1;
+}
+
+/* 1 when the layout that will render this key produces exactly one
+   printable character for it (not a dead key, not a ligature, not nothing):
+   only then does one key stand for one character on screen. */
+static int active_layout_types_one_character(DWORD scan_code, int shift, int caps) {
+    HKL layout = g_target.thread ? GetKeyboardLayout(g_target.thread) : NULL;
+    wchar_t character = 0;
+    if (!layout) return 1;
+    return translated_layout_character(layout, scan_code, shift, caps, &character);
 }
 
 static int map_physical_key(DWORD scan_code, int shift, int caps,
@@ -1609,8 +1823,9 @@ static void add_unicode_input(INPUT *inputs, UINT *count, wchar_t character) {
 static int send_replacement(HWND foreground, int delete_count, const wchar_t *replacement,
                             UINT delimiter, int delimiter_zwnj,
                             KS_LANGUAGE target_language) {
-    INPUT inputs[(KS_MAX_PHRASE_CHARS + 2) * 4];
+    INPUT inputs[(KS_MAX_PHRASE_CHARS + 3) * 4];
     UINT count = 0;
+    int excel_delete;
     int i;
     const wchar_t *cursor;
     size_t replacement_length;
@@ -1618,6 +1833,28 @@ static int send_replacement(HWND foreground, int delete_count, const wchar_t *re
         delete_count > KS_MAX_PHRASE_CHARS) return 0;
     replacement_length = wcslen(replacement);
     if (replacement_length > KS_MAX_PHRASE_CHARS) return 0;
+    /* Excel's AutoComplete leaves the rest of a matching entry selected
+       after the caret; the first Backspace would only remove the selection.
+       Delete clears it first, but only in a freshly entered cell: while
+       existing text is edited it would delete the user's next character. */
+    excel_delete = delete_count > 0 && g_cell_fresh && focus_facts(foreground)->excel;
+    /* Let hook calls that are already waiting run now (they are nested and
+       only mark this operation interrupted), so no key can land between the
+       check below and the injected input. */
+    {
+        MSG pending;
+        PeekMessageW(&pending, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+    }
+    /* A key arrived while this operation waited on another thread: the text
+       on screen is no longer what the delete count assumes. */
+    if (g_engine_interrupted) return 0;
+    /* Windows passes a key on by itself when the hook takes too long; if it
+       did, the key is already in the application and the count is off. */
+    if (g_hook_entered_at && GetTickCount() - g_hook_entered_at > 150u) {
+        set_activity(L"A correction was skipped because the system was busy.");
+        return 0;
+    }
+    if (excel_delete) add_virtual_input(inputs, &count, VK_DELETE);
     for (i = 0; i < delete_count; ++i) add_virtual_input(inputs, &count, VK_BACK);
     for (cursor = replacement; *cursor; ++cursor) {
         /* Snippets may contain line breaks and tabs; those are keys, not
@@ -1661,6 +1898,7 @@ static void store_phrase_undo(HWND foreground, KS_LANGUAGE source_language,
     ZeroMemory(&g_undo, sizeof(g_undo));
     g_undo.valid = 1;
     g_undo.window = foreground;
+    g_undo.focus = focused_window(foreground);
     g_undo.source_language = source_language;
     g_undo.delimiter = delimiter;
     g_undo.delimiter_zwnj = delimiter_zwnj;
@@ -1740,10 +1978,15 @@ static int try_sequence_correction(HWND foreground,
         current_count > KS_MAX_WORD || delimiter != VK_SPACE)
         return 0;
     if (g_history_window != foreground || g_history_count < 1) return 0;
+    /* Word, Outlook and OneNote rewrite text behind the caret themselves
+       (AutoCorrect: dont → don't): the history no longer matches the
+       screen, so earlier words are never rewritten there. */
+    if (focus_facts(foreground)->autocorrect_app) return 0;
 
+    /* At most the three previous words: a longer rewrite deletes more text
+       than anyone can check at a glance. */
     maximum_words = g_history_count + 1;
-    if (maximum_words > KS_MAX_SEQUENCE_WORDS)
-        maximum_words = KS_MAX_SEQUENCE_WORDS;
+    if (maximum_words > 4) maximum_words = 4;
     for (word_count = maximum_words; word_count >= 2; --word_count) {
         start = g_history_count - (word_count - 1);
         for (index = 0; index < word_count - 1; ++index) {
@@ -1789,6 +2032,7 @@ static int try_sequence_correction(HWND foreground,
                 return 0;
         }
         if (!needs_change) return 0;
+        if (wcslen(original) > 64) continue;
         if (is_protected_field(foreground)) {
             set_activity(L"Correction skipped in a protected password field.");
             return 0;
@@ -1977,7 +2221,7 @@ static void append_personal_dictionary(const wchar_t *word) {
  * active there, but spelling correction is skipped below Aggressive. The
  * user-editable "Excluded apps" list still disables everything.
  */
-static int spelling_skipped_process(HWND foreground) {
+static int developer_tool_process(HWND foreground) {
     static const wchar_t *const developer_tools[] = {
         L"WindowsTerminal.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
         L"conhost.exe", L"OpenConsole.exe", L"mintty.exe", L"alacritty.exe",
@@ -1988,11 +2232,7 @@ static int spelling_skipped_process(HWND foreground) {
         L"sublime_text.exe", L"notepad++.exe", L"atom.exe", L"ssms.exe",
         L"sqldeveloper64W.exe", L"dbeaver.exe", L"HeidiSQL.exe",
         L"git-bash.exe", L"bash.exe", L"wsl.exe", L"ubuntu.exe",
-        /* Remote sessions: the local layout state says nothing about the
-           remote machine, which may run its own KeySwitchFix. */
-        L"mstsc.exe", L"msrdc.exe", L"vmconnect.exe", L"VirtualBoxVM.exe", L"vmware.exe",
-        L"vmware-vmx.exe", L"wfica32.exe", L"AnyDesk.exe", L"TeamViewer.exe", L"RustDesk.exe",
-        L"parsecd.exe", L"kitty.exe", L"MobaXterm.exe", L"SecureCRT.exe"
+        L"kitty.exe", L"MobaXterm.exe", L"SecureCRT.exe"
     };
     wchar_t name[MAX_PATH];
     size_t i;
@@ -2009,6 +2249,203 @@ static int spelling_skipped_process(HWND foreground) {
         }
     }
     return 0;
+}
+
+/* Remote sessions and virtual machines: the local layout state says nothing
+   about the remote machine (which may run its own KeySwitchFix), so the
+   engine does not touch these windows at all. */
+static int process_name_in(HWND foreground, const wchar_t *const *names, size_t count) {
+    wchar_t name[MAX_PATH];
+    size_t i;
+    HWND focus = focused_window(foreground);
+    int pass;
+    for (pass = 0; pass < 2; ++pass) {
+        if (!query_process_basename(pass ? focus : foreground, name, MAX_PATH)) continue;
+        for (i = 0; i < count; ++i)
+            if (_wcsicmp(name, names[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static int remote_session_process(HWND foreground) {
+    static const wchar_t *const remote[] = {
+        L"mstsc.exe", L"msrdc.exe", L"vmconnect.exe", L"VirtualBoxVM.exe", L"vmware.exe",
+        L"vmware-vmx.exe", L"vmware-remotemks.exe", L"wfica32.exe", L"CDViewer.exe",
+        L"AnyDesk.exe", L"TeamViewer.exe", L"RustDesk.exe", L"parsecd.exe", L"putty.exe",
+        L"vncviewer.exe", L"tvnviewer.exe", L"mRemoteNG.exe", L"RDCMan.exe", L"Royal TS.exe"
+    };
+    return process_name_in(foreground, remote, sizeof(remote) / sizeof(remote[0]));
+}
+
+static int autocorrect_process(HWND foreground) {
+    static const wchar_t *const office[] = {
+        L"WINWORD.EXE", L"OUTLOOK.EXE", L"ONENOTE.EXE", L"POWERPNT.EXE", L"olk.exe"
+    };
+    return process_name_in(foreground, office, sizeof(office) / sizeof(office[0]));
+}
+
+static const FOCUS_FACTS *focus_facts(HWND foreground) {
+    HWND focus = focused_window(foreground);
+    DWORD now = GetTickCount();
+    if (g_facts.focus == focus && g_facts.focus_serial == g_focus_serial &&
+        g_facts.settings_generation == g_settings_generation && now - g_facts.computed_at < 5000u)
+        return &g_facts;
+    ZeroMemory(&g_facts, sizeof(g_facts));
+    g_facts.focus = focus;
+    g_facts.focus_serial = g_focus_serial;
+    g_facts.settings_generation = g_settings_generation;
+    g_facts.computed_at = now ? now : 1;
+    g_facts.excluded = compute_process_excluded(foreground);
+    g_facts.remote = remote_session_process(foreground);
+    g_facts.developer_tool = g_facts.remote || developer_tool_process(foreground);
+    g_facts.autocorrect_app = autocorrect_process(foreground);
+    /* g_focus_event_protected is -1 while the accessibility query for the
+       field is still running: unknown counts as protected. */
+    /* The latest focus event describes the focused element; frameworks
+       that raise it on a child or host window of the focus (WinUI input
+       sites, Java, some Electron builds) still belong to the same
+       top-level window. */
+    g_facts.protected_field = edit_control_protected(foreground) ||
+                              (g_focus_event_protected != 0 && g_focus_event_window &&
+                               (g_focus_event_window == focus ||
+                                GetAncestor(g_focus_event_window, GA_ROOT) ==
+                                    GetAncestor(focus ? focus : foreground, GA_ROOT)));
+    if (focus) {
+        wchar_t class_name[32];
+        class_name[0] = 0;
+        GetClassNameW(focus, class_name, 32);
+        /* EXCEL< is the formula bar: text is edited there, never replaced
+           as a whole, so it is not treated as a cell. */
+        g_facts.excel = _wcsnicmp(class_name, L"EXCEL", 5) == 0 && class_name[5] != L'<';
+    }
+    return &g_facts;
+}
+
+static int is_protected_field(HWND foreground) {
+    return focus_facts(foreground)->protected_field;
+}
+
+static int spelling_skipped_process(HWND foreground) {
+    return focus_facts(foreground)->developer_tool;
+}
+
+static int process_is_excluded(HWND foreground) {
+    const FOCUS_FACTS *facts = focus_facts(foreground);
+    return facts->excluded || facts->remote;
+}
+
+/*
+ * Focus moved to another control (or another element of a web page). The
+ * word being typed, the sentence model, a pending layout switch, and the
+ * Undo record all described the old field: drop them.
+ */
+static void engine_reset_for_focus(void) {
+    /* The Excel cell state is left alone: F2 or a double-click may move the
+       focus to the cell editor, which is exactly the "editing" state. */
+    g_word_untrusted = 0;
+    clear_word();
+    clear_history();
+    forget_layout_request();
+    g_undo.valid = 0;
+    g_prev_word_count = 0;
+    g_orphan_peak[0] = 0;
+    g_capitalize_armed = 0;
+    g_capitalize_next = 0;
+}
+
+/* 1 when MSAA reports the focused element as a protected (password) field. */
+static int accessible_is_protected(HWND window, LONG object_id, LONG child_id) {
+    IAccessible *accessible = NULL;
+    VARIANT child;
+    int protected_now = 0;
+    VariantInit(&child);
+    if (SUCCEEDED(AccessibleObjectFromEvent(window, (DWORD)object_id, (DWORD)child_id,
+                                            &accessible, &child)) && accessible) {
+        VARIANT state;
+        VariantInit(&state);
+        if (SUCCEEDED(accessible->lpVtbl->get_accState(accessible, child, &state)) &&
+            V_VT(&state) == VT_I4 && (V_I4(&state) & STATE_SYSTEM_PROTECTED))
+            protected_now = 1;
+        VariantClear(&state);
+        accessible->lpVtbl->Release(accessible);
+    }
+    VariantClear(&child);
+    return protected_now;
+}
+
+static void run_focus_query(void);
+static int g_focus_query_posted;
+static int g_focus_query_running;
+
+static void CALLBACK focus_event_proc(HWINEVENTHOOK hook, DWORD event, HWND window, LONG object_id,
+                                      LONG child_id, DWORD thread_id, DWORD event_time) {
+    int busy = g_focus_query_running;
+    (void)hook;
+    (void)thread_id;
+    (void)event_time;
+    if (event != EVENT_OBJECT_FOCUS || !window) return;
+    if (window == g_focus_event_window && object_id == g_focus_event_object &&
+        child_id == g_focus_event_child) return;
+    g_focus_event_window = window;
+    g_focus_event_object = object_id;
+    g_focus_event_child = child_id;
+    ++g_focus_serial;
+    if (g_engine_depth > 0) g_engine_interrupted = 1;
+    engine_reset_for_focus();
+    /*
+     * Password detection for fields Windows' own controls do not describe:
+     * browsers, Electron and WPF mark password inputs "protected" in MSAA.
+     * Until the answer arrives the field counts as protected (-1). The COM
+     * call pumps messages: keys typed meanwhile pass through untouched
+     * (engine depth), and a focus event that arrives meanwhile is picked up
+     * by the query's loop instead of being left unchecked.
+     */
+    g_focus_event_protected = -1;
+    g_facts.computed_at = 0;
+    if (busy) return;   /* the running query loops and picks this one up */
+    /* Inside another operation (even inside the keyboard hook, when it
+       pumps messages) a cross-process COM call could exceed the hook time
+       limit: the query runs from the message loop instead. */
+    if (g_engine_depth > 0) {
+        if (!g_focus_query_posted && g_window) {
+            g_focus_query_posted = 1;
+            PostMessageW(g_window, WM_APP_FOCUS_QUERY, 0, 0);
+        }
+        return;
+    }
+    run_focus_query();
+}
+
+/* Asks MSAA whether the focused element is a password field. Keys typed
+   while COM pumps messages pass through untouched (engine depth). Focus
+   that keeps moving is followed a few times; after that the field stays
+   "unknown", which counts as protected. */
+static void run_focus_query(void) {
+    static int busy;
+    int round;
+    if (busy || !engine_enter()) return;
+    busy = 1;
+    g_focus_query_running = 1;
+    for (round = 0; round < 4; ++round) {
+        HWND queried_window = g_focus_event_window;
+        LONG queried_object = g_focus_event_object;
+        LONG queried_child = g_focus_event_child;
+        unsigned long serial = g_focus_serial;
+        int protected_now = accessible_is_protected(queried_window, queried_object, queried_child);
+        if (serial == g_focus_serial) {
+            g_focus_event_protected = protected_now;
+            break;
+        }
+    }
+    busy = 0;
+    g_focus_query_running = 0;
+    engine_leave();
+    g_facts.computed_at = 0;
+    /* Focus kept moving: look again from the message loop. */
+    if (g_focus_event_protected == -1 && !g_focus_query_posted && g_window) {
+        g_focus_query_posted = 1;
+        PostMessageW(g_window, WM_APP_FOCUS_QUERY, 0, 0);
+    }
 }
 
 #define SPELL_NOT_CONSULTED 0   /* off, unavailable, or not a candidate word */
@@ -2052,6 +2489,9 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
         set_activity(L"Correction skipped in a protected password field.");
         return SPELL_SUPPRESSED;
     }
+    /* A fix that adds a half-space or a space to a 32-key word does not fit
+       the decision record; truncating it would type a wrong word. */
+    if (wcslen(result.replacement) > KS_MAX_WORD) return SPELL_DECLINED;
     memset(&decision, 0, sizeof(decision));
     decision.should_correct = 1;
     decision.key_count = g_word_count;
@@ -2112,7 +2552,8 @@ static int layout_change_was_ours(HWND foreground, KS_LANGUAGE now) {
     /* ...or keys still rendered by the old layout after the translation
        window closed (the request was never honoured and the user has not
        switched by hand since, or the window would have been forgotten). */
-    return now == g_layout_request_from && now != g_layout_request_language;
+    return now == g_layout_request_from && now != g_layout_request_language &&
+           GetTickCount() - g_layout_request_started < 10000u;
 }
 
 static KS_LANGUAGE current_word_layout(void) {
@@ -2192,7 +2633,17 @@ static KS_LIVE_RESULT evaluate_mixed_word(HWND foreground, KS_EVALUATION_PHASE p
     return KS_LIVE_CORRECT_NOW;
 }
 
+static void try_smart_correction_body(void);
+
+/* The adaptive-pause correction runs from a timer, outside the hook; it is
+   guarded like the hook so a key arriving mid-operation aborts it. */
 static void try_smart_correction(void) {
+    if (!engine_enter()) return;
+    try_smart_correction_body();
+    engine_leave();
+}
+
+static void try_smart_correction_body(void) {
     HWND foreground;
     KS_LANGUAGE language;
     KS_LANGUAGE intent;
@@ -2208,6 +2659,7 @@ static void try_smart_correction(void) {
     if (switch_still_pending(foreground, language)) language = g_layout_request_language;
     if (!foreground || foreground != g_word_window || language != current_word_layout()) {
         clear_word();
+        clear_history();
         return;
     }
 
@@ -2237,17 +2689,52 @@ static void try_smart_correction(void) {
     }
 }
 
+/* What one Backspace removes is a character, not a UTF-16 unit: count code
+   points (a surrogate pair is one). */
+static int backspaces_for(const wchar_t *text) {
+    int count = 0;
+    for (; *text; ++text)
+        if (!(*text >= 0xDC00 && *text <= 0xDFFF)) ++count;
+    return count;
+}
+
 static int try_undo(int consume_delimiter) {
     HWND foreground = GetForegroundWindow();
     int delete_count;
     UINT restored_delimiter;
     if (!g_undo.valid || foreground != g_undo.window ||
-        GetTickCount64() - g_undo.created_at > 15000u) {
+        focused_window(foreground) != g_undo.focus ||
+        GetTickCount64() - g_undo.created_at > (consume_delimiter ? 5000u : 15000u)) {
         g_undo.valid = 0;
         set_activity(L"Nothing to undo. Press Backspace immediately after a correction.");
         return 0;
     }
-    delete_count = (int)wcslen(g_undo.replacement) + (g_undo.delimiter ? 1 : 0);
+    /*
+     * Enter and Tab have already acted: a message was sent, a cell was left,
+     * focus moved to the next field. Deleting "back" from there would erase
+     * text the correction never touched, and replaying them would act twice.
+     * The same holds for a snippet that typed Enter or Tab itself.
+     */
+    if (g_undo.delimiter == VK_RETURN || g_undo.delimiter == VK_TAB ||
+        wcschr(g_undo.replacement, L'\n') || wcschr(g_undo.replacement, L'\t')) {
+        g_undo.valid = 0;
+        set_activity(L"Undo is not available after Enter, Tab, or a multi-line snippet.");
+        return 0;
+    }
+    /* Emoji sequences (variation selectors, joiners, surrogate pairs) are
+       erased as one character by some editors and as several by others:
+       the Backspace count would be a guess. */
+    {
+        const wchar_t *c;
+        for (c = g_undo.replacement; *c; ++c) {
+            if (*c == 0xFE0F || *c == 0x200D || (*c >= 0xD800 && *c <= 0xDFFF)) {
+                g_undo.valid = 0;
+                set_activity(L"Undo is not available for a snippet with emoji.");
+                return 0;
+            }
+        }
+    }
+    delete_count = backspaces_for(g_undo.replacement) + (g_undo.delimiter ? 1 : 0);
     restored_delimiter = consume_delimiter ? 0 : g_undo.delimiter;
     if (send_replacement(foreground, delete_count, g_undo.original,
                          restored_delimiter, g_undo.delimiter_zwnj,
@@ -2307,22 +2794,13 @@ static int try_undo(int consume_delimiter) {
 
 /* ---- Typing helpers inside the hook -------------------------------------- */
 
-/* Developer tools, excluded processes and password fields get the raw keys:
-   digits, punctuation and letters are never reshaped there. Cached per
-   focused window because the process lookup is not free. */
+/* Developer tools, excluded processes, remote sessions and password fields
+   get the raw keys: digits, punctuation and letters are never reshaped
+   there. focus_facts caches per focused element and is invalidated by focus
+   events (a browser's login fields share one window) and settings changes. */
 static int helpers_suppressed(HWND foreground) {
-    static HWND cached_focus;
-    static DWORD cached_at;
-    static int cached_result;
-    HWND focus = focused_window(foreground);
-    DWORD now = GetTickCount();
-    if (focus != cached_focus || now - cached_at > 3000u || !cached_at) {
-        cached_focus = focus;
-        cached_at = now ? now : 1;
-        cached_result = process_is_excluded(foreground) || spelling_skipped_process(foreground) ||
-                        is_protected_field(foreground);
-    }
-    return cached_result;
+    const FOCUS_FACTS *facts = focus_facts(foreground);
+    return facts->excluded || facts->remote || facts->developer_tool || facts->protected_field;
 }
 
 static void remember_last_word(HWND foreground) {
@@ -2397,11 +2875,20 @@ static int expand_snippet_or_pronoun(HWND foreground, UINT boundary_key, int zwn
     tokens_to_language(g_word, g_word_count, g_word_language, typed);
     if (g_settings.snippets) {
         snippet = ks_snippet_find(&g_snippets, typed);
+        /* "brgds" at a sentence start was capitalised as it was typed. */
+        if (!snippet && g_word_auto_capitalized && typed[0] >= L'A' && typed[0] <= L'Z') {
+            wchar_t lower[KS_MAX_WORD + 1];
+            wcscpy(lower, typed);
+            lower[0] = (wchar_t)(lower[0] - L'A' + L'a');
+            snippet = ks_snippet_find(&g_snippets, lower);
+        }
         if (snippet) {
-            wchar_t expansion[KS_MAX_PHRASE_CHARS + 1];
+            /* One character short of the injection limit, so Undo (which
+               also removes the delimiter) can always take it back. */
+            wchar_t expansion[KS_MAX_PHRASE_CHARS];
             KS_DATE_INFO now;
             current_date_info(&now);
-            ks_expand_macros(snippet->text, &now, expansion, KS_MAX_PHRASE_CHARS + 1);
+            ks_expand_macros(snippet->text, &now, expansion, KS_MAX_PHRASE_CHARS);
             if (expansion[0] &&
                 send_replacement(foreground, g_word_count, expansion, boundary_key, zwnj,
                                  g_word_language)) {
@@ -2512,20 +2999,9 @@ static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, 
     return 1;
 }
 
-/* is_protected_field costs a message round trip for Edit controls; while
-   keys are being translated it is asked once per focused window. */
+/* Cached in focus_facts, which follows focus events inside one window. */
 static int translation_target_protected(HWND foreground) {
-    static HWND cached_focus;
-    static DWORD cached_at;
-    static int cached_result;
-    HWND focus = focused_window(foreground);
-    DWORD now = GetTickCount();
-    if (focus != cached_focus || now - cached_at > 2000u) {
-        cached_focus = focus;
-        cached_at = now;
-        cached_result = is_protected_field(foreground);
-    }
-    return cached_result;
+    return is_protected_field(foreground);
 }
 
 /*
@@ -2550,6 +3026,10 @@ static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
     int helpers = (g_settings.persian_letters || g_settings.digits != KS_DIGITS_OFF ||
                    g_settings.punctuation || capitalize) && !helpers_suppressed(foreground);
     if (!translate && !helpers) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+    /* Windows already passed the key on (the hook took too long), or keys
+       slipped past meanwhile: injecting now would type it twice. */
+    if (g_engine_interrupted || (g_hook_entered_at && GetTickCount() - g_hook_entered_at > 150u))
+        return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     /* Numeric keypad keys depend on Num Lock, not on the layout. */
     if ((data->vkCode >= VK_NUMPAD0 && data->vkCode <= VK_DIVIDE) || (data->flags & LLKHF_EXTENDED))
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
@@ -2599,7 +3079,74 @@ static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
     return 1;
 }
 
+static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam);
+
+/* Excel's cell state (see g_cell_fresh) follows every physical key, even one
+   that arrives while another operation runs. */
+static void track_cell_state(DWORD key) {
+    int alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    switch (key) {
+        case VK_F2: g_cell_fresh = 0; g_cell_edit_mode = 1; break;
+        case VK_RETURN:
+            /* Alt+Enter is a line break inside the cell being edited. */
+            if (alt) { g_cell_fresh = 0; g_cell_edit_mode = 1; }
+            else { g_cell_fresh = 1; g_cell_edit_mode = 0; }
+            break;
+        case VK_TAB: case VK_ESCAPE:
+            g_cell_fresh = 1; g_cell_edit_mode = 0; break;
+        case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: case VK_PRIOR: case VK_NEXT:
+            if (!g_cell_edit_mode) g_cell_fresh = 1;
+            break;
+        default: break;
+    }
+}
+
 static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
+    const KBDLLHOOKSTRUCT *data = (const KBDLLHOOKSTRUCT *)lparam;
+    int key_down_event;
+    int foreign_key_down;
+    LRESULT result;
+    if (code < 0) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+    key_down_event = (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) &&
+                     !(data->flags & LLKHF_INJECTED);
+    /* Keys typed by another program (auto-type, macro tools) change the
+       text just as much as physical ones. */
+    foreign_key_down = (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) &&
+                       (data->flags & LLKHF_INJECTED) && data->dwExtraInfo != INPUT_MARKER;
+    if (g_engine_depth > 0) {
+        /* See g_engine_depth: never interpret a key in the middle of
+           another key's operation. */
+        g_last_hook_tick = GetTickCount();
+        if (key_down_event || foreign_key_down) {
+            g_engine_interrupted = 1;
+            g_engine_key_interrupted = 1;
+            ++g_key_serial;
+            if (key_down_event) track_cell_state(data->vkCode);
+            if (data->vkCode < 256) g_suppressed_at[data->vkCode] = 0;
+        }
+        return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+    }
+    engine_enter();
+    g_key_swallowed = 0;
+    g_hook_entered_at = GetTickCount();
+    result = keyboard_hook_body(code, wparam, lparam);
+    /* A key-down that reached the application (an auto-repeat after a
+       swallowed first press, say) must get its key-up too, or the key stays
+       down for the application. */
+    if (key_down_event && !g_key_swallowed && data->vkCode < 256)
+        g_suppressed_at[data->vkCode] = 0;
+    if (key_down_event) {
+        track_cell_state(data->vkCode);
+        /* A word boundary ends whatever word the engine did not see begin. */
+        if (data->vkCode == VK_SPACE || data->vkCode == VK_RETURN || data->vkCode == VK_TAB)
+            g_word_untrusted = 0;
+    }
+    g_hook_entered_at = 0;
+    engine_leave();
+    return result;
+}
+
+static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     KBDLLHOOKSTRUCT *data;
     int key_up;
     HWND foreground;
@@ -2623,6 +3170,7 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
     data = (KBDLLHOOKSTRUCT *)lparam;
     if (data->flags & LLKHF_INJECTED) {
         if (data->dwExtraInfo != INPUT_MARKER) {
+            if (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) ++g_key_serial;
             clear_word();
             clear_history();
             forget_layout_request();
@@ -2658,6 +3206,7 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     /* Every physical key-down: "the key right after X" tests use it. */
     ++g_key_serial;
+    resync_modifiers();
     if (data->vkCode == VK_BACK && g_control_down && g_windows_down) {
         clear_word();
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
@@ -2669,7 +3218,8 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
 
     if (data->vkCode == VK_BACK && !shortcut_modifier_down() &&
         g_undo.valid && GetForegroundWindow() == g_undo.window &&
-        GetTickCount64() - g_undo.created_at <= 15000u) {
+        g_undo.delimiter != VK_RETURN && g_undo.delimiter != VK_TAB &&
+        GetTickCount64() - g_undo.created_at <= 5000u) {
         clear_word();
         if (try_undo(1)) {
             suppress_key_up(data->vkCode);
@@ -2728,7 +3278,12 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
          * every later key of a long or slowly typed word.
          */
         if (g_word_count > 0 && layout_change_was_ours(foreground, language)) g_word_mixed = 1;
-        else clear_word();
+        else {
+            /* The rest of this word is typed in another layout; the history
+               can no longer say what is on screen before it. */
+            clear_word();
+            clear_history();
+        }
     }
 
     if (data->vkCode == VK_BACK) {
@@ -2819,6 +3374,14 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
      * boundary exactly like Shift+Space, not part of the word.
      */
     mapped = map_physical_key(data->scanCode, shift, caps, &token);
+    if (mapped && !translate && !active_layout_types_one_character(data->scanCode, shift, caps)) {
+        /* A dead key (US-International ' and `) or a key the active layout
+           leaves empty: the screen does not get one character for it, so
+           the word model would miscount. Stop tracking this word. */
+        clear_word();
+        clear_history();
+        return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+    }
     zwnj_key = mapped && language == KS_LANG_PERSIAN &&
                token.persian == (wchar_t)ZWNJ;
     if (mapped && !zwnj_key) {
@@ -2865,6 +3428,9 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             g_word_window = foreground;
             g_word_language = language;
             g_skip_word = process_is_excluded(foreground);
+            g_word_skip_untrusted = !g_skip_word && g_word_untrusted;
+            if (g_word_skip_untrusted) g_skip_word = 1;
+            g_word_untrusted = 0;
             /* Retyping a word that was just deleted in full. */
             if (g_orphan_peak[0] && g_orphan_window == foreground &&
                 g_orphan_serial + 1 == g_key_serial) {
@@ -2891,7 +3457,11 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
             g_word_auto_capitalized = capitalize;
         }
         g_previous_key_boundary = 0;
-        if (g_skip_word) return deliver_key(code, wparam, lparam, data, 0, shift, caps, foreground, language, 0);
+        /* An untrusted word is not corrected, but a pending layout switch
+           still types its keys in the requested alphabet. */
+        if (g_skip_word)
+            return deliver_key(code, wparam, lparam, data, g_word_skip_untrusted ? translate : 0,
+                               shift, caps, foreground, language, 0);
         if (g_word_count < KS_MAX_WORD && !g_overflow_count) {
             /* Sampled in the hook, before the target translates the key: if
                the switch lands in between, this one key is attributed to the
@@ -3193,7 +3763,20 @@ static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) 
     if (code >= 0 && (wparam == WM_LBUTTONDOWN || wparam == WM_RBUTTONDOWN ||
                       wparam == WM_MBUTTONDOWN || wparam == WM_XBUTTONDOWN)) {
         data = (MSLLHOOKSTRUCT *)lparam;
-        if (!(data->flags & LLMHF_INJECTED)) {
+        /* Injected clicks count too (remote-control tools, accessibility
+           software, pen and touch): KeySwitchFix itself never injects mouse
+           input, and any click can move the caret. */
+        (void)data;
+        if (g_engine_depth > 0) g_engine_interrupted = 1;
+        if (wparam == WM_LBUTTONDOWN) {
+            DWORD now = GetTickCount();
+            int double_click = g_last_click_at && now - g_last_click_at <= GetDoubleClickTime();
+            g_cell_fresh = !double_click;
+            g_cell_edit_mode = double_click;
+            g_last_click_at = double_click ? 0 : now;
+        }
+        g_word_untrusted = 0;
+        {
             clear_word();
             clear_history();
             forget_layout_request();
@@ -3282,27 +3865,6 @@ static void check_hook_health(void) {
         ++g_hook_reinstalls;
         set_activity(L"Windows had detached the keyboard hook; it has been reinstalled.");
     }
-}
-
-static void add_tray_icon(void) {
-    ZeroMemory(&g_tray, sizeof(g_tray));
-    g_tray.cbSize = sizeof(g_tray);
-    g_tray.hWnd = g_window;
-    g_tray.uID = ID_TRAY;
-    g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
-    g_tray.uCallbackMessage = WM_APP_TRAY;
-    g_tray.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP));
-    safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t), L"KeySwitchFix — Active");
-    Shell_NotifyIconW(NIM_ADD, &g_tray);
-    g_tray.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
-}
-
-static void update_tray_tip(void) {
-    g_tray.uFlags = NIF_TIP | NIF_SHOWTIP;
-    safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t),
-              g_settings.enabled ? L"KeySwitchFix — Active" : L"KeySwitchFix — Paused");
-    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
 /* ---- Ctrl+Win+X: clean up the selected text ------------------------------ */
@@ -3435,6 +3997,20 @@ static int clipboard_set_text(const wchar_t *text) {
     if (open_clipboard_retry()) {
         EmptyClipboard();
         ok = SetClipboardData(CF_UNICODETEXT, memory) != NULL;
+        if (ok) {
+            /* A clean-up passes through the clipboard for a moment: keep it
+               out of Win+V history and cloud clipboard sync. */
+            UINT exclude = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+            HGLOBAL marker = exclude ? GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD)) : NULL;
+            if (marker) {
+                DWORD *zero = (DWORD *)GlobalLock(marker);
+                if (zero) {
+                    *zero = 0;
+                    GlobalUnlock(marker);
+                }
+                if (!SetClipboardData(exclude, marker)) GlobalFree(marker);
+            }
+        }
         CloseClipboard();
     }
     if (!ok) GlobalFree(memory);
@@ -3479,6 +4055,10 @@ static int any_modifier_down(void) {
  * Step 4: put the user's own clipboard back — unless something else has
  * been copied meanwhile.
  */
+static HWND g_cleanup_target;
+static unsigned long g_cleanup_focus_serial;
+static unsigned long g_cleanup_key_serial;
+
 static void start_selection_cleanup(void) {
     HWND foreground = GetForegroundWindow();
     if (g_cleanup_step) return;
@@ -3495,10 +4075,24 @@ static void start_selection_cleanup(void) {
     g_cleanup_step = 1;
     g_cleanup_retries = 0;
     g_cleanup_started_at = GetTickCount();
+    g_cleanup_target = foreground;
+    g_cleanup_focus_serial = g_focus_serial;
     SetTimer(g_window, ID_TIMER_CLEANUP, 30, NULL);
 }
 
 static void continue_selection_cleanup(void) {
+    /* The user switched windows, moved to another field, or typed (moving
+       the caret or the selection) meanwhile: never paste somewhere else. */
+    if ((g_cleanup_step == 1 || g_cleanup_step == 2) &&
+        (GetForegroundWindow() != g_cleanup_target || g_focus_serial != g_cleanup_focus_serial ||
+         (g_cleanup_step == 2 && g_key_serial != g_cleanup_key_serial))) {
+        set_activity(L"Clean-up cancelled: the window changed.");
+        if (g_cleanup_step == 1) {
+            finish_selection_cleanup();
+            return;
+        }
+        g_cleanup_step = 4;   /* put the user's clipboard back */
+    }
     switch (g_cleanup_step) {
         case 1:
             if (any_modifier_down()) {
@@ -3508,6 +4102,7 @@ static void continue_selection_cleanup(void) {
             clipboard_snapshot_take(&g_cleanup_saved_clipboard);
             g_cleanup_sequence = GetClipboardSequenceNumber();
             send_shortcut('C');
+            g_cleanup_key_serial = g_key_serial;
             g_cleanup_step = 2;
             SetTimer(g_window, ID_TIMER_CLEANUP, 120, NULL);
             return;
@@ -3564,10 +4159,9 @@ static void continue_selection_cleanup(void) {
     }
 }
 
-static void show_tray_menu(void) {
+static void show_tray_menu(int x, int y) {
     HMENU menu = CreatePopupMenu();
     HMENU language_menu = CreatePopupMenu();
-    POINT point;
     AppendMenuW(menu, MF_STRING, IDM_OPEN, L"Open KeySwitchFix");
     AppendMenuW(menu, MF_STRING | (g_settings.enabled ? MF_CHECKED : 0), IDM_TOGGLE,
                 L"Enable automatic correction");
@@ -3589,7 +4183,7 @@ static void show_tray_menu(void) {
     {
         HMENU helpers_menu = CreatePopupMenu();
         AppendMenuW(helpers_menu, MF_STRING | (g_settings.punctuation ? MF_CHECKED : 0),
-                    IDM_PUNCTUATION, L"Persian punctuation after Persian words (؟ ، ؛)");
+                    IDM_PUNCTUATION, L"Persian punctuation after Persian words (؟\x200E ،\x200E ؛\x200E)");
         AppendMenuW(helpers_menu, MF_STRING | (g_settings.auto_capitalize ? MF_CHECKED : 0),
                     IDM_CAPITALIZE, L"Capitalise English sentences");
         AppendMenuW(helpers_menu, MF_STRING | (g_settings.snippets ? MF_CHECKED : 0),
@@ -3599,7 +4193,8 @@ static void show_tray_menu(void) {
                     IDM_VOCAB_IT, L"IT && computing vocabulary");
         AppendMenuW(helpers_menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(helpers_menu, MF_STRING | MF_GRAYED, IDM_CLEANUP,
-                    L"Clean up selected text:  Ctrl + Win + X");
+                    g_cleanup_hotkey_registered ? L"Clean up selected text:  Ctrl + Win + X"
+                                                : L"Clean up selected text: hotkey used by another app");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)helpers_menu, L"Typing helpers");
     }
     {
@@ -3611,66 +4206,95 @@ static void show_tray_menu(void) {
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)memory_menu, L"Writing memory");
     }
     if (g_last_typed_process[0]) {
-        wchar_t label[MAX_PATH + 48];
+        wchar_t label[2 * MAX_PATH + 48];
+        wchar_t escaped[2 * MAX_PATH];
+        size_t in = 0, out = 0;
+        /* "&" in a file name would become a menu accelerator. */
+        for (; g_last_typed_process[in] && out + 2 < sizeof(escaped) / sizeof(escaped[0]); ++in) {
+            if (g_last_typed_process[in] == L'&') escaped[out++] = L'&';
+            escaped[out++] = g_last_typed_process[in];
+        }
+        escaped[out] = 0;
         swprintf(label, sizeof(label) / sizeof(label[0]),
                  excluded_list_contains(g_last_typed_process)
                      ? L"Resume correction in %ls"
                      : L"Exclude %ls",
-                 g_last_typed_process);
+                 escaped);
         AppendMenuW(menu, MF_STRING, IDM_EXCLUDE_CURRENT, label);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
-    GetCursorPos(&point);
+    SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
     SetForegroundWindow(g_window);
-    TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN, point.x, point.y, 0, g_window, NULL);
+    TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, x, y, 0, g_window, NULL);
     /* Required after TrackPopupMenu from a tray icon (KB Q135788), otherwise
        the menu does not dismiss when the user clicks elsewhere. */
     PostMessageW(g_window, WM_NULL, 0, 0);
     DestroyMenu(menu);
 }
 
-static void show_main_window(void) {
-    ShowWindow(g_window, SW_SHOWNORMAL);
-    SetForegroundWindow(g_window);
-    /* WM_SHOWWINDOW is not delivered for every restore path; make sure the
-       diagnostics refresh is running whenever the dashboard is on screen. */
-    update_diagnostics_ui();
-    SetTimer(g_window, ID_TIMER_STATUS, 500, NULL);
-}
-
 /* ------------------------------------------------------------------------ */
 /* Dashboard                                                                 */
 /*                                                                           */
-/* Geometry is authored at 96 DPI on an 840x748 client area and scaled once  */
-/* at startup; if the screen's work area is smaller than the scaled window,  */
-/* the scale is reduced so the whole dashboard, footer buttons included, is  */
-/* always on screen. Every label column is wide enough for its longest       */
-/* caption in Segoe UI 16px with room to spare, so nothing is clipped.       */
+/* One window, authored at 96 DPI on an 840x540 client area: a header, a     */
+/* status card that is always visible (state, last activity, Pause), four    */
+/* pages chosen with a segmented bar (Correction, Typing, Memory & words,    */
+/* Statistics), and a footer. Settings apply the moment they change; there   */
+/* is no Save button to forget. Every control is a real child window with a */
+/* real label, so Tab, Alt+letter, Ctrl+Tab, Esc and screen readers work.   */
+/* The layout is rebuilt for the monitor's DPI (per-monitor v2), and scaled  */
+/* down when the work area is too small (1366x768 at 150 %).                 */
 /* ------------------------------------------------------------------------ */
 
 #define UI_CLIENT_WIDTH 840
-#define UI_CLIENT_HEIGHT 762
-#define UI_HEADER_HEIGHT 100
+#define UI_CLIENT_HEIGHT 540
+#define UI_HEADER_HEIGHT 68
 #define UI_MARGIN 32
 #define UI_CARD_LEFT UI_MARGIN
 #define UI_CARD_RIGHT (UI_CLIENT_WIDTH - UI_MARGIN)
 #define UI_LABEL_LEFT 56
-#define UI_CONTROL_LEFT 250
-#define UI_CONTROL_WIDTH 296
+#define UI_CONTROL_LEFT 236
+#define UI_CONTROL_WIDTH 300
 #define UI_SIDE_LEFT 556
-#define UI_SIDE_WIDTH 228
+#define UI_SIDE_WIDTH 232
+#define UI_STATUS_TOP 80
+#define UI_STATUS_BOTTOM 140
+#define UI_NAV_TOP 152
+#define UI_NAV_HEIGHT 32
+#define UI_NAV_WIDTH 160
+#define UI_NAV_GAP 8
+#define UI_PAGE_TOP 192
+#define UI_PAGE_BOTTOM 480
+#define UI_ROW_PITCH 38
+#define UI_ROW(index) (UI_PAGE_TOP + 20 + (index) * UI_ROW_PITCH)
+#define UI_FOOTER_TOP 492
+#define UI_BUTTON_HEIGHT 34
+#define UI_TILE_WIDTH 173
+#define UI_TILE_HEIGHT 56
+#define UI_TILE_GAP 12
+#define UI_PAGES 4
+
+#define IDC_NAV_FIRST 150      /* 150..153 */
+#define IDC_OPEN_DATA 160
+#define IDC_OPEN_MEMORY 161
+#define IDC_FORGET_MEMORY 162
+#define IDC_MEMORY_STATE 163
+#define IDC_TYPING_IN 164
+#define IDC_SHORTCUTS 165
 
 static const COLORREF UI_HEADER_TOP = RGB(22, 34, 66);
 static const COLORREF UI_HEADER_BOTTOM = RGB(44, 72, 132);
 static const COLORREF UI_BACKGROUND = RGB(245, 247, 251);
 static const COLORREF UI_CARD_BORDER = RGB(222, 228, 238);
-static const COLORREF UI_TEXT = RGB(40, 51, 74);
-static const COLORREF UI_MUTED = RGB(104, 116, 140);
-static const COLORREF UI_ACCENT = RGB(76, 111, 230);
-static const COLORREF UI_GREEN = RGB(38, 176, 120);
-static const COLORREF UI_GREY = RGB(139, 148, 166);
-static const COLORREF UI_TILE = RGB(240, 244, 251);
+static const COLORREF UI_TEXT = RGB(33, 43, 64);
+static const COLORREF UI_MUTED = RGB(88, 99, 122);
+static const COLORREF UI_ACCENT = RGB(62, 96, 214);
+static const COLORREF UI_GREEN = RGB(30, 150, 100);
+static const COLORREF UI_AMBER = RGB(196, 120, 20);
+static const COLORREF UI_RED = RGB(196, 60, 60);
+static const COLORREF UI_GREY = RGB(128, 138, 156);
+static const COLORREF UI_TILE = RGB(238, 243, 252);
+static const COLORREF UI_SLATE = RGB(84, 101, 138);
 
 static HBRUSH g_brush_tile;
 static HWND g_tile_values[UI_TILE_COUNT];
@@ -3684,6 +4308,31 @@ static HWND g_snippets_check;
 static HWND g_stats_label;
 static HWND g_learn_writing;
 static HWND g_vocab_it;
+static HWND g_memory_state;
+static HWND g_shortcuts_label;
+static HWND g_nav[UI_PAGES];
+static HWND g_page_controls[UI_PAGES][32];
+static int g_page_count[UI_PAGES];
+static int g_page;
+/* Statics drawn in the muted colour (row labels and hints). */
+static int g_high_contrast;      /* Windows high-contrast theme: system colours only */
+static int g_ui_ready;           /* controls exist and may be read */
+static HWND g_saved_focus;       /* restored when the window is activated again */
+static const wchar_t *const g_page_names[UI_PAGES] = {
+    L"Correction", L"Typing", L"Memory && words", L"Statistics" };
+static HWND g_row_labels[24];
+static int g_row_label_count;
+static HWND g_spelling_label;
+static LRESULT g_dropdown_selection = -1;   /* list item when the list opened */
+static UINT g_show_message;      /* a second instance asks the first to show itself */
+static int g_tray_retries;
+static HWND g_muted[48];
+static int g_muted_count;
+static HWND g_hover_button;
+static int g_monitor_dpi = 96;
+static int g_fit_percent = 100;
+static HICON g_icon_normal;
+static HICON g_icon_paused;
 
 static int scale(int value) {
     return MulDiv(value, g_dpi, 96);
@@ -3703,11 +4352,258 @@ static HWND create_child(const wchar_t *class_name, const wchar_t *text, DWORD s
                            parent, (HMENU)(INT_PTR)identifier, g_instance, NULL);
 }
 
+static void page_add(int page, HWND control) {
+    if (page < 0 || page >= UI_PAGES || !control) return;
+    if (g_page_count[page] < 32) g_page_controls[page][g_page_count[page]++] = control;
+    if (page != g_page) ShowWindow(control, SW_HIDE);
+}
+
+static HWND muted(HWND control) {
+    if (g_muted_count < 48) g_muted[g_muted_count++] = control;
+    return control;
+}
+
+static int is_muted(HWND control) {
+    int i;
+    for (i = 0; i < g_muted_count; ++i)
+        if (g_muted[i] == control) return 1;
+    return 0;
+}
+
+/* A row label: a real STATIC with a mnemonic, created right before the
+   control it names so Alt+letter and screen readers find that control. */
+static void row_label(HWND window, int page, int row, const wchar_t *text) {
+    HWND label = muted(create_child(L"STATIC", text, SS_LEFT, 0, UI_LABEL_LEFT, UI_ROW(row) + 4,
+                                    UI_CONTROL_LEFT - UI_LABEL_LEFT - 8, 22, window, 0));
+    if (g_row_label_count < 24) g_row_labels[g_row_label_count++] = label;
+    page_add(page, label);
+}
+
+static int is_row_label(HWND control) {
+    int i;
+    for (i = 0; i < g_row_label_count; ++i)
+        if (g_row_labels[i] == control) return 1;
+    return 0;
+}
+
+/* Colours: the designed palette, or the system's in a high-contrast theme. */
+static COLORREF ui_color(COLORREF designed, int system_index) {
+    return g_high_contrast ? GetSysColor(system_index) : designed;
+}
+
+static void refresh_high_contrast(void) {
+    HIGHCONTRASTW contrast;
+    ZeroMemory(&contrast, sizeof(contrast));
+    contrast.cbSize = sizeof(contrast);
+    g_high_contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+                      (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+}
+
+static HWND checkbox(HWND window, int page, int left, int top, int width, const wchar_t *text, int id) {
+    HWND control = create_child(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, left, top, width, 24,
+                                window, id);
+    page_add(page, control);
+    return control;
+}
+
+static HWND combo(HWND window, int page, int row, int id, const wchar_t *const *items, int count) {
+    HWND control = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0,
+                                UI_CONTROL_LEFT, UI_ROW(row), UI_CONTROL_WIDTH, 240, window, id);
+    int i;
+    for (i = 0; i < count; ++i) SendMessageW(control, CB_ADDSTRING, 0, (LPARAM)items[i]);
+    page_add(page, control);
+    return control;
+}
+
+static HWND button(HWND window, int page, const wchar_t *text, int left, int top, int width, int id) {
+    HWND control = create_child(L"BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, 0, left, top, width,
+                                UI_BUTTON_HEIGHT, window, id);
+    if (page >= 0) page_add(page, control);
+    return control;
+}
+
+static HWND hint(HWND window, int page, int left, int top, int width, int height, const wchar_t *text, int id) {
+    HWND control = muted(create_child(L"STATIC", text, SS_LEFT | SS_NOPREFIX, 0, left, top, width, height,
+                                      window, id));
+    page_add(page, control);
+    return control;
+}
+
+static void show_page(int page) {
+    int p;
+    int i;
+    if (page < 0) page = UI_PAGES - 1;
+    if (page >= UI_PAGES) page = 0;
+    g_page = page;
+    for (p = 0; p < UI_PAGES; ++p)
+        for (i = 0; i < g_page_count[p]; ++i)
+            ShowWindow(g_page_controls[p][i], p == page ? SW_SHOW : SW_HIDE);
+    for (p = 0; p < UI_PAGES; ++p) {
+        if (!g_nav[p]) continue;
+        /* One Tab stop for the tab strip (arrows move inside it), and the
+           selected page is named so a screen reader announces it. */
+        {
+            LONG_PTR style = GetWindowLongPtrW(g_nav[p], GWL_STYLE);
+            wchar_t name[64];
+            SetWindowLongPtrW(g_nav[p], GWL_STYLE, p == page ? (style | WS_TABSTOP) : (style & ~(LONG_PTR)WS_TABSTOP));
+            swprintf(name, 64, p == page ? L"%ls (selected page)" : L"%ls", g_page_names[p]);
+            SetWindowTextW(g_nav[p], name);
+        }
+        InvalidateRect(g_nav[p], NULL, FALSE);
+    }
+    /* The page card's tiles are painted by the window itself. */
+    if (g_window) InvalidateRect(g_window, NULL, FALSE);
+}
+
+/* ---- Tray icon ----------------------------------------------------------- */
+
+/* A desaturated, lighter copy of the icon for the paused / not-working
+   states, so the state is visible in the notification area itself. */
+static HICON make_grey_icon(HICON source) {
+    ICONINFO info;
+    BITMAP bitmap;
+    BITMAPINFO header;
+    DWORD *pixels = NULL;
+    void *bits = NULL;
+    HBITMAP grey = NULL;
+    HICON result = NULL;
+    HDC screen;
+    int count;
+    int i;
+    if (!source || !GetIconInfo(source, &info)) return NULL;
+    if (!info.hbmColor) {
+        DeleteObject(info.hbmMask);
+        return NULL;
+    }
+    GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap);
+    ZeroMemory(&header, sizeof(header));
+    header.bmiHeader.biSize = sizeof(header.bmiHeader);
+    header.bmiHeader.biWidth = bitmap.bmWidth;
+    header.bmiHeader.biHeight = -bitmap.bmHeight;
+    header.bmiHeader.biPlanes = 1;
+    header.bmiHeader.biBitCount = 32;
+    header.bmiHeader.biCompression = BI_RGB;
+    count = bitmap.bmWidth * bitmap.bmHeight;
+    screen = GetDC(NULL);
+    pixels = (DWORD *)HeapAlloc(GetProcessHeap(), 0, (size_t)count * sizeof(DWORD));
+    if (pixels && GetDIBits(screen, info.hbmColor, 0, (UINT)bitmap.bmHeight, pixels, &header, DIB_RGB_COLORS)) {
+        for (i = 0; i < count; ++i) {
+            DWORD pixel = pixels[i];
+            DWORD alpha = pixel >> 24;
+            DWORD red = (pixel >> 16) & 0xFF;
+            DWORD green = (pixel >> 8) & 0xFF;
+            DWORD blue = pixel & 0xFF;
+            DWORD level = (red * 30 + green * 59 + blue * 11) / 100;
+            level = (level + 150) / 2;
+            /* Icon colour bitmaps carry straight (not premultiplied) alpha. */
+            pixels[i] = (alpha << 24) | (level << 16) | (level << 8) | level;
+        }
+        grey = CreateDIBSection(screen, &header, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (grey && bits) {
+            memcpy(bits, pixels, (size_t)count * sizeof(DWORD));
+            DeleteObject(info.hbmColor);
+            info.hbmColor = grey;
+            grey = NULL;
+            result = CreateIconIndirect(&info);
+        }
+    }
+    if (grey) DeleteObject(grey);
+    if (pixels) HeapFree(GetProcessHeap(), 0, pixels);
+    ReleaseDC(NULL, screen);
+    DeleteObject(info.hbmColor);
+    DeleteObject(info.hbmMask);
+    return result;
+}
+
+/* 0 active, 1 paused, 2 not working (reason in *why). */
+static int app_state(const wchar_t **why) {
+    const wchar_t *missing = missing_layout_name();
+    if (why) *why = L"";
+    if (!g_keyboard_hook) {
+        if (why) *why = L"keyboard hook blocked";
+        return 2;
+    }
+    if (missing) {
+        if (why) *why = missing[0] == L'P' ? L"Persian layout missing" : L"English layout missing";
+        return 2;
+    }
+    return g_settings.enabled ? 0 : 1;
+}
+
+static void load_tray_icons(void) {
+    int size = GetSystemMetrics(SM_CXSMICON);
+    if (!g_icon_normal)
+        g_icon_normal = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, size, size, 0);
+    if (!g_icon_normal) g_icon_normal = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP));
+    if (!g_icon_paused) g_icon_paused = make_grey_icon(g_icon_normal);
+}
+
+/* The taskbar was recreated (Explorer restart, or a DPI change of the
+   taskbar): the small-icon size may differ, so the icons are rebuilt. */
+static void reload_tray_icons(void) {
+    if (g_icon_paused) DestroyIcon(g_icon_paused);
+    if (g_icon_normal) DestroyIcon(g_icon_normal);
+    g_icon_paused = NULL;
+    g_icon_normal = NULL;
+    load_tray_icons();
+}
+
+static void add_tray_icon(void) {
+    load_tray_icons();
+    ZeroMemory(&g_tray, sizeof(g_tray));
+    g_tray.cbSize = sizeof(g_tray);
+    g_tray.hWnd = g_window;
+    g_tray.uID = ID_TRAY;
+    g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    g_tray.uCallbackMessage = WM_APP_TRAY;
+    g_tray.hIcon = g_icon_normal;
+    safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t), L"KeySwitchFix");
+    Shell_NotifyIconW(NIM_DELETE, &g_tray);   /* a stale entry would make NIM_ADD fail */
+    if (!Shell_NotifyIconW(NIM_ADD, &g_tray)) {
+        /* Explorer may not be ready yet at logon; try again shortly (for a
+           minute at most; TaskbarCreated adds it later anyway). */
+        if (++g_tray_retries <= 20) SetTimer(g_window, ID_TIMER_TRAY_RETRY, 3000, NULL);
+        return;
+    }
+    g_tray_retries = 0;
+    g_tray.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_tray);
+    update_tray_tip();
+}
+
+static void update_tray_tip(void) {
+    const wchar_t *why;
+    int state = app_state(&why);
+    load_tray_icons();
+    g_tray.uFlags = NIF_TIP | NIF_SHOWTIP | NIF_ICON;
+    g_tray.hIcon = state == 0 || !g_icon_paused ? g_icon_normal : g_icon_paused;
+    safe_copy(g_tray.szTip, sizeof(g_tray.szTip) / sizeof(wchar_t),
+              state == 0 ? L"KeySwitchFix — Active"
+                         : state == 1 ? (g_toggle_hotkey_registered ? L"KeySwitchFix — Paused (Ctrl + Win + K resumes)"
+                                                                    : L"KeySwitchFix — Paused")
+                                      : L"KeySwitchFix — Not working: open it for details");
+    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
+
+static void show_balloon(const wchar_t *title, const wchar_t *text) {
+    /* NIF_REALTIME: a note that cannot be shown now is dropped rather than
+       queued in the notification centre. */
+    g_tray.uFlags = NIF_INFO | NIF_REALTIME;
+    g_tray.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    safe_copy(g_tray.szInfoTitle, sizeof(g_tray.szInfoTitle) / sizeof(wchar_t), title);
+    safe_copy(g_tray.szInfo, sizeof(g_tray.szInfo) / sizeof(wchar_t), text);
+    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
+
+/* ---- Settings <-> controls ----------------------------------------------- */
+
 static void update_controls_from_settings(void) {
     SendMessageW(g_sensitivity, CB_SETCURSEL, (WPARAM)g_settings.sensitivity, 0);
     SendMessageW(g_language_mode, CB_SETCURSEL, (WPARAM)g_settings.language_mode, 0);
     SendMessageW(g_spelling, CB_SETCURSEL, (WPARAM)g_settings.spelling, 0);
     EnableWindow(g_spelling, g_spelling_available);
+    /* A disabled list's label would send Alt+P to the next control. */
+    EnableWindow(g_spelling_label, g_spelling_available);
     EnableWindow(g_personal_dictionary, g_spelling_available);
     SendMessageW(g_personal_dictionary, BM_SETCHECK,
                  g_settings.personal_dictionary ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -3719,10 +4615,10 @@ static void update_controls_from_settings(void) {
     SendMessageW(g_snippets_check, BM_SETCHECK, g_settings.snippets ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_learn_writing, BM_SETCHECK, g_settings.learn_writing ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_vocab_it, BM_SETCHECK, g_settings.vocab_it ? BST_CHECKED : BST_UNCHECKED, 0);
-    SetWindowTextW(g_excluded, g_settings.excluded);
-    InvalidateRect(g_enable_button, NULL, TRUE);
+    if (GetFocus() != g_excluded) SetWindowTextW(g_excluded, g_settings.excluded);
+    SetWindowTextW(g_enable_button, g_settings.enabled ? L"Pa&use" : L"Res&ume");
+    InvalidateRect(g_enable_button, NULL, FALSE);
     if (g_window) {
-        /* The header pill shows the active/paused state. */
         RECT header = {0, 0, scale(UI_CLIENT_WIDTH), scale(UI_HEADER_HEIGHT)};
         InvalidateRect(g_window, &header, FALSE);
     }
@@ -3757,6 +4653,30 @@ static void read_controls_to_settings(void) {
                    (int)(sizeof(g_settings.excluded) / sizeof(wchar_t)));
 }
 
+/* The excluded-apps box differs from the saved list. */
+static int excluded_edit_changed(void) {
+    wchar_t text[512];
+    if (!g_ui_ready || !g_excluded) return 0;
+    text[0] = 0;
+    GetWindowTextW(g_excluded, text, 512);
+    return wcscmp(text, g_settings.excluded) != 0;
+}
+
+/* Any control changed: the setting takes effect and is saved at once. */
+static void apply_controls(void) {
+    /* While the controls are being destroyed (a DPI rebuild, exit) their
+       values read as zero: never save those. */
+    if (!g_ui_ready) return;
+    read_controls_to_settings();
+    memory_apply_setting();
+    clear_word();
+    clear_history();
+    g_undo.valid = 0;
+    save_settings();
+    update_tray_tip();
+    set_activity(L"Setting saved.");
+}
+
 /* SetWindowText repaints even when nothing changed; on a 500 ms timer that
    shows up as flicker. Only touch a label whose text is actually different. */
 static void set_label_text(HWND label, const wchar_t *text) {
@@ -3768,9 +4688,33 @@ static void set_label_text(HWND label, const wchar_t *text) {
 }
 
 static void set_tile_value(int index, LONG value) {
-    wchar_t buffer[32];
-    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%ld", value);
+    wchar_t digits[32];
+    wchar_t buffer[48];
+    size_t length;
+    size_t i;
+    size_t out = 0;
+    swprintf(digits, sizeof(digits) / sizeof(digits[0]), L"%ld", value < 0 ? 0L : value);
+    length = wcslen(digits);
+    /* 18,204 reads faster than 18204. */
+    for (i = 0; i < length; ++i) {
+        if (i > 0 && (length - i) % 3 == 0) buffer[out++] = L',';
+        buffer[out++] = digits[i];
+    }
+    buffer[out] = 0;
     set_label_text(g_tile_values[index], buffer);
+}
+
+static void update_shortcuts_text(void) {
+    wchar_t buffer[512];
+    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+             L"Undo a correction:  Backspace right after it%ls\n"
+             L"Pause or resume everywhere:  Ctrl + Win + K%ls\n"
+             L"Clean up selected text:  Ctrl + Win + X%ls\n"
+             L"Switch pages here:  Ctrl + Tab     Hide this window:  Esc",
+             g_hotkey_registered ? L", or Ctrl + Win + Backspace" : L"",
+             g_toggle_hotkey_registered ? L"" : L"   (unavailable: used by another app)",
+             g_cleanup_hotkey_registered ? L"" : L"   (unavailable: used by another app)");
+    set_label_text(g_shortcuts_label, buffer);
 }
 
 static void update_diagnostics_ui(void) {
@@ -3778,44 +4722,39 @@ static void update_diagnostics_ui(void) {
     wchar_t process_name[MAX_PATH];
     HWND foreground = GetForegroundWindow();
     KS_LANGUAGE language;
-    const wchar_t *missing_layout;
+    const wchar_t *why;
+    int state = app_state(&why);
 
     if (foreground == g_window) foreground = g_word_window;
     language = foreground_language(foreground);
     if (!query_process_basename(focused_window(foreground), process_name, MAX_PATH))
-        safe_copy(process_name, MAX_PATH, L"No application yet");
+        safe_copy(process_name, MAX_PATH, L"no application yet");
 
-    set_label_text(g_status_label, g_settings.enabled
-        ? L"Protection is active" : L"Protection is paused");
-    if (g_layout_requests_ignored > 0)
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Typing in %ls  •  %ls layout%ls  •  %ld of %ld layout switches were not accepted by the app (keys translated by KeySwitchFix)",
-                 process_name, language_name(language),
-                 g_spelling_available ? L"" : L"  •  spelling data missing",
-                 (long)g_layout_requests_ignored, (long)g_layout_requests);
-    else
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Typing in %ls  •  %ls layout%ls",
-                 process_name, language_name(language),
-                 g_spelling_available ? L"" : L"  •  spelling data missing");
-    set_label_text(g_layout_label, buffer);
-
-    missing_layout = missing_layout_name();
-    if (missing_layout) {
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"The %ls keyboard layout is not installed in Windows. Add it under Settings > Time & language > Language.",
-                 missing_layout);
-    } else if (g_hook_reinstalls) {
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Keyboard hook: %ls (re-armed %d×)  •  Undo: Backspace  •  Pause: Ctrl + Win + K",
-                 g_keyboard_hook ? L"Running" : L"FAILED", g_hook_reinstalls);
+    if (state == 2) {
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"Not working: %ls", why);
+        set_label_text(g_status_label, buffer);
+        /* The line below the status says what to do about it. */
+        set_label_text(g_activity_label,
+                       !g_keyboard_hook
+                           ? L"Restart KeySwitchFix; if it persists, allow it in your security software."
+                           : L"Add English and Persian in Settings > Time & language > Language & region.");
     } else {
-        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                 L"Keyboard hook: %ls  •  Undo: Backspace or Ctrl + Win + Backspace  •  Pause: Ctrl + Win + K  •  Clean up selection: Ctrl + Win + X",
-                 g_keyboard_hook ? L"Running" : L"FAILED");
+        set_label_text(g_status_label, state == 0 ? L"Protection is active" : L"Protection is paused");
+        set_label_text(g_activity_label, g_last_activity);
     }
+
+    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+             L"Typing in %ls with the %ls layout.%ls%ls",
+             process_name, language_name(language),
+             g_spelling_available ? L"" : L" Spelling data is missing from this build.",
+             g_layout_requests_ignored > 0 ? L" Some apps did not switch layouts; KeySwitchFix typed those keys itself." : L"");
+    set_label_text(g_layout_label, buffer);
+    swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+             L"Keyboard hook: %ls%ls",
+             g_keyboard_hook ? L"running" : L"FAILED",
+             g_hook_reinstalls ? L" (re-armed after Windows removed it)" : L"");
     set_label_text(g_hook_label, buffer);
-    set_label_text(g_activity_label, g_last_activity);
+
     stats_touch_day();
     set_tile_value(0, g_stats.today_layout);
     set_tile_value(1, g_stats.today_spelling);
@@ -3827,145 +4766,214 @@ static void update_diagnostics_ui(void) {
         long minutes = ks_stats_seconds_saved(&g_stats) / 60;
         wchar_t top[160];
         top[0] = 0;
-        if (ks_stats_top(&g_stats, 0, &word, &count) && count >= 2) {
-            const wchar_t *second = NULL;
-            unsigned second_count = 0;
-            if (ks_stats_top(&g_stats, 1, &second, &second_count) && second_count >= 2)
-                swprintf(top, 160, L"  •  most corrected: %ls (%u), %ls (%u)", word, count, second, second_count);
-            else
-                swprintf(top, 160, L"  •  most corrected: %ls (%u)", word, count);
-        }
-        if (g_memory_active)
-            swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                     L"Memory: %d words, %d learned repairs  •  %ld active days  •  about %ld minute%ls saved%ls",
-                     g_memory.word_count, ks_memory_active_fix_count(&g_memory),
-                     g_stats.days_active, minutes, minutes == 1 ? L"" : L"s", top);
-        else
-            swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
-                     L"Session: %ld keys, %ld fixes  •  %ld active days  •  about %ld minute%ls saved in total%ls",
-                     (long)g_keys_seen, (long)(g_corrections + g_spelling_fixes + g_snippets_used),
-                     g_stats.days_active, minutes, minutes == 1 ? L"" : L"s", top);
+        if (ks_stats_top(&g_stats, 0, &word, &count) && count >= 2)
+            swprintf(top, 160, L"\nMost corrected this session: %ls\x200E (%u)", word, count);
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                 L"%ld active days, about %ld minute%ls saved in total.%ls",
+                 g_stats.days_active, minutes, minutes == 1 ? L"" : L"s", top);
         set_label_text(g_stats_label, buffer);
     }
-    InvalidateRect(g_enable_button, NULL, TRUE);
+    if (g_memory_active)
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                 L"The memory holds %d words and %d learned repairs.",
+                 g_memory.word_count, ks_memory_active_fix_count(&g_memory));
+    else
+        swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                 L"Learning is off. Nothing you type is remembered.");
+    set_label_text(g_memory_state, buffer);
+    update_shortcuts_text();
+    if (g_window) {
+        /* Only the header badge and the status stripe depend on the state. */
+        RECT header = {0, 0, scale(UI_CLIENT_WIDTH), scale(UI_HEADER_HEIGHT)};
+        RECT stripe = {scale(UI_CARD_LEFT), scale(UI_STATUS_TOP), scale(UI_CARD_LEFT + 24),
+                       scale(UI_STATUS_BOTTOM)};
+        InvalidateRect(g_window, &header, FALSE);
+        InvalidateRect(g_window, &stripe, FALSE);
+    }
 }
 
-#define UI_TILE_WIDTH 176
+/* ---- Building the window ------------------------------------------------- */
 
 static void create_tile(HWND window, int index, int left, int top, const wchar_t *caption) {
-    g_tile_values[index] = create_child(L"STATIC", L"0", SS_ENDELLIPSIS, 0,
+    g_tile_values[index] = create_child(L"STATIC", L"0", SS_ENDELLIPSIS | SS_NOPREFIX, 0,
                                         left + 14, top + 6, UI_TILE_WIDTH - 28, 28, window,
                                         IDC_TILE_VALUE + index);
-    g_tile_captions[index] = create_child(L"STATIC", caption, SS_ENDELLIPSIS, 0,
-                                          left + 14, top + 33, UI_TILE_WIDTH - 28, 16, window,
+    g_tile_captions[index] = create_child(L"STATIC", caption, SS_ENDELLIPSIS | SS_NOPREFIX, 0,
+                                          left + 14, top + 34, UI_TILE_WIDTH - 28, 18, window,
                                           IDC_TILE_CAPTION + index);
+    page_add(3, g_tile_values[index]);
+    page_add(3, g_tile_captions[index]);
 }
 
-/* Vertical layout (design pixels): cards and rows are computed from these so
-   the settings card can grow without hand-tuned coordinates. */
-#define UI_CARD1_TOP (UI_HEADER_HEIGHT + 16)
-#define UI_CARD1_BOTTOM (UI_CARD1_TOP + 72)
-#define UI_CARD2_TOP (UI_CARD1_BOTTOM + 16)
-#define UI_ROW_PITCH 36
-#define UI_ROW(index) (UI_CARD2_TOP + 50 + (index) * UI_ROW_PITCH)
-#define UI_CARD2_BOTTOM (UI_ROW(6) + 44)
-#define UI_CARD3_TOP (UI_CARD2_BOTTOM + 16)
-#define UI_TILE_TOP (UI_CARD3_TOP + 40)
-#define UI_TILE_HEIGHT 52
-#define UI_TILE_GAP 10
-#define UI_STATS_TOP (UI_TILE_TOP + UI_TILE_HEIGHT + 10)
-#define UI_HOOK_TOP (UI_STATS_TOP + 20)
-#define UI_ACTIVITY_TOP (UI_HOOK_TOP + 20)
-#define UI_CARD3_BOTTOM (UI_ACTIVITY_TOP + 26)
-#define UI_BUTTON_TOP (UI_CARD3_BOTTOM + 14)
-#define UI_BUTTON_HEIGHT 36
+static LRESULT CALLBACK button_subclass_proc(HWND control, UINT message, WPARAM wparam, LPARAM lparam,
+                                             UINT_PTR id, DWORD_PTR data) {
+    (void)id;
+    (void)data;
+    if (message == WM_MOUSEMOVE && g_hover_button != control) {
+        TRACKMOUSEEVENT track;
+        HWND previous = g_hover_button;
+        g_hover_button = control;
+        ZeroMemory(&track, sizeof(track));
+        track.cbSize = sizeof(track);
+        track.dwFlags = TME_LEAVE;
+        track.hwndTrack = control;
+        TrackMouseEvent(&track);
+        if (previous) InvalidateRect(previous, NULL, FALSE);
+        InvalidateRect(control, NULL, FALSE);
+    } else if (message == WM_MOUSELEAVE && g_hover_button == control) {
+        g_hover_button = NULL;
+        InvalidateRect(control, NULL, FALSE);
+    }
+    return DefSubclassProc(control, message, wparam, lparam);
+}
+
+static void subclass_buttons(HWND window) {
+    HWND child = GetWindow(window, GW_CHILD);
+    while (child) {
+        wchar_t class_name[16];
+        class_name[0] = 0;
+        GetClassNameW(child, class_name, 16);
+        if (_wcsicmp(class_name, L"Button") == 0 &&
+            (GetWindowLongPtrW(child, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW)
+            SetWindowSubclass(child, button_subclass_proc, 1, 0);
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+}
 
 static void create_ui(HWND window) {
+    static const wchar_t *const sensitivity[] = {
+        L"Conservative", L"Balanced (recommended)", L"Sensitive" };
+    static const wchar_t *const writing[] = {
+        L"Auto — sentence context", L"Prefer Persian for collisions", L"Prefer English for collisions" };
+    static const wchar_t *const spelling[] = {
+        L"Off", L"Conservative", L"Balanced (recommended)", L"Aggressive" };
+    static const wchar_t *const digits[] = {
+        L"As the layout types them", L"Follow the layout (۱۲۳ / 123)", L"Always Persian ۱۲۳",
+        L"Always English 123" };
+    const wchar_t *const *pages = g_page_names;
+    int i;
+    int card_width = UI_CARD_RIGHT - UI_CARD_LEFT;
+
+    ZeroMemory(g_page_count, sizeof(g_page_count));
+    g_muted_count = 0;
+    g_row_label_count = 0;
+    refresh_high_contrast();
+    g_hover_button = NULL;
     g_font_regular = create_ui_font(15, FW_NORMAL);
-    g_font_medium = create_ui_font(16, FW_SEMIBOLD);
-    g_font_title = create_ui_font(28, FW_BOLD);
-    g_font_status = create_ui_font(21, FW_SEMIBOLD);
+    g_font_medium = create_ui_font(15, FW_SEMIBOLD);
+    g_font_title = create_ui_font(26, FW_BOLD);
+    g_font_status = create_ui_font(20, FW_SEMIBOLD);
     g_font_tile = create_ui_font(24, FW_BOLD);
     g_font_small = create_ui_font(13, FW_NORMAL);
 
-    /* Card 1: status */
-    g_status_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
-                                  UI_LABEL_LEFT, UI_CARD1_TOP + 14, 570, 30, window, IDC_STATUS_LABEL);
-    g_layout_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
-                                  UI_LABEL_LEFT, UI_CARD1_TOP + 44, 570, 20, window, IDC_LAYOUT_LABEL);
-    g_enable_button = create_child(L"BUTTON", L"", BS_OWNERDRAW, 0,
-                                   UI_CARD_RIGHT - 24 - 140, UI_CARD1_TOP + 16, 140, 40, window, IDC_ENABLE);
+    /* Status card: always visible. */
+    {
+        int status_width = UI_CARD_RIGHT - 24 - 132 - 16 - UI_LABEL_LEFT;
+        g_status_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS | SS_NOPREFIX, 0,
+                                      UI_LABEL_LEFT, UI_STATUS_TOP + 8, status_width, 28, window,
+                                      IDC_STATUS_LABEL);
+        g_activity_label = muted(create_child(L"STATIC", L"", SS_ENDELLIPSIS | SS_NOPREFIX, 0,
+                                              UI_LABEL_LEFT, UI_STATUS_TOP + 36, status_width, 18, window,
+                                              IDC_ACTIVITY_LABEL));
+    }
+    g_enable_button = button(window, -1, L"Pa&use", UI_CARD_RIGHT - 24 - 132, UI_STATUS_TOP + 13, 132,
+                             IDC_ENABLE);
 
-    /* Card 2: settings — label column, control column, side column */
-    g_sensitivity = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
-                                 UI_CONTROL_LEFT, UI_ROW(0), UI_CONTROL_WIDTH, 200, window, IDC_SENSITIVITY);
-    SendMessageW(g_sensitivity, CB_ADDSTRING, 0, (LPARAM)L"Conservative");
-    SendMessageW(g_sensitivity, CB_ADDSTRING, 0, (LPARAM)L"Balanced (recommended)");
-    SendMessageW(g_sensitivity, CB_ADDSTRING, 0, (LPARAM)L"Sensitive");
-    g_startup = create_child(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX, 0,
-                             UI_SIDE_LEFT, UI_ROW(0) + 2, UI_SIDE_WIDTH, 24, window, IDC_APP_STARTUP);
+    /* Page selector. */
+    for (i = 0; i < UI_PAGES; ++i)
+        g_nav[i] = button(window, -1, pages[i], UI_CARD_LEFT + i * (UI_NAV_WIDTH + UI_NAV_GAP), UI_NAV_TOP,
+                          UI_NAV_WIDTH, IDC_NAV_FIRST + i);
 
-    g_language_mode = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
-                                   UI_CONTROL_LEFT, UI_ROW(1), UI_CONTROL_WIDTH, 200, window, IDC_LANGUAGE_MODE);
-    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Auto — sentence context");
-    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Prefer Persian for collisions");
-    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Prefer English for collisions");
-    g_capitalize = create_child(L"BUTTON", L"Auto-capitalise English", BS_AUTOCHECKBOX, 0,
-                                UI_SIDE_LEFT, UI_ROW(1) + 2, UI_SIDE_WIDTH, 24, window, IDC_CAPITALIZE);
+    /* Page 0: Correction. */
+    /* Creation order is the Tab order: the three lists, then the two
+       switches beside them, then the excluded-apps box. */
+    row_label(window, 0, 0, L"&Sensitivity");
+    g_sensitivity = combo(window, 0, 0, IDC_SENSITIVITY, sensitivity, 3);
+    row_label(window, 0, 1, L"&Writing language");
+    g_language_mode = combo(window, 0, 1, IDC_LANGUAGE_MODE, writing, 3);
+    row_label(window, 0, 2, L"S&pelling");
+    g_spelling_label = g_row_labels[g_row_label_count - 1];
+    g_spelling = combo(window, 0, 2, IDC_SPELLING, spelling, 4);
+    g_startup = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(0) + 2, UI_SIDE_WIDTH, L"Start with Wi&ndows",
+                         IDC_APP_STARTUP);
+    g_personal_dictionary = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(2) + 2, UI_SIDE_WIDTH,
+                                     L"&Remember undone words", IDC_PERSONAL_DICTIONARY);
+    row_label(window, 0, 3, L"E&xcluded apps");
+    g_excluded = create_child(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+                              UI_CONTROL_LEFT, UI_ROW(3), UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 26, window,
+                              IDC_EXCLUDED);
+    page_add(0, g_excluded);
+    /* The setting holds 511 characters: stop there rather than cut silently. */
+    SendMessageW(g_excluded, EM_SETLIMITTEXT, 511, 0);
+    hint(window, 0, UI_CONTROL_LEFT, UI_ROW(4) - 4, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 40,
+         L"Program file names separated by commas, for example KeePass.exe. The tray menu can "
+         L"exclude the app you last typed in with one click.", 0);
+    hint(window, 0, UI_LABEL_LEFT, UI_ROW(5) + 12, card_width - 48, 60,
+         L"Wrong-layout words are repaired as you type; ambiguous ones when the word ends. "
+         L"One Backspace right after a correction restores what you typed.", 0);
 
-    g_spelling = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
-                              UI_CONTROL_LEFT, UI_ROW(2), UI_CONTROL_WIDTH, 200, window, IDC_SPELLING);
-    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Off");
-    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Conservative");
-    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Balanced (recommended)");
-    SendMessageW(g_spelling, CB_ADDSTRING, 0, (LPARAM)L"Aggressive");
-    g_personal_dictionary = create_child(L"BUTTON", L"Remember undone words", BS_AUTOCHECKBOX, 0,
-                                         UI_SIDE_LEFT, UI_ROW(2) + 2, UI_SIDE_WIDTH, 24, window,
-                                         IDC_PERSONAL_DICTIONARY);
+    /* Page 1: Typing. */
+    row_label(window, 1, 0, L"&Digits");
+    g_digits = combo(window, 1, 0, IDC_DIGITS, digits, 4);
+    row_label(window, 1, 1, L"Punctuation");
+    g_punctuation = checkbox(window, 1, UI_CONTROL_LEFT, UI_ROW(1) + 2, 520,
+                             L"&Persian ؟\x200E ،\x200E ؛\x200E after Persian words, ? , ; after English", IDC_PUNCTUATION);
+    row_label(window, 1, 2, L"Letters");
+    g_persian_letters = checkbox(window, 1, UI_CONTROL_LEFT, UI_ROW(2) + 2, 520,
+                                 L"&Type Arabic ي ك as Persian ی ک", IDC_PERSIAN_LETTERS);
+    row_label(window, 1, 3, L"Capitals");
+    g_capitalize = checkbox(window, 1, UI_CONTROL_LEFT, UI_ROW(3) + 2, 520,
+                            L"&Capitalise English sentences and the lone i", IDC_CAPITALIZE);
+    row_label(window, 1, 4, L"Snippets");
+    g_snippets_check = checkbox(window, 1, UI_CONTROL_LEFT, UI_ROW(4) + 2, 300,
+                                L"E&xpand snippet shortcuts", IDC_SNIPPETS);
+    button(window, 1, L"Edit s&nippets…", UI_SIDE_LEFT, UI_ROW(4) - 4, 160, IDC_EDIT_SNIPPETS);
+    hint(window, 1, UI_LABEL_LEFT, UI_ROW(5) + 12, card_width - 48, 60,
+         L"Select text in any application and press Ctrl + Win + X to clean it up: Persian "
+         L"letters, digits and punctuation. None of these helpers act in code editors, "
+         L"terminals, remote desktops or password fields.", 0);
 
-    g_digits = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST, 0,
-                            UI_CONTROL_LEFT, UI_ROW(3), UI_CONTROL_WIDTH, 200, window, IDC_DIGITS);
-    SendMessageW(g_digits, CB_ADDSTRING, 0, (LPARAM)L"As the layout types them");
-    SendMessageW(g_digits, CB_ADDSTRING, 0, (LPARAM)L"Follow the layout (۱۲۳ / 123)");
-    SendMessageW(g_digits, CB_ADDSTRING, 0, (LPARAM)L"Always Persian ۱۲۳");
-    SendMessageW(g_digits, CB_ADDSTRING, 0, (LPARAM)L"Always English 123");
-    g_punctuation = create_child(L"BUTTON", L"Persian marks ؟ ، ؛", BS_AUTOCHECKBOX, 0,
-                                 UI_SIDE_LEFT, UI_ROW(3) + 2, UI_SIDE_WIDTH, 24, window, IDC_PUNCTUATION);
+    /* Page 2: Memory & words. */
+    row_label(window, 2, 0, L"Writing memory");
+    g_learn_writing = checkbox(window, 2, UI_CONTROL_LEFT, UI_ROW(0) + 2, 520,
+                               L"&Learn my writing (kept only on this PC)", IDC_LEARN_WRITING);
+    hint(window, 2, UI_CONTROL_LEFT, UI_ROW(1) - 2, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 42,
+         L"Learns the repairs you make by hand (fix a typo twice and it is fixed for you) and "
+         L"the words you use most. Only words that end with Space; never in password fields.", 0);
+    g_memory_state = hint(window, 2, UI_CONTROL_LEFT, UI_ROW(2) + 10, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT,
+                          20, L"", IDC_MEMORY_STATE);
+    button(window, 2, L"&Open memory file…", UI_CONTROL_LEFT, UI_ROW(3) + 2, 180, IDC_OPEN_MEMORY);
+    button(window, 2, L"Forg&et everything…", UI_CONTROL_LEFT + 192, UI_ROW(3) + 2, 180, IDC_FORGET_MEMORY);
+    /* Half a row below the buttons, so they do not crowd the switch. */
+    row_label(window, 2, 4, L"Vocabulary");
+    SetWindowPos(g_row_labels[g_row_label_count - 1], NULL, scale(UI_LABEL_LEFT), scale(UI_ROW(4) + 18), 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    g_vocab_it = checkbox(window, 2, UI_CONTROL_LEFT, UI_ROW(4) + 16, 520,
+                          L"&IT && computing terms (about 1,400 English and Persian words)", IDC_VOCAB_IT);
 
-    g_persian_letters = create_child(L"BUTTON", L"Persian letters: ي ك → ی ک", BS_AUTOCHECKBOX, 0,
-                                     UI_CONTROL_LEFT, UI_ROW(4) + 2, UI_CONTROL_WIDTH, 24, window,
-                                     IDC_PERSIAN_LETTERS);
-    g_snippets_check = create_child(L"BUTTON", L"Expand snippet shortcuts", BS_AUTOCHECKBOX, 0,
-                                    UI_SIDE_LEFT, UI_ROW(4) + 2, UI_SIDE_WIDTH, 24, window, IDC_SNIPPETS);
+    /* Page 3: Statistics. */
+    create_tile(window, 0, UI_LABEL_LEFT, UI_ROW(0) - 4, L"layout fixes today");
+    create_tile(window, 1, UI_LABEL_LEFT + (UI_TILE_WIDTH + UI_TILE_GAP), UI_ROW(0) - 4, L"spelling fixes today");
+    create_tile(window, 2, UI_LABEL_LEFT + 2 * (UI_TILE_WIDTH + UI_TILE_GAP), UI_ROW(0) - 4, L"fixes, all time");
+    create_tile(window, 3, UI_LABEL_LEFT + 3 * (UI_TILE_WIDTH + UI_TILE_GAP), UI_ROW(0) - 4, L"keys today");
+    /* Heights allow two lines of the regular font (stats), three of the
+       small one (layout diagnostics) and four for the shortcut list, with
+       room for the rounding of larger scales (a 13 px line is 17 px high,
+       20 px at 150 % is 27). */
+    g_stats_label = create_child(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 0, UI_LABEL_LEFT, UI_ROW(1) + 26,
+                                 card_width - 48, 44, window, IDC_STATS_LABEL);
+    page_add(3, g_stats_label);
+    g_layout_label = muted(create_child(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 0, UI_LABEL_LEFT, UI_ROW(2) + 36,
+                                        card_width - 48, 56, window, IDC_LAYOUT_LABEL));
+    page_add(3, g_layout_label);
+    g_hook_label = muted(create_child(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, 0, UI_LABEL_LEFT, UI_ROW(4) + 18,
+                                      card_width - 48, 18, window, IDC_HOOK_LABEL));
+    page_add(3, g_hook_label);
+    g_shortcuts_label = hint(window, 3, UI_LABEL_LEFT, UI_ROW(5), card_width - 48, 76, L"", IDC_SHORTCUTS);
 
-    g_excluded = create_child(L"EDIT", L"", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
-                              UI_CONTROL_LEFT, UI_ROW(5), UI_CONTROL_WIDTH, 28, window, IDC_EXCLUDED);
-    create_child(L"BUTTON", L"Edit snippets…", BS_OWNERDRAW, 0,
-                 UI_SIDE_LEFT, UI_ROW(5) - 2, 150, 32, window, IDC_EDIT_SNIPPETS);
-
-    g_learn_writing = create_child(L"BUTTON", L"Learn my writing (kept on this PC)", BS_AUTOCHECKBOX, 0,
-                                   UI_CONTROL_LEFT, UI_ROW(6) + 2, UI_CONTROL_WIDTH, 24, window,
-                                   IDC_LEARN_WRITING);
-    g_vocab_it = create_child(L"BUTTON", L"IT && computing terms", BS_AUTOCHECKBOX, 0,
-                              UI_SIDE_LEFT, UI_ROW(6) + 2, UI_SIDE_WIDTH, 24, window, IDC_VOCAB_IT);
-
-    /* Card 3: diagnostics and statistics */
-    create_tile(window, 0, UI_LABEL_LEFT, UI_TILE_TOP, L"layout fixes today");
-    create_tile(window, 1, UI_LABEL_LEFT + (UI_TILE_WIDTH + UI_TILE_GAP), UI_TILE_TOP, L"spelling fixes today");
-    create_tile(window, 2, UI_LABEL_LEFT + 2 * (UI_TILE_WIDTH + UI_TILE_GAP), UI_TILE_TOP, L"fixes, all time");
-    create_tile(window, 3, UI_LABEL_LEFT + 3 * (UI_TILE_WIDTH + UI_TILE_GAP), UI_TILE_TOP, L"keys today");
-    g_stats_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
-                                 UI_LABEL_LEFT, UI_STATS_TOP, 736, 18, window, IDC_STATS_LABEL);
-    g_hook_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
-                                UI_LABEL_LEFT, UI_HOOK_TOP, 736, 18, window, IDC_HOOK_LABEL);
-    g_activity_label = create_child(L"STATIC", L"", SS_ENDELLIPSIS, 0,
-                                    UI_LABEL_LEFT, UI_ACTIVITY_TOP, 736, 18, window, IDC_ACTIVITY_LABEL);
-
-    /* Footer */
-    create_child(L"BUTTON", L"Save settings", BS_OWNERDRAW, 0, UI_MARGIN, UI_BUTTON_TOP, 160, UI_BUTTON_HEIGHT,
-                 window, IDC_SAVE);
-    create_child(L"BUTTON", L"Hide to tray", BS_OWNERDRAW, 0, UI_MARGIN + 172, UI_BUTTON_TOP, 150,
-                 UI_BUTTON_HEIGHT, window, IDC_HIDE);
+    /* Footer. */
+    button(window, -1, L"&Hide to tray", UI_MARGIN, UI_FOOTER_TOP, 150, IDC_HIDE);
+    button(window, -1, L"Open data &folder", UI_MARGIN + 160, UI_FOOTER_TOP, 170, IDC_OPEN_DATA);
 
     {
         HWND child = GetWindow(window, GW_CHILD);
@@ -3975,22 +4983,187 @@ static void create_ui(HWND window) {
         }
     }
     SendMessageW(g_status_label, WM_SETFONT, (WPARAM)g_font_status, TRUE);
-    SendMessageW(g_layout_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
-    SendMessageW(g_stats_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
-    SendMessageW(g_hook_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
     SendMessageW(g_activity_label, WM_SETFONT, (WPARAM)g_font_small, TRUE);
-    {
-        int i;
-        for (i = 0; i < UI_TILE_COUNT; ++i) {
-            SendMessageW(g_tile_values[i], WM_SETFONT, (WPARAM)g_font_tile, TRUE);
-            SendMessageW(g_tile_captions[i], WM_SETFONT, (WPARAM)g_font_small, TRUE);
-        }
+    /* Hints and diagnostics use the small font; row labels keep the
+       regular one so they line up with the controls they name. */
+    for (i = 0; i < g_muted_count; ++i)
+        if (!is_row_label(g_muted[i]))
+            SendMessageW(g_muted[i], WM_SETFONT, (WPARAM)g_font_small, TRUE);
+    for (i = 0; i < UI_TILE_COUNT; ++i) {
+        SendMessageW(g_tile_values[i], WM_SETFONT, (WPARAM)g_font_tile, TRUE);
+        SendMessageW(g_tile_captions[i], WM_SETFONT, (WPARAM)g_font_small, TRUE);
     }
     g_brush_white = CreateSolidBrush(RGB(255, 255, 255));
     g_brush_background = CreateSolidBrush(UI_BACKGROUND);
     g_brush_tile = CreateSolidBrush(UI_TILE);
+    subclass_buttons(window);
+    g_ui_ready = 1;
+    show_page(g_page);
     update_controls_from_settings();
 }
+
+static void destroy_ui(HWND window) {
+    HWND child;
+    /* Destroying a focused edit sends EN_KILLFOCUS; by then other controls
+       are gone. Take the focus away first and stop reading controls. */
+    if (g_ui_ready && GetFocus() == g_excluded && excluded_edit_changed()) apply_controls();
+    g_ui_ready = 0;
+    g_saved_focus = NULL;
+    if (IsChild(window, GetFocus())) SetFocus(window);
+    while ((child = GetWindow(window, GW_CHILD)) != NULL) DestroyWindow(child);
+    DeleteObject(g_font_regular);
+    DeleteObject(g_font_medium);
+    DeleteObject(g_font_title);
+    DeleteObject(g_font_status);
+    DeleteObject(g_font_tile);
+    DeleteObject(g_font_small);
+    DeleteObject(g_brush_white);
+    DeleteObject(g_brush_background);
+    DeleteObject(g_brush_tile);
+}
+
+/* The DPI of the monitor a window is on (Windows 10 1607+), else the
+   system DPI. */
+static int window_dpi(HWND window) {
+    typedef UINT (WINAPI *GET_DPI_FOR_WINDOW)(HWND);
+    static GET_DPI_FOR_WINDOW get_dpi_for_window;
+    static int resolved;
+    if (!resolved) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        resolved = 1;
+        if (user32) get_dpi_for_window = (GET_DPI_FOR_WINDOW)(void *)GetProcAddress(user32, "GetDpiForWindow");
+    }
+    if (get_dpi_for_window && window) {
+        UINT dpi = get_dpi_for_window(window);
+        if (dpi >= 72) return (int)dpi;
+    }
+    {
+        HDC screen = GetDC(NULL);
+        int dpi = screen ? GetDeviceCaps(screen, LOGPIXELSX) : 96;
+        if (screen) ReleaseDC(NULL, screen);
+        return dpi >= 72 ? dpi : 96;
+    }
+}
+
+/* Frame size for a given DPI: under per-monitor awareness the caption and
+   borders follow the monitor, not the system DPI (Windows 10 1607+). */
+static void adjust_for_dpi(RECT *frame, DWORD style, int dpi) {
+    typedef BOOL (WINAPI *ADJUST_FOR_DPI)(RECT *, DWORD, BOOL, DWORD, UINT);
+    static ADJUST_FOR_DPI adjust;
+    static int resolved;
+    if (!resolved) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        resolved = 1;
+        if (user32) adjust = (ADJUST_FOR_DPI)(void *)GetProcAddress(user32, "AdjustWindowRectExForDpi");
+    }
+    if (adjust && adjust(frame, style, FALSE, WS_EX_APPWINDOW, (UINT)dpi)) return;
+    AdjustWindowRectEx(frame, style, FALSE, WS_EX_APPWINDOW);
+}
+
+/* Scale for `monitor_dpi`, reduced when the window would not fit the work
+   area (the footer must always be reachable). */
+static void choose_scale(int monitor_dpi, const RECT *work_area) {
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    g_monitor_dpi = monitor_dpi;
+    g_fit_percent = 100;
+    for (;;) {
+        RECT probe;
+        g_dpi = MulDiv(g_monitor_dpi, g_fit_percent, 100);
+        probe.left = 0;
+        probe.top = 0;
+        probe.right = scale(UI_CLIENT_WIDTH);
+        probe.bottom = scale(UI_CLIENT_HEIGHT);
+        adjust_for_dpi(&probe, style, g_monitor_dpi);
+        if (!work_area || g_fit_percent <= 60 ||
+            (probe.bottom - probe.top <= work_area->bottom - work_area->top &&
+             probe.right - probe.left <= work_area->right - work_area->left))
+            break;
+        g_fit_percent -= 5;
+    }
+}
+
+static void work_area_for(HWND window, RECT *area) {
+    MONITORINFO info;
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    if (window && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &info)) {
+        *area = info.rcWork;
+        return;
+    }
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, area, 0)) SetRect(area, 0, 0, 1280, 720);
+}
+
+/* Moved to a monitor with another DPI (or created on one): rebuild every
+   control at the new size. */
+static void rebuild_for_dpi(HWND window, int monitor_dpi, const RECT *suggested) {
+    RECT area;
+    RECT frame;
+    HWND focus_page = NULL;
+    int focus_id = 0;
+    {
+        HWND focus = GetFocus();
+        if (!focus || !IsChild(window, focus)) focus = g_saved_focus;
+        if (focus && IsChild(window, focus)) focus_id = GetDlgCtrlID(focus);
+    }
+    work_area_for(window, &area);
+    choose_scale(monitor_dpi, &area);
+    destroy_ui(window);
+    create_ui(window);
+    /* The same control keeps (or will get back) the focus. */
+    if (focus_id) g_saved_focus = GetDlgItem(window, focus_id);
+    SetRect(&frame, 0, 0, scale(UI_CLIENT_WIDTH), scale(UI_CLIENT_HEIGHT));
+    adjust_for_dpi(&frame, (DWORD)GetWindowLongPtrW(window, GWL_STYLE), g_monitor_dpi);
+    if (suggested)
+        SetWindowPos(window, NULL, suggested->left, suggested->top, frame.right - frame.left,
+                     frame.bottom - frame.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    else
+        SetWindowPos(window, NULL, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+    focus_page = g_saved_focus ? g_saved_focus : g_nav[g_page];
+    if (IsWindowVisible(window) && GetForegroundWindow() == window && focus_page) SetFocus(focus_page);
+    update_diagnostics_ui();
+    InvalidateRect(window, NULL, TRUE);
+}
+
+static void center_in_work_area(HWND window) {
+    RECT area;
+    RECT frame;
+    work_area_for(window, &area);
+    GetWindowRect(window, &frame);
+    SetWindowPos(window, NULL,
+                 area.left + ((area.right - area.left) - (frame.right - frame.left)) / 2,
+                 area.top + ((area.bottom - area.top) - (frame.bottom - frame.top)) / 2,
+                 0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static void show_main_window_by(int keyboard) {
+    static int placed;
+    /* Centred the first time, and again if its monitor was unplugged. */
+    if (!placed || !MonitorFromWindow(g_window, MONITOR_DEFAULTTONULL)) {
+        center_in_work_area(g_window);
+        placed = 1;
+    }
+    update_controls_from_settings();
+    ShowWindow(g_window, SW_SHOWNORMAL);
+    SetForegroundWindow(g_window);
+    /* Opened with the mouse: no focus rectangle or underlines until the
+       keyboard is used (the dialog manager shows them then). */
+    SendMessageW(g_window, WM_CHANGEUISTATE,
+                 MAKEWPARAM(keyboard ? UIS_CLEAR : UIS_SET, UISF_HIDEFOCUS | UISF_HIDEACCEL), 0);
+    if (g_saved_focus && IsChild(g_window, g_saved_focus) && IsWindowVisible(g_saved_focus))
+        SetFocus(g_saved_focus);
+    else if (g_nav[g_page]) SetFocus(g_nav[g_page]);
+    /* WM_SHOWWINDOW is not delivered for every restore path; make sure the
+       diagnostics refresh is running whenever the dashboard is on screen. */
+    update_diagnostics_ui();
+    SetTimer(g_window, ID_TIMER_STATUS, 1000, NULL);
+}
+
+static void show_main_window(void) {
+    show_main_window_by(0);
+}
+
+/* ---- Painting ------------------------------------------------------------ */
 
 static int is_tile_label(HWND control) {
     int i;
@@ -4013,7 +5186,8 @@ static void fill_round_rect(HDC dc, int left, int top, int right, int bottom, in
 }
 
 static void draw_card(HDC dc, int left, int top, int right, int bottom) {
-    fill_round_rect(dc, left, top, right, bottom, 18, RGB(255, 255, 255), UI_CARD_BORDER);
+    fill_round_rect(dc, left, top, right, bottom, 16, ui_color(RGB(255, 255, 255), COLOR_WINDOW),
+                    ui_color(UI_CARD_BORDER, COLOR_WINDOWTEXT));
 }
 
 static void draw_text(HDC dc, int left, int top, const wchar_t *text) {
@@ -4029,7 +5203,20 @@ static void draw_text_right(HDC dc, int right, int top, const wchar_t *text) {
 static void draw_header(HDC dc, const RECT *client) {
     int height = scale(UI_HEADER_HEIGHT);
     int y;
-    /* Vertical gradient in 4-pixel bands: no msimg32 dependency. */
+    const wchar_t *why;
+    int state = app_state(&why);
+    if (g_high_contrast) {
+        RECT band = {0, 0, client->right, height};
+        FillRect(dc, &band, GetSysColorBrush(COLOR_WINDOW));
+        SelectObject(dc, g_font_title);
+        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+        draw_text(dc, UI_MARGIN, 10, L"KeySwitchFix");
+        SelectObject(dc, g_font_small);
+        draw_text(dc, UI_MARGIN + 2, 44, L"v" APP_VERSION);
+        SelectObject(dc, g_font_medium);
+        draw_text_right(dc, UI_CARD_RIGHT, 24, state == 0 ? L"Active" : state == 1 ? L"Paused" : L"Problem");
+        return;
+    }
     for (y = 0; y < height; y += 4) {
         RECT band = {0, y, client->right, y + 4 < height ? y + 4 : height};
         int r = GetRValue(UI_HEADER_TOP) + (GetRValue(UI_HEADER_BOTTOM) - GetRValue(UI_HEADER_TOP)) * y / height;
@@ -4039,136 +5226,249 @@ static void draw_header(HDC dc, const RECT *client) {
         FillRect(dc, &band, brush);
         DeleteObject(brush);
     }
-    /* Left: name and tagline. Right: status pill above the version line.
-       Everything sits inside the gradient with a clear margin below. */
     SelectObject(dc, g_font_title);
     SetTextColor(dc, RGB(255, 255, 255));
-    draw_text(dc, UI_MARGIN, 22, L"KeySwitchFix");
-    SelectObject(dc, g_font_regular);
-    SetTextColor(dc, RGB(196, 208, 236));
-    draw_text(dc, UI_MARGIN + 2, 60, L"Persian ↔ English layout repair, spelling, and typing helpers");
+    draw_text(dc, UI_MARGIN, 10, L"KeySwitchFix");
     SelectObject(dc, g_font_small);
-    SetTextColor(dc, RGB(160, 176, 214));
-    draw_text_right(dc, UI_CARD_RIGHT, 66, L"v" APP_VERSION L"  •  offline  •  no logging");
-
-    /* Status pill */
+    SetTextColor(dc, RGB(196, 208, 236));
+    draw_text(dc, UI_MARGIN + 2, 44, L"Persian ↔ English layout repair, spelling and typing helpers  •  v" APP_VERSION);
     {
-        const wchar_t *text = g_settings.enabled ? L"Active" : L"Paused";
-        COLORREF dot = g_settings.enabled ? UI_GREEN : UI_GREY;
-        fill_round_rect(dc, UI_CARD_RIGHT - 118, 24, UI_CARD_RIGHT, 54, 15,
-                        RGB(52, 82, 146), RGB(70, 104, 174));
-        {
-            HBRUSH brush = CreateSolidBrush(dot);
-            HPEN pen = CreatePen(PS_SOLID, 1, dot);
-            HGDIOBJ old_brush = SelectObject(dc, brush);
-            HGDIOBJ old_pen = SelectObject(dc, pen);
-            Ellipse(dc, scale(UI_CARD_RIGHT - 102), scale(33), scale(UI_CARD_RIGHT - 90), scale(45));
-            SelectObject(dc, old_pen);
-            SelectObject(dc, old_brush);
-            DeleteObject(pen);
-            DeleteObject(brush);
-        }
+        const wchar_t *text = state == 0 ? L"Active" : state == 1 ? L"Paused" : L"Problem";
+        COLORREF dot = state == 0 ? RGB(80, 220, 150) : state == 1 ? UI_GREY : RGB(255, 170, 60);
+        HBRUSH brush;
+        HPEN pen;
+        HGDIOBJ old_brush;
+        HGDIOBJ old_pen;
+        fill_round_rect(dc, UI_CARD_RIGHT - 118, 19, UI_CARD_RIGHT, 49, 15, RGB(52, 82, 146), RGB(70, 104, 174));
+        brush = CreateSolidBrush(dot);
+        pen = CreatePen(PS_SOLID, 1, dot);
+        old_brush = SelectObject(dc, brush);
+        old_pen = SelectObject(dc, pen);
+        Ellipse(dc, scale(UI_CARD_RIGHT - 102), scale(28), scale(UI_CARD_RIGHT - 90), scale(40));
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen);
+        DeleteObject(brush);
         SelectObject(dc, g_font_medium);
         SetTextColor(dc, RGB(255, 255, 255));
-        draw_text(dc, UI_CARD_RIGHT - 80, 29, text);
+        draw_text(dc, UI_CARD_RIGHT - 82, 24, text);
     }
 }
 
 static void paint_main_window(HWND window) {
     PAINTSTRUCT paint;
-    HDC dc = BeginPaint(window, &paint);
+    HDC target = BeginPaint(window, &paint);
     RECT client;
-    HFONT old_font;
-    SetBkMode(dc, TRANSPARENT);
+    HDC dc;
+    HBITMAP bitmap;
+    HGDIOBJ old_bitmap;
+    HGDIOBJ old_font;
+    int i;
     GetClientRect(window, &client);
-    FillRect(dc, &client, g_brush_background);
-    old_font = (HFONT)SelectObject(dc, g_font_title);
+    /* Double-buffered: the whole frame is composed off screen, then copied. */
+    dc = CreateCompatibleDC(target);
+    bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
+    old_bitmap = SelectObject(dc, bitmap);
+    SetBkMode(dc, TRANSPARENT);
+    FillRect(dc, &client, g_high_contrast ? GetSysColorBrush(COLOR_WINDOW) : g_brush_background);
+    old_font = SelectObject(dc, g_font_title);
     draw_header(dc, &client);
-
-    draw_card(dc, UI_CARD_LEFT, UI_CARD1_TOP, UI_CARD_RIGHT, UI_CARD1_BOTTOM);
-    draw_card(dc, UI_CARD_LEFT, UI_CARD2_TOP, UI_CARD_RIGHT, UI_CARD2_BOTTOM);
-    draw_card(dc, UI_CARD_LEFT, UI_CARD3_TOP, UI_CARD_RIGHT, UI_CARD3_BOTTOM);
-
-    /* Tiles */
+    draw_card(dc, UI_CARD_LEFT, UI_STATUS_TOP, UI_CARD_RIGHT, UI_STATUS_BOTTOM);
     {
-        int i;
+        /* State stripe on the status card. */
+        const wchar_t *why;
+        int state = app_state(&why);
+        fill_round_rect(dc, UI_CARD_LEFT + 10, UI_STATUS_TOP + 14, UI_CARD_LEFT + 16, UI_STATUS_BOTTOM - 14, 6,
+                        state == 0 ? UI_GREEN : state == 1 ? UI_GREY : UI_AMBER,
+                        state == 0 ? UI_GREEN : state == 1 ? UI_GREY : UI_AMBER);
+    }
+    draw_card(dc, UI_CARD_LEFT, UI_PAGE_TOP, UI_CARD_RIGHT, UI_PAGE_BOTTOM);
+    if (g_page == 3 && !g_high_contrast) {
         for (i = 0; i < UI_TILE_COUNT; ++i) {
             int left = UI_LABEL_LEFT + i * (UI_TILE_WIDTH + UI_TILE_GAP);
-            fill_round_rect(dc, left, UI_TILE_TOP, left + UI_TILE_WIDTH, UI_TILE_TOP + UI_TILE_HEIGHT,
-                            14, UI_TILE, UI_TILE);
+            fill_round_rect(dc, left, UI_ROW(0) - 4, left + UI_TILE_WIDTH, UI_ROW(0) - 4 + UI_TILE_HEIGHT,
+                            12, UI_TILE, UI_TILE);
         }
     }
-
-    SelectObject(dc, g_font_medium);
-    SetTextColor(dc, UI_TEXT);
-    draw_text(dc, UI_LABEL_LEFT, UI_CARD2_TOP + 14, L"Correction and typing settings");
-    draw_text(dc, UI_LABEL_LEFT, UI_CARD3_TOP + 12, L"Live diagnostics and statistics");
-    SelectObject(dc, g_font_regular);
-    SetTextColor(dc, UI_MUTED);
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(0) + 4, L"Sensitivity");
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(1) + 4, L"Writing language");
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(2) + 4, L"Spelling");
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(3) + 4, L"Digits");
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(4) + 4, L"Typing helpers");
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(5) + 4, L"Excluded apps");
-    draw_text(dc, UI_LABEL_LEFT, UI_ROW(6) + 4, L"Memory & vocabulary");
     SelectObject(dc, g_font_small);
-    draw_text_right(dc, UI_CARD_RIGHT, UI_BUTTON_TOP + 10, L"No cloud, no logging, no background service");
+    SetTextColor(dc, ui_color(UI_MUTED, COLOR_WINDOWTEXT));
+    draw_text_right(dc, UI_CARD_RIGHT, UI_FOOTER_TOP + 9, L"Offline  •  nothing leaves this PC");
+    BitBlt(target, paint.rcPaint.left, paint.rcPaint.top, paint.rcPaint.right - paint.rcPaint.left,
+           paint.rcPaint.bottom - paint.rcPaint.top, dc, paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
     SelectObject(dc, old_font);
+    SelectObject(dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
     EndPaint(window, &paint);
+}
+
+static COLORREF shade(COLORREF color, int percent) {
+    return RGB(GetRValue(color) * percent / 100, GetGValue(color) * percent / 100,
+               GetBValue(color) * percent / 100);
+}
+
+static COLORREF tint(COLORREF color, int percent) {
+    return RGB(GetRValue(color) + (255 - GetRValue(color)) * percent / 100,
+               GetGValue(color) + (255 - GetGValue(color)) * percent / 100,
+               GetBValue(color) + (255 - GetBValue(color)) * percent / 100);
 }
 
 static void draw_button(DRAWITEMSTRUCT *item) {
     wchar_t text[64];
+    RECT rectangle = item->rcItem;
     HBRUSH brush;
     HPEN pen;
-    RECT rectangle = item->rcItem;
     HGDIOBJ old_brush;
     HGDIOBJ old_pen;
     HGDIOBJ old_font;
-    COLORREF color;
-    if (item->CtlID == IDC_ENABLE) color = g_settings.enabled ? UI_GREEN : UI_GREY;
-    else if (item->CtlID == IDC_SAVE) color = UI_ACCENT;
-    else if (item->CtlID == IDC_EDIT_SNIPPETS) color = RGB(76, 140, 180);
-    else color = RGB(93, 111, 148);
-    if (item->itemState & ODS_SELECTED) color = RGB(GetRValue(color) * 4 / 5,
-                                                    GetGValue(color) * 4 / 5,
-                                                    GetBValue(color) * 4 / 5);
-    brush = CreateSolidBrush(color);
-    pen = CreatePen(PS_SOLID, 1, color);
+    COLORREF fill;
+    COLORREF border;
+    COLORREF ink;
+    COLORREF behind = RGB(255, 255, 255);
+    UINT id = item->CtlID;
+    int hover = item->hwndItem == g_hover_button;
+    int pressed = (item->itemState & ODS_SELECTED) != 0;
+    int disabled = (item->itemState & ODS_DISABLED) != 0;
+
+    if (id >= IDC_NAV_FIRST && id < IDC_NAV_FIRST + UI_PAGES) {
+        int selected = (int)(id - IDC_NAV_FIRST) == g_page;
+        behind = UI_BACKGROUND;
+        fill = selected ? UI_ACCENT : hover ? RGB(226, 233, 247) : RGB(234, 239, 248);
+        border = selected ? UI_ACCENT : UI_CARD_BORDER;
+        ink = selected ? RGB(255, 255, 255) : UI_TEXT;
+    } else if (id == IDC_ENABLE) {
+        /* Darker green than the stripe: white text needs 4.5:1 contrast. */
+        fill = g_settings.enabled ? UI_SLATE : shade(UI_GREEN, 78);
+        if (hover) fill = shade(fill, 90);
+        border = fill;
+        ink = RGB(255, 255, 255);
+    } else if (id == IDC_HIDE || id == IDC_OPEN_DATA) {
+        behind = UI_BACKGROUND;
+        fill = hover ? RGB(233, 238, 248) : RGB(255, 255, 255);
+        border = UI_CARD_BORDER;
+        ink = UI_TEXT;
+    } else if (id == IDC_FORGET_MEMORY) {
+        fill = hover ? tint(UI_RED, 88) : RGB(255, 255, 255);
+        border = tint(UI_RED, 40);
+        ink = UI_RED;
+    } else {
+        fill = hover ? tint(UI_ACCENT, 88) : RGB(255, 255, 255);
+        border = tint(UI_ACCENT, 45);
+        ink = UI_ACCENT;
+    }
+    if (pressed) fill = shade(fill, 88);
+    if (disabled) {
+        fill = RGB(240, 242, 246);
+        border = UI_CARD_BORDER;
+        ink = UI_GREY;
+    }
+    if (g_high_contrast) {
+        int selected = id >= IDC_NAV_FIRST && id < IDC_NAV_FIRST + UI_PAGES &&
+                       (int)(id - IDC_NAV_FIRST) == g_page;
+        behind = GetSysColor(COLOR_WINDOW);
+        fill = GetSysColor(selected || hover ? COLOR_HIGHLIGHT : COLOR_BTNFACE);
+        border = GetSysColor(COLOR_BTNTEXT);
+        ink = GetSysColor(disabled ? COLOR_GRAYTEXT : selected || hover ? COLOR_HIGHLIGHTTEXT : COLOR_BTNTEXT);
+    }
+    /* The rounded corners show what is behind the button. */
+    brush = CreateSolidBrush(behind);
+    FillRect(item->hDC, &rectangle, brush);
+    DeleteObject(brush);
+    brush = CreateSolidBrush(fill);
+    pen = CreatePen(PS_SOLID, 1, border);
     old_brush = SelectObject(item->hDC, brush);
     old_pen = SelectObject(item->hDC, pen);
     RoundRect(item->hDC, rectangle.left, rectangle.top, rectangle.right, rectangle.bottom,
-              scale(14), scale(14));
+              scale(12), scale(12));
     SelectObject(item->hDC, old_pen);
     SelectObject(item->hDC, old_brush);
     DeleteObject(pen);
     DeleteObject(brush);
-    if (item->CtlID == IDC_ENABLE)
-        safe_copy(text, 64, g_settings.enabled ? L"Pause" : L"Resume");
+    if (id >= IDC_NAV_FIRST && id < IDC_NAV_FIRST + UI_PAGES)
+        safe_copy(text, 64, g_page_names[id - IDC_NAV_FIRST]);   /* without "(selected page)" */
     else
         GetWindowTextW(item->hwndItem, text, 64);
     SetBkMode(item->hDC, TRANSPARENT);
-    SetTextColor(item->hDC, RGB(255, 255, 255));
+    SetTextColor(item->hDC, ink);
     old_font = SelectObject(item->hDC, g_font_medium);
-    DrawTextW(item->hDC, text, -1, &rectangle, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(item->hDC, text, -1, &rectangle,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | ((item->itemState & ODS_NOACCEL) ? DT_HIDEPREFIX : 0));
     SelectObject(item->hDC, old_font);
+    if ((item->itemState & ODS_FOCUS) && !(item->itemState & ODS_NOFOCUSRECT)) {
+        RECT focus = rectangle;
+        InflateRect(&focus, -scale(4), -scale(4));
+        DrawFocusRect(item->hDC, &focus);
+    }
 }
 
-static void toggle_enabled(void) {
+static void toggle_enabled(int announce) {
     g_settings.enabled = !g_settings.enabled;
     clear_word();
     clear_history();
     g_undo.valid = 0;
     save_settings();
     update_controls_from_settings();
-    set_activity(g_settings.enabled ? L"Automatic correction enabled."
+    set_activity(g_settings.enabled ? L"Automatic correction resumed."
                                     : L"Automatic correction paused.");
+    if (announce && !IsWindowVisible(g_window))
+        show_balloon(g_settings.enabled ? L"KeySwitchFix resumed" : L"KeySwitchFix paused",
+                     g_settings.enabled ? L"Correction is active again."
+                                        : L"Nothing is corrected until you press Ctrl + Win + K again.");
+    if (g_window) InvalidateRect(g_window, NULL, FALSE);
+}
+
+static void open_data_folder(void) {
+    ShellExecuteW(NULL, L"open", g_data_directory, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* Keyboard navigation for the dashboard: Tab, Alt+letter, Enter and Esc via
+   IsDialogMessage, plus Ctrl+Tab / Ctrl+Shift+Tab to change pages. */
+static int dashboard_message(MSG *message) {
+    if (!g_window || !IsWindowVisible(g_window)) return 0;
+    if (message->hwnd != g_window && !IsChild(g_window, message->hwnd)) return 0;
+    if (message->message == WM_KEYDOWN && message->wParam == VK_TAB &&
+        (GetKeyState(VK_CONTROL) & 0x8000)) {
+        show_page(g_page + ((GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1));
+        SendMessageW(g_window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS | UISF_HIDEACCEL), 0);
+        SetFocus(g_nav[g_page]);
+        return 1;
+    }
+    /* Left and Right move between the page tabs, like a tab strip. */
+    if (message->message == WM_KEYDOWN && (message->wParam == VK_LEFT || message->wParam == VK_RIGHT)) {
+        int i;
+        for (i = 0; i < UI_PAGES; ++i) {
+            if (message->hwnd == g_nav[i]) {
+                show_page(i + (message->wParam == VK_LEFT ? -1 : 1));
+                SendMessageW(g_window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS | UISF_HIDEACCEL), 0);
+                SetFocus(g_nav[g_page]);
+                return 1;
+            }
+        }
+    }
+    return IsDialogMessageW(g_window, message);
+}
+
+/* Hide to the tray. The first time on a fresh install, say where it went. */
+static void hide_dashboard(HWND window) {
+    static int told;
+    if (GetFocus() == g_excluded && excluded_edit_changed()) apply_controls();
+    ShowWindow(window, SW_HIDE);
+    if (g_first_run && !told) {
+        told = 1;
+        show_balloon(L"KeySwitchFix keeps running",
+                     L"It lives in the tray. Click the icon to open settings.");
+    }
 }
 
 static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (g_taskbar_created_message && message == g_taskbar_created_message) {
+        g_tray_retries = 0;
+        reload_tray_icons();
         add_tray_icon();
+        return 0;
+    }
+    if (g_show_message && message == g_show_message) {
+        show_main_window();
         return 0;
     }
     switch (message) {
@@ -4180,13 +5480,16 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             SetTimer(window, ID_TIMER_STATS, 600000, NULL);
             SetTimer(window, ID_TIMER_SNIPPETS, 2000, NULL);
             return 0;
+        case WM_DPICHANGED:
+            rebuild_for_dpi(window, HIWORD(wparam), (const RECT *)lparam);
+            return 0;
         case WM_SHOWWINDOW:
-            /* The 500 ms diagnostics refresh only needs to run while the
-               dashboard is visible; hidden in the tray it was pure overhead. */
             if (wparam) {
                 update_diagnostics_ui();
-                SetTimer(window, ID_TIMER_STATUS, 500, NULL);
+                SetTimer(window, ID_TIMER_STATUS, 1000, NULL);
             } else {
+                /* An edit in progress (the excluded-apps box) is kept. */
+                if (GetFocus() == g_excluded && excluded_edit_changed()) apply_controls();
                 KillTimer(window, ID_TIMER_STATUS);
             }
             break;
@@ -4196,29 +5499,109 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
         case WM_ERASEBKGND:
             return 1;
         case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORBTN:
+            if (g_high_contrast) {
+                SetTextColor((HDC)wparam, GetSysColor(COLOR_WINDOWTEXT));
+                SetBkColor((HDC)wparam, GetSysColor(COLOR_WINDOW));
+                return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+            }
+            if (message == WM_CTLCOLOREDIT) {
+                SetTextColor((HDC)wparam, UI_TEXT);
+                SetBkColor((HDC)wparam, RGB(255, 255, 255));
+                return (LRESULT)g_brush_white;
+            }
+            if (message == WM_CTLCOLORBTN) return (LRESULT)g_brush_white;
             if (is_tile_label((HWND)lparam)) {
-                int is_value = (HWND)lparam == g_tile_values[0] ||
-                               (HWND)lparam == g_tile_values[1] ||
-                               (HWND)lparam == g_tile_values[2] ||
-                               (HWND)lparam == g_tile_values[3];
+                int is_value = GetDlgCtrlID((HWND)lparam) >= IDC_TILE_VALUE &&
+                               GetDlgCtrlID((HWND)lparam) < IDC_TILE_VALUE + UI_TILE_COUNT;
                 SetBkColor((HDC)wparam, UI_TILE);
                 SetTextColor((HDC)wparam, is_value ? UI_ACCENT : UI_MUTED);
                 return (LRESULT)g_brush_tile;
             }
             SetBkColor((HDC)wparam, RGB(255, 255, 255));
-            SetTextColor((HDC)wparam, (HWND)lparam == g_status_label ? UI_TEXT : RGB(62, 73, 96));
+            SetTextColor((HDC)wparam, is_muted((HWND)lparam) ? UI_MUTED : UI_TEXT);
             return (LRESULT)g_brush_white;
-        case WM_CTLCOLOREDIT:
-            SetBkColor((HDC)wparam, RGB(255, 255, 255));
-            return (LRESULT)g_brush_white;
+        case WM_SETTINGCHANGE:
+        case WM_SYSCOLORCHANGE:
+        case WM_THEMECHANGED:
+            refresh_high_contrast();
+            RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+            break;
+        case WM_ACTIVATE:
+            /* A top-level window that is not a dialog loses its focused
+               control on deactivation; keep it for the return. */
+            if (LOWORD(wparam) == WA_INACTIVE) {
+                HWND focus = GetFocus();
+                if (focus && IsChild(window, focus)) g_saved_focus = focus;
+            } else if (!HIWORD(wparam)) {   /* not while minimised */
+                if (g_saved_focus && IsChild(window, g_saved_focus) && IsWindowVisible(g_saved_focus))
+                    SetFocus(g_saved_focus);
+                else if (g_nav[g_page])
+                    SetFocus(g_nav[g_page]);
+                return 0;
+            }
+            break;
         case WM_DRAWITEM:
             draw_button((DRAWITEMSTRUCT *)lparam);
             return TRUE;
-        case WM_COMMAND:
-            switch (LOWORD(wparam)) {
+        case WM_COMMAND: {
+            UINT id = LOWORD(wparam);
+            UINT notification = HIWORD(wparam);
+            /* Settings controls apply immediately. */
+            if ((notification == CBN_SELCHANGE &&
+                 (id == IDC_SENSITIVITY || id == IDC_LANGUAGE_MODE || id == IDC_SPELLING || id == IDC_DIGITS)) ||
+                (notification == BN_CLICKED &&
+                 (id == IDC_APP_STARTUP || id == IDC_PERSONAL_DICTIONARY || id == IDC_PUNCTUATION ||
+                  id == IDC_PERSIAN_LETTERS || id == IDC_CAPITALIZE || id == IDC_SNIPPETS ||
+                  id == IDC_LEARN_WRITING || id == IDC_VOCAB_IT)) ||
+                (notification == CBN_CLOSEUP &&
+                 (id == IDC_SENSITIVITY || id == IDC_LANGUAGE_MODE || id == IDC_SPELLING || id == IDC_DIGITS)) ||
+                (notification == EN_KILLFOCUS && id == IDC_EXCLUDED)) {
+                /* Arrowing through an open list saves once, when it closes;
+                   leaving the box unchanged saves nothing. */
+                if (notification == CBN_SELCHANGE && SendMessageW((HWND)lparam, CB_GETDROPPEDSTATE, 0, 0))
+                    return 0;
+                /* Closed with Esc or on the same item: nothing changed. */
+                if (notification == CBN_CLOSEUP &&
+                    SendMessageW((HWND)lparam, CB_GETCURSEL, 0, 0) == g_dropdown_selection)
+                    return 0;
+                if (notification == EN_KILLFOCUS && !excluded_edit_changed()) return 0;
+                apply_controls();
+                if (id == IDC_LEARN_WRITING) update_diagnostics_ui();
+                return 0;
+            }
+            if (notification == CBN_DROPDOWN) {
+                g_dropdown_selection = SendMessageW((HWND)lparam, CB_GETCURSEL, 0, 0);
+                return 0;
+            }
+            if (id >= IDC_NAV_FIRST && id < IDC_NAV_FIRST + UI_PAGES) {
+                show_page((int)(id - IDC_NAV_FIRST));
+                InvalidateRect(window, NULL, FALSE);
+                return 0;
+            }
+            switch (id) {
+                case IDOK: {
+                    /* Enter: the dialog manager asks for the default button,
+                       which owner-drawn buttons cannot be. Press the focused
+                       button, or commit the excluded-apps box. */
+                    HWND focus = GetFocus();
+                    if (focus && IsChild(window, focus) &&
+                        (GetWindowLongPtrW(focus, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW &&
+                        GetDlgCtrlID(focus) != IDC_EXCLUDED)
+                        SendMessageW(focus, BM_CLICK, 0, 0);
+                    else if (focus == g_excluded)
+                        apply_controls();
+                    return 0;
+                }
+                case IDCANCEL:
+                    hide_dashboard(window);
+                    return 0;
                 case IDC_ENABLE:
+                    toggle_enabled(0);
+                    return 0;
                 case IDM_TOGGLE:
-                    toggle_enabled();
+                    toggle_enabled(0);   /* the user just saw the menu: no note */
                     return 0;
                 case IDM_SPELLING:
                     g_settings.spelling = g_settings.spelling == KS_SPELL_OFF
@@ -4252,17 +5635,11 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                         set_activity(note);
                     }
                     return 0;
-                case IDC_SAVE:
-                    read_controls_to_settings();
-                    memory_apply_setting();
-                    clear_word();
-                    clear_history();
-                    g_undo.valid = 0;
-                    save_settings();
-                    set_activity(L"Settings saved.");
-                    return 0;
                 case IDC_HIDE:
-                    ShowWindow(window, SW_HIDE);
+                    hide_dashboard(window);
+                    return 0;
+                case IDC_OPEN_DATA:
+                    open_data_folder();
                     return 0;
                 case IDC_EDIT_SNIPPETS:
                 case IDM_EDIT_SNIPPETS:
@@ -4277,35 +5654,39 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                         ? L"Learning your writing: words and hand repairs are remembered on this PC."
                         : L"Learning paused. What was learned is kept; nothing new is recorded.");
                     return 0;
+                case IDC_OPEN_MEMORY:
                 case IDM_OPEN_MEMORY:
                     open_memory_file();
                     return 0;
+                case IDC_FORGET_MEMORY:
                 case IDM_FORGET_MEMORY:
                     if (MessageBoxW(window,
                                     L"Forget every word and repair KeySwitchFix has learned from your typing?\n\n"
                                     L"This deletes writing-memory.txt and cannot be undone.",
-                                    APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                                    APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
                         memory_forget();
+                        update_diagnostics_ui();
+                    }
                     return 0;
                 case IDM_VOCAB_IT:
                     g_settings.vocab_it = !g_settings.vocab_it;
                     save_settings();
                     update_controls_from_settings();
-                    set_activity(g_settings.vocab_it ? L"IT & computing vocabulary: on."
-                                                     : L"IT & computing vocabulary: off.");
+                    set_activity(g_settings.vocab_it ? L"IT and computing vocabulary: on."
+                                                     : L"IT and computing vocabulary: off.");
                     return 0;
                 case IDM_PUNCTUATION:
                 case IDM_CAPITALIZE:
                 case IDM_SNIPPETS: {
-                    int *flag = LOWORD(wparam) == IDM_PUNCTUATION ? &g_settings.punctuation
-                              : LOWORD(wparam) == IDM_CAPITALIZE ? &g_settings.auto_capitalize
+                    int *flag = id == IDM_PUNCTUATION ? &g_settings.punctuation
+                              : id == IDM_CAPITALIZE ? &g_settings.auto_capitalize
                               : &g_settings.snippets;
                     *flag = !*flag;
                     save_settings();
                     update_controls_from_settings();
-                    set_activity(LOWORD(wparam) == IDM_PUNCTUATION
+                    set_activity(id == IDM_PUNCTUATION
                         ? (g_settings.punctuation ? L"Persian punctuation after Persian words: on." : L"Persian punctuation: off.")
-                        : LOWORD(wparam) == IDM_CAPITALIZE
+                        : id == IDM_CAPITALIZE
                             ? (g_settings.auto_capitalize ? L"English sentence capitalisation: on." : L"English sentence capitalisation: off.")
                             : (g_settings.snippets ? L"Snippets: on." : L"Snippets: off."));
                     return 0;
@@ -4317,8 +5698,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 case IDM_LANGUAGE_PERSIAN:
                 case IDM_LANGUAGE_ENGLISH:
                     g_settings.language_mode =
-                        LOWORD(wparam) == IDM_LANGUAGE_AUTO ? 0 :
-                        LOWORD(wparam) == IDM_LANGUAGE_PERSIAN ? 1 : 2;
+                        id == IDM_LANGUAGE_AUTO ? 0 : id == IDM_LANGUAGE_PERSIAN ? 1 : 2;
                     clear_word();
                     clear_history();
                     clear_intent();
@@ -4337,17 +5717,21 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     return 0;
             }
             break;
+        }
         case WM_HOTKEY:
             if (wparam == ID_HOTKEY_UNDO) {
                 SetTimer(window, ID_TIMER_UNDO, 40, NULL);
                 return 0;
             }
             if (wparam == ID_HOTKEY_TOGGLE) {
-                toggle_enabled();
+                toggle_enabled(1);
                 return 0;
             }
             if (wparam == ID_HOTKEY_CLEANUP) {
-                start_selection_cleanup();
+                if (engine_enter()) {
+                    start_selection_cleanup();
+                    engine_leave();
+                }
                 return 0;
             }
             break;
@@ -4359,13 +5743,27 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             }
             if (wparam == ID_TIMER_HOOK_WATCHDOG) {
                 check_hook_health();
+                update_tray_tip();
+                return 0;
+            }
+            if (wparam == ID_TIMER_TRAY_RETRY) {
+                KillTimer(window, ID_TIMER_TRAY_RETRY);
+                add_tray_icon();
                 return 0;
             }
             if (wparam == ID_TIMER_UNDO) {
                 if (!key_down(VK_CONTROL) && !key_down(VK_LWIN) && !key_down(VK_RWIN) && !key_down(VK_BACK)) {
-                    KillTimer(window, ID_TIMER_UNDO);
-                    try_undo(0);
+                    if (engine_enter()) {
+                        KillTimer(window, ID_TIMER_UNDO);
+                        try_undo(0);
+                        engine_leave();
+                    }
                 }
+                return 0;
+            }
+            if (wparam == ID_TIMER_FOCUS_QUERY) {
+                KillTimer(window, ID_TIMER_FOCUS_QUERY);
+                PostMessageW(window, WM_APP_FOCUS_QUERY, 0, 0);
                 return 0;
             }
             if (wparam == ID_TIMER_SMART_CORRECTION) {
@@ -4373,7 +5771,10 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 return 0;
             }
             if (wparam == ID_TIMER_CLEANUP) {
-                continue_selection_cleanup();
+                if (engine_enter()) {
+                    continue_selection_cleanup();
+                    engine_leave();
+                }
                 return 0;
             }
             if (wparam == ID_TIMER_STATS) {
@@ -4393,7 +5794,17 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             }
             break;
         case WM_APP_DIAGNOSTIC:
-            update_diagnostics_ui();
+            if (IsWindowVisible(window)) update_diagnostics_ui();
+            return 0;
+        case WM_APP_FOCUS_QUERY:
+            g_focus_query_posted = 0;
+            if (g_engine_depth > 0) {
+                /* Still inside an operation: try again shortly. */
+                g_focus_query_posted = 1;
+                SetTimer(window, ID_TIMER_FOCUS_QUERY, 20, NULL);
+            } else if (g_focus_event_protected == -1) {
+                run_focus_query();
+            }
             return 0;
         case WM_APP_SAVE_STATS:
             stats_save();
@@ -4410,8 +5821,21 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             }
             return 0;
         case WM_APP_TRAY:
-            if (LOWORD(lparam) == WM_LBUTTONDBLCLK) show_main_window();
-            else if (LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == WM_CONTEXTMENU) show_tray_menu();
+            switch (LOWORD(lparam)) {
+                case NIN_SELECT:
+                case WM_LBUTTONDBLCLK:
+                    show_main_window();
+                    break;
+                case NIN_KEYSELECT:
+                    show_main_window_by(1);
+                    break;
+                case WM_CONTEXTMENU:
+                    /* Version 4: the anchor (mouse or keyboard) is in wparam. */
+                    show_tray_menu(GET_X_LPARAM(wparam), GET_Y_LPARAM(wparam));
+                    break;
+                default:
+                    break;
+            }
             return 0;
         case WM_APP_EXIT:
             g_exit_requested = 1;
@@ -4419,7 +5843,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             return 0;
         case WM_CLOSE:
             if (!g_exit_requested) {
-                ShowWindow(window, SW_HIDE);
+                hide_dashboard(window);
                 return 0;
             }
             break;
@@ -4431,25 +5855,20 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             KillTimer(window, ID_TIMER_CLEANUP);
             KillTimer(window, ID_TIMER_STATS);
             KillTimer(window, ID_TIMER_SNIPPETS);
+            KillTimer(window, ID_TIMER_TRAY_RETRY);
             stats_save();
             memory_save();
             clipboard_snapshot_free(&g_cleanup_saved_clipboard);
             if (g_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_UNDO);
             if (g_toggle_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_TOGGLE);
             if (g_cleanup_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_CLEANUP);
+            if (g_focus_event_hook) UnhookWinEvent(g_focus_event_hook);
             if (g_keyboard_hook) UnhookWindowsHookEx(g_keyboard_hook);
             if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
             g_tray.uFlags = 0;
             Shell_NotifyIconW(NIM_DELETE, &g_tray);
-            DeleteObject(g_font_regular);
-            DeleteObject(g_font_medium);
-            DeleteObject(g_font_title);
-            DeleteObject(g_font_status);
-            DeleteObject(g_font_tile);
-            DeleteObject(g_font_small);
-            DeleteObject(g_brush_white);
-            DeleteObject(g_brush_background);
-            DeleteObject(g_brush_tile);
+            destroy_ui(window);
+            if (g_icon_paused) DestroyIcon(g_icon_paused);
             PostQuitMessage(0);
             return 0;
     }
@@ -4467,26 +5886,25 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     (void)command_line_ansi;
 
     g_instance = instance;
-    SetProcessDPIAware();
-    {
-        HDC screen = GetDC(NULL);
-        if (screen) {
-            g_dpi = GetDeviceCaps(screen, LOGPIXELSX);
-            ReleaseDC(NULL, screen);
-        }
-        if (g_dpi < 96) g_dpi = 96;
-    }
+    /* MSAA queries in focus_event_proc need COM on this (the UI) thread. */
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    /* DPI awareness (PerMonitorV2) is declared in the manifest. */
     g_taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
     g_shift_down = key_down(VK_SHIFT) || key_down(VK_LSHIFT) || key_down(VK_RSHIFT);
     g_control_down = key_down(VK_CONTROL) || key_down(VK_LCONTROL) || key_down(VK_RCONTROL);
     g_alt_down = key_down(VK_MENU) || key_down(VK_LMENU) || key_down(VK_RMENU);
     g_windows_down = key_down(VK_LWIN) || key_down(VK_RWIN);
+    g_show_message = RegisterWindowMessageW(L"KeySwitchFix.ShowDashboard");
     mutex = CreateMutexW(NULL, TRUE, APP_MUTEX);
     if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(WINDOW_CLASS, NULL);
         if (existing) {
-            ShowWindow(existing, SW_SHOWNORMAL);
-            SetForegroundWindow(existing);
+            /* The running copy shows itself (centred, refreshed); this one
+               lets it take the foreground. */
+            DWORD process_id = 0;
+            GetWindowThreadProcessId(existing, &process_id);
+            AllowSetForegroundWindow(process_id);
+            PostMessageW(existing, g_show_message, 0, 0);
         }
         if (mutex) CloseHandle(mutex);
         return 0;
@@ -4553,7 +5971,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     load_settings();
     load_personal_dictionary();
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_STANDARD_CLASSES;
+    controls.dwICC = ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&controls);
 
     ZeroMemory(&window_class, sizeof(window_class));
@@ -4561,7 +5979,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     window_class.lpfnWndProc = main_window_proc;
     window_class.hInstance = instance;
     window_class.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP));
-    window_class.hIconSm = window_class.hIcon;
+    window_class.hIconSm = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                             GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     window_class.hCursor = LoadCursorW(NULL, IDC_ARROW);
     window_class.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     window_class.lpszClassName = WINDOW_CLASS;
@@ -4572,38 +5991,22 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     }
 
     {
-        /* Client area authored at UI_CLIENT_WIDTH × UI_CLIENT_HEIGHT (96 DPI). */
-        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        /* Client area authored at UI_CLIENT_WIDTH x UI_CLIENT_HEIGHT (96 DPI),
+           scaled for the primary monitor and shrunk to fit its work area. */
+        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
         RECT frame;
         RECT work_area;
-        /*
-         * Fit to the screen: on a small laptop screen or a high scaling
-         * factor the scaled dashboard could be taller than the work area,
-         * with the footer buttons off screen. Shrink the scale until the
-         * whole window fits; fonts and controls scale with it.
-         */
-        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0)) {
-            int available_height = work_area.bottom - work_area.top;
-            int available_width = work_area.right - work_area.left;
-            int guess;
-            for (guess = 0; guess < 8; ++guess) {
-                RECT probe = {0, 0, scale(UI_CLIENT_WIDTH), scale(UI_CLIENT_HEIGHT)};
-                AdjustWindowRectEx(&probe, style, FALSE, WS_EX_APPWINDOW);
-                if (probe.bottom - probe.top <= available_height &&
-                    probe.right - probe.left <= available_width) break;
-                g_dpi = MulDiv(g_dpi, 95, 100);
-                if (g_dpi < 72) { g_dpi = 72; break; }
-            }
-        }
-        frame.left = 0;
-        frame.top = 0;
-        frame.right = scale(UI_CLIENT_WIDTH);
-        frame.bottom = scale(UI_CLIENT_HEIGHT);
-        AdjustWindowRectEx(&frame, style, FALSE, WS_EX_APPWINDOW);
-        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix 3.1.0",
+        work_area_for(NULL, &work_area);
+        choose_scale(window_dpi(NULL), &work_area);
+        SetRect(&frame, 0, 0, scale(UI_CLIENT_WIDTH), scale(UI_CLIENT_HEIGHT));
+        adjust_for_dpi(&frame, style, g_monitor_dpi);
+        g_window = CreateWindowExW(WS_EX_APPWINDOW, WINDOW_CLASS, L"KeySwitchFix " APP_VERSION,
                                    style, CW_USEDEFAULT, CW_USEDEFAULT,
                                    frame.right - frame.left, frame.bottom - frame.top,
                                    NULL, NULL, instance, NULL);
+        /* Created on a monitor with another DPI: rebuild at that size. */
+        if (g_window && window_dpi(g_window) != g_monitor_dpi)
+            rebuild_for_dpi(g_window, window_dpi(g_window), NULL);
     }
     if (!g_window) {
         MessageBoxW(NULL, L"The main window could not be created.", APP_NAME, MB_OK | MB_ICONERROR);
@@ -4615,6 +6018,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     snippets_reload(1);
     memory_load();
     install_hooks();
+    /* Focus changes (including between fields of one web page) reset the
+       engine and tell it about password fields; see focus_event_proc. */
+    g_focus_event_hook = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, NULL,
+                                         focus_event_proc, 0, 0,
+                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     if (!g_keyboard_hook) set_activity(L"Keyboard hook FAILED. Restart the app or check security software.");
     else if (!g_mouse_hook) set_activity(L"Mouse hook FAILED; caret clicks cannot be observed. Check security software.");
     else if (missing_layout_name()) {
@@ -4639,6 +6047,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     else ShowWindow(g_window, SW_HIDE);
 
     while (GetMessageW(&message, NULL, 0, 0) > 0) {
+        /* Tab, arrows, mnemonics and Ctrl+Tab inside the dashboard. */
+        if (dashboard_message(&message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

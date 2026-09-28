@@ -54,8 +54,13 @@ computer only:
   and is therefore never recorded.
 - Only letters-only words of 2–32 letters are kept; nothing with digits or
   symbols.
-- The file holds at most 4,096 words and 512 repairs; the least used and
-  least recent are forgotten first.
+- The file holds at most 4,096 words and 512 repairs. When the word table is
+  full, the least used eighth is forgotten (the least recent first among
+  equal counts) and the counts of the rest are reduced by about a quarter:
+  a little less for words you typed since the previous clean-up (a word you
+  use stays known), a little more, and at least one, for words you did not,
+  so words you stopped using fade out.
+  Repairs are forgotten least used first.
 - **Writing memory → Open writing memory…** opens the file in Notepad. Delete
   any line you like and save: the change is picked up within two seconds
   (your edit wins over anything learned in the meantime).

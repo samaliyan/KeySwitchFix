@@ -122,15 +122,30 @@ int ks_clean_text(wchar_t *text, int letters, int digits, int punctuation) {
         int latin = 0;
         while (is_space(*token)) ++token;
         if (!*token) break;
-        for (end = token; *end && !is_space(*end); ++end)
-            if (ks_is_latin_letter(*end)) latin = 1;
+        {
+            int dots = 0;
+            for (end = token; *end && !is_space(*end); ++end) {
+                if (ks_is_latin_letter(*end)) latin = 1;
+                else if (*end == L'.') ++dots;
+                /* Windows paths, addresses and assignments are machine
+                   text; a slash is not (1403/05/12 is a Persian date). */
+                else if (*end == L'\\' || *end == L'@' || *end == L'_' || *end == L'=') latin = 1;
+            }
+            /* 192.168.1.10, 1.2.3, 10.0.0.1:1521: an address or a version
+               must stay pasteable, so it keeps its ASCII digits. */
+            if (dots >= 2) latin = 1;
+        }
         for (cursor = token; cursor < end; ++cursor) {
             wchar_t c = *cursor;
             wchar_t shaped = c;
             if (letters) shaped = ks_persian_form(shaped);
             if (!latin) {
                 shaped = ks_shape_digit(shaped, digits, persian ? KS_LANG_PERSIAN : KS_LANG_ENGLISH);
-                if (punctuation && persian) shaped = ks_persian_punctuation(shaped);
+                /* 1,000 keeps its thousands separator. */
+                if (punctuation && persian &&
+                    !(c == L',' && cursor > token && ks_is_digit_any(cursor[-1]) &&
+                      ks_is_digit_any(cursor[1])))
+                    shaped = ks_persian_punctuation(shaped);
             }
             if (shaped != c) {
                 *cursor = shaped;
@@ -149,7 +164,7 @@ int ks_is_abbreviation(const wchar_t *word) {
         L"mr", L"mrs", L"ms", L"dr", L"prof", L"sr", L"jr", L"st", L"mt", L"ft",
         L"etc", L"vs", L"eg", L"ie", L"cf", L"approx", L"dept", L"inc", L"ltd",
         L"corp", L"fig", L"vol", L"pp", L"avg", L"tel", L"ext", L"www", L"com",
-        L"org", L"net", L"io", L"ir", L"uk", L"de", L"ai", L"dev", L"app", L"exe",
+        L"org", L"io", L"ir", L"uk", L"de", L"ai", L"exe",
         L"dll", L"txt", L"jpg", L"png", L"pdf", L"doc", L"docx", L"xlsx", L"zip",
         L"html", L"js", L"py", L"cs", L"cpp", L"jan", L"feb", L"mar", L"apr",
         L"jun", L"jul", L"aug", L"sep", L"sept", L"oct", L"nov", L"dec", L"ave",
@@ -350,18 +365,11 @@ size_t ks_expand_macros(const wchar_t *template_text, const KS_DATE_INFO *now,
     if (!template_text) return 0;
     if (now) ks_gregorian_to_jalali(now->year, now->month, now->day, &jy, &jm, &jd);
     for (cursor = template_text; *cursor && used + 1 < capacity;) {
-        if (cursor[0] == L'\\' && cursor[1] == L'n') {
-            output[used++] = L'\n';
-            cursor += 2;
-            continue;
-        }
-        if (cursor[0] == L'\\' && cursor[1] == L't') {
-            output[used++] = L'\t';
-            cursor += 2;
-            continue;
-        }
-        if (cursor[0] == L'{' && cursor[1] == L'{') {
-            output[used++] = L'{';
+        /* Backslashes are literal (\\server\share, C:\temp\new): line
+           breaks and tabs are the {n} and {t} macros. Doubled braces are a
+           literal brace. */
+        if ((cursor[0] == L'{' && cursor[1] == L'{') || (cursor[0] == L'}' && cursor[1] == L'}')) {
+            output[used++] = cursor[0];
             cursor += 2;
             continue;
         }
@@ -602,4 +610,65 @@ int ks_stats_top(const KS_STATS *stats, int rank, const wchar_t **word, unsigned
 long ks_stats_seconds_saved(const KS_STATS *stats) {
     if (!stats) return 0;
     return (stats->total_layout + stats->total_spelling) * 4;
+}
+
+/* ---- Snippets file migration (3.1 -> 3.2) ------------------------------- */
+
+static const wchar_t OLD_ESCAPE_HEADER[] = L"\\n = new line";
+
+int ks_snippets_migrate(const wchar_t *content, wchar_t *output, size_t capacity) {
+    const wchar_t *cursor;
+    size_t used = 0;
+    int comment = 0;
+    int line_start = 1;
+    if (!content || !output || capacity == 0) return 0;
+    /* The 3.1 template header, or (header edited away) snippet lines with
+       the old escapes and none of the new macros. */
+    if (!wcsstr(content, OLD_ESCAPE_HEADER)) {
+        const wchar_t *line = content;
+        int old_escape = 0;
+        if (wcsstr(content, L"{n}") || wcsstr(content, L"{t}")) return 0;
+        while (*line && !old_escape) {
+            const wchar_t *end = wcschr(line, L'\n');
+            const wchar_t *first = line;
+            const wchar_t *c;
+            if (!end) end = line + wcslen(line);
+            while (first < end && (*first == L' ' || *first == L'\t')) ++first;
+            if (first < end && *first != L'#' && wmemchr(first, L'=', (size_t)(end - first)))
+                for (c = first; c + 1 < end; ++c)
+                    if (c[0] == L'\\' && (c[1] == L'n' || c[1] == L't') &&
+                        (c + 2 >= end || !iswalnum(c[2]))) old_escape = 1;
+            line = *end ? end + 1 : end;
+        }
+        if (!old_escape) return 0;
+    }
+    for (cursor = content; *cursor; ++cursor) {
+        const wchar_t *piece = NULL;
+        wchar_t single[2];
+        size_t length;
+        if (line_start) {
+            const wchar_t *first = cursor;
+            while (*first == L' ' || *first == L'\t') ++first;
+            comment = *first == L'#';
+            line_start = 0;
+        }
+        if (*cursor == L'\n') line_start = 1;
+        if (comment && wcsncmp(cursor, OLD_ESCAPE_HEADER, wcslen(OLD_ESCAPE_HEADER)) == 0) {
+            piece = L"{n} = new line";
+            cursor += wcslen(OLD_ESCAPE_HEADER) - 1;
+        } else if (!comment && cursor[0] == L'\\' && (cursor[1] == L'n' || cursor[1] == L't')) {
+            piece = cursor[1] == L'n' ? L"{n}" : L"{t}";
+            ++cursor;
+        } else {
+            single[0] = *cursor;
+            single[1] = 0;
+            piece = single;
+        }
+        length = wcslen(piece);
+        if (used + length + 1 > capacity) return 0;
+        memcpy(output + used, piece, length * sizeof(wchar_t));
+        used += length;
+    }
+    output[used] = 0;
+    return 1;
 }

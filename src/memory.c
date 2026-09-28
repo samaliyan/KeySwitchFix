@@ -73,8 +73,20 @@ static int by_count_descending(const void *left, const void *right) {
 /* Full: keep the most used seven eighths, forget the rest at once so the
    cost is paid rarely. */
 static void evict_words(KS_WRITING_MEMORY *memory) {
+    int i;
     qsort(memory->words, (size_t)memory->word_count, sizeof(memory->words[0]), by_count_descending);
     memory->word_count = KS_MEMORY_WORDS - KS_MEMORY_WORDS / 8;
+    /* Age what stays by about a quarter at every eviction. A word seen
+       since the previous eviction loses the smaller share (a known word in
+       use stays known); a word not seen since loses the larger share, at
+       least one, so words the user stopped writing fade out. */
+    for (i = 0; i < memory->word_count; ++i) {
+        unsigned count = memory->words[i].count;
+        if (memory->words[i].last_seen > memory->aged_at) count -= count / 4;
+        else if (count > 1) count -= (count + 3) / 4;
+        memory->words[i].count = count;
+    }
+    memory->aged_at = memory->clock;
     rebuild_slots(memory);
 }
 
@@ -384,6 +396,15 @@ int ks_memory_parse(KS_WRITING_MEMORY *memory, const wchar_t *text) {
             }
         }
         cursor = *end ? end + 1 : end;
+    }
+    /* The file keeps no recency: loaded words start equal, so the order of
+       the lines does not decide which of two equal counts is forgotten. */
+    {
+        int i;
+        /* Loaded words count as seen since the last eviction. */
+        for (i = 0; i < memory->word_count; ++i) memory->words[i].last_seen = 1;
+        memory->clock = 1;
+        memory->aged_at = 0;
     }
     memory->dirty = 0;
     return 1;

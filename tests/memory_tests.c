@@ -10,6 +10,14 @@
 
 #define CHECK(value, message) do { if (!(value)) { fprintf(stderr, "FAIL: %s\n", message); return 1; } } while (0)
 
+/* Loaded files live until exit; freed there so leak checkers stay quiet. */
+static unsigned char *g_loaded[32];
+static int g_loaded_count;
+
+static void free_loaded(void) {
+    while (g_loaded_count > 0) free(g_loaded[--g_loaded_count]);
+}
+
 static unsigned char *load_file(const char *path, size_t *size) {
     FILE *file = fopen(path, "rb");
     unsigned char *data;
@@ -26,6 +34,8 @@ static unsigned char *load_file(const char *path, size_t *size) {
     }
     fclose(file);
     *size = (size_t)length;
+    if (g_loaded_count == 0) atexit(free_loaded);
+    if (g_loaded_count < 32) g_loaded[g_loaded_count++] = data;
     return data;
 }
 
@@ -163,7 +173,7 @@ int main(void) {
     }
     CHECK(g_memory.word_count <= KS_MEMORY_WORDS, "word table bounded");
     CHECK(ks_memory_word_count(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634") == 3,
-          "a frequent word survives eviction");
+          "a known word survives eviction and stays known (ageing takes a quarter)");
     CHECK(ks_memory_word_count(&g_memory, L"w04099") == 1, "the newest word is present after eviction");
     ks_memory_unobserve_word(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634");
     CHECK(ks_memory_word_count(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634") == 2, "unobserve takes one back");
@@ -192,6 +202,26 @@ int main(void) {
         }
         CHECK(persian_left > 1500, "Persian words are not evicted before English ones");
         CHECK(ks_memory_word_count(&fair, L"n00399") == 1, "the most recent word survives");
+    }
+    /* A known word in use survives an eviction as known; one that is not
+       typed again fades at the next. */
+    {
+        static KS_WRITING_MEMORY fade;
+        int round;
+        ks_memory_reset(&fade);
+        for (i = 0; i < 3; ++i) ks_memory_observe_word(&fade, L"stale");
+        for (round = 0; round < 2; ++round) {
+            int start = fade.word_count;
+            for (i = 0; fade.word_count >= start && i < KS_MEMORY_WORDS; ++i) {
+                wchar_t word[16];
+                swprintf(word, 16, L"f%d%05d", round, i);
+                ks_memory_observe_word(&fade, word);
+                ks_memory_observe_word(&fade, word);
+            }
+            if (round == 0)
+                CHECK(ks_memory_word_count(&fade, L"stale") == 3, "a recently used known word stays known");
+        }
+        CHECK(ks_memory_word_count(&fade, L"stale") < 3, "a word not typed since fades at the next eviction");
     }
     /* The shipped rank formula. */
     CHECK(ks_memory_rank_adjust(&g_memory, L"unseen", -1) == -1, "unknown and unseen stays unknown");

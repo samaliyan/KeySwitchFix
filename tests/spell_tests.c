@@ -59,7 +59,7 @@ int main(void) {
           en_common_data && fa_common_data, "fixtures and resources load");
     CHECK(ks_rank_table_init(&en_rank, en_rank_data, en_rank_size), "English rank table validates");
     CHECK(ks_rank_table_init(&fa_rank, fa_rank_data, fa_rank_size), "Persian rank table validates");
-    CHECK(en_rank.word_count == 95 && fa_rank.word_count == 74, "fixture word counts match the generator");
+    CHECK(en_rank.word_count == 95 && fa_rank.word_count == 75, "fixture word counts match the generator");
     CHECK(ks_bloom_init(&en, en_data, en_size) && ks_bloom_init(&fa, fa_data, fa_size) &&
           ks_bloom_init(&en_common, en_common_data, en_common_size) &&
           ks_bloom_init(&fa_common, fa_common_data, fa_common_size),
@@ -213,6 +213,8 @@ int main(void) {
     CHECK(untouched(L"بزرگتر", KS_SPELL_BALANCED, &persian, &ignore) &&
               corrects_to(L"بزرگتر", KS_SPELL_AGGRESSIVE, &persian, &ignore, L"بزرگ\u200Cتر"),
           "suffix ZWNJ (بزرگ‌تر) is Aggressive-only");
+    CHECK(untouched(L"ساختمان", KS_SPELL_AGGRESSIVE, &persian, &ignore),
+          "a dictionary noun ending in مان is not cut into ساخت‌مان");
     CHECK(corrects_to(L"کتابها", KS_SPELL_AGGRESSIVE, &persian, &ignore, L"کتاب\u200Cها"),
           "missing ZWNJ before ها is inserted in Aggressive");
     CHECK(untouched(L"میپرسیدند", KS_SPELL_CONSERVATIVE, &persian, &ignore),

@@ -32,6 +32,17 @@ jobs:
       - name: Install wordfreq for the spelling rank tables
         run: python3 -m pip install --quiet wordfreq==3.1.1
 
+      - name: Language tests under AddressSanitizer and UBSan
+        run: |
+          set -euo pipefail
+          python3 tools/generate_domain_words.py
+          flags="-std=c11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all"
+          gcc $flags src/core.c tests/core_tests.c -o /tmp/asan-core && /tmp/asan-core
+          gcc $flags src/core.c src/spell.c tests/spell_tests.c -o /tmp/asan-spell && /tmp/asan-spell
+          gcc $flags src/core.c src/typing.c tests/typing_tests.c -o /tmp/asan-typing && /tmp/asan-typing
+          gcc $flags src/core.c src/spell.c src/domain.c src/memory.c tests/memory_tests.c -o /tmp/asan-memory && /tmp/asan-memory
+          gcc $flags src/core.c src/domain.c tests/corpus_tests.c -o /tmp/asan-corpus && /tmp/asan-corpus
+
       - name: Install Zig cross-compiler
         run: >-
           npm install

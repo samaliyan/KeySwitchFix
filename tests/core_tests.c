@@ -314,6 +314,11 @@ int main(void) {
     CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
                             KS_LANG_OTHER, 0, KS_PHASE_IDLE,
                             &en, &fa, &en_prefix, &fa_prefix,
+                            &decision) == KS_LIVE_NONE,
+          "a two-key word is never repaired on a pause (fi is also first)");
+    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
+                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+                            &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "expanded short-word list recognizes unshifted ab");
     CHECK(wcscmp(decision.replacement, L"اب") == 0,
@@ -323,10 +328,10 @@ int main(void) {
     CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
                             KS_LANG_OTHER, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
-                            &decision) == KS_LIVE_WAIT_FOR_IDLE,
-          "two-key ta waits for a natural pause");
+                            &decision) == KS_LIVE_NONE,
+          "two-key ta waits for a natural pause (decided at the word boundary now)");
     CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_IDLE,
+                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "two-key ta corrects after the adaptive pause");
@@ -339,7 +344,7 @@ int main(void) {
 
     CHECK(make_tokens(kon, 2, tokens), "kon scan codes map");
     CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_IDLE,
+                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "two-key kon corrects after the adaptive pause");
@@ -355,10 +360,10 @@ int main(void) {
     CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
                             KS_LANG_PERSIAN, 3, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
-                            &decision) == KS_LIVE_WAIT_FOR_IDLE,
-          "contextual khob waits until the two-key word is complete");
+                            &decision) == KS_LIVE_NONE,
+          "contextual khob waits until the two-key word is complete (decided at the word boundary now)");
     CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_PERSIAN, 3, KS_PHASE_IDLE,
+                            KS_LANG_PERSIAN, 3, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "Persian sentence context resolves of to khob");
@@ -400,10 +405,10 @@ int main(void) {
                                    KS_LANG_PERSIAN, 3, KS_PHASE_LIVE,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
-                                   &decision) == KS_LIVE_WAIT_FOR_IDLE,
-          "Auto mode cautiously pauses on the leg/mesl prefix collision");
+                                   &decision) == KS_LIVE_NONE,
+          "Auto mode cautiously pauses on the leg/mesl prefix collision (decided at the word boundary now)");
     CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_PERSIAN, 3, KS_PHASE_IDLE,
+                                   KS_LANG_PERSIAN, 3, KS_PHASE_BOUNDARY,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_CORRECT_NOW,
@@ -411,11 +416,11 @@ int main(void) {
     CHECK(wcscmp(decision.replacement, L"مثل") == 0,
           "mesl collision replacement is Persian");
     CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_PERSIAN, 4, KS_PHASE_LIVE,
+                                   KS_LANG_PERSIAN, 4, KS_PHASE_BOUNDARY,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_CORRECT_NOW,
-          "explicit Prefer Persian resolves leg/mesl on the third key");
+          "explicit Prefer Persian resolves leg/mesl when the word ends");
     CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
                                    KS_LANG_ENGLISH, 3, KS_PHASE_BOUNDARY,
                                    &en, &fa, &en_common, &fa_common,
@@ -426,10 +431,10 @@ int main(void) {
           "frequency prior makes Persian mesl likelier than English leg");
     CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
                                  KS_LANG_OTHER, 0, 1, KS_PHASE_LIVE,
-                                 &lexicons, &decision) == KS_LIVE_WAIT_FOR_IDLE,
-          "sentence-start frequency resolves mesl but honors the leg prefix");
+                                 &lexicons, &decision) == KS_LIVE_NONE,
+          "sentence-start frequency resolves mesl but honors the leg prefix (decided at the word boundary now)");
     CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_IDLE,
+                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "sentence-start mesl corrects after the adaptive pause");
     CHECK(wcscmp(decision.replacement, L"مثل") == 0,
@@ -440,8 +445,8 @@ int main(void) {
           "same prior preserves correctly typed Persian mesl");
     CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
                                  KS_LANG_PERSIAN, 4, 0, KS_PHASE_LIVE,
-                                 &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
-          "strong Persian sentence context corrects mesl immediately");
+                                 &lexicons, &decision) == KS_LIVE_NONE,
+          "no mid-word collision rewrite while leg can still become legal");
     CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
                                  KS_LANG_ENGLISH, 5, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
@@ -691,11 +696,11 @@ int main(void) {
                   "English two-key token survives a pause in English text");
             CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
                                          KS_LANG_PERSIAN, 3, 0,
-                                         KS_PHASE_IDLE, &lexicons,
+                                         KS_PHASE_BOUNDARY, &lexicons,
                                          &decision) == KS_LIVE_CORRECT_NOW &&
                       wcscmp(decision.replacement,
                              english_token_suite[suite_index].persian) == 0,
-                  "Persian context still resolves the collision to Persian");
+                  "Persian context still resolves the collision to Persian at Space");
         }
     }
 

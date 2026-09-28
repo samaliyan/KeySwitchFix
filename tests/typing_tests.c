@@ -52,6 +52,28 @@ int main(void) {
     CHECK(ks_clean_text(text, 1, KS_DIGITS_BY_LAYOUT, 1), "clean-up reports a change");
     CHECK(wcscmp(text, L"\x06A9\x062A\x0627\x0628 \x06CC\x06A9 \x06F1\x06F2\x06F3\x061F") == 0,
           "clean-up rewrites letters, digits and punctuation");
+    /* An IP address or a version number inside Persian text stays ASCII. */
+    wcscpy(text, L"\x0633\x0631\x0648\x0631 192.168.1.10 \x0648 1.2.3 \x0648 12");
+    ks_clean_text(text, 1, KS_DIGITS_BY_LAYOUT, 1);
+    CHECK(wcscmp(text, L"\x0633\x0631\x0648\x0631 192.168.1.10 \x0648 1.2.3 \x0648 \x06F1\x06F2") == 0,
+          "clean-up keeps addresses and versions pasteable");
+    wcscpy(text, L"\x062A\x0627\x0631\x06CC\x062E 1403/05/12");
+    ks_clean_text(text, 1, KS_DIGITS_BY_LAYOUT, 1);
+    CHECK(wcscmp(text, L"\x062A\x0627\x0631\x06CC\x062E \x06F1\x06F4\x06F0\x06F3/\x06F0\x06F5/\x06F1\x06F2") == 0,
+          "a Jalali date in Persian text gets Persian digits");
+    /* A 3.1 snippets file: \\n and \\t become {n} and {t}, comments keep
+       their text apart from the old escape note. */
+    {
+        static wchar_t migrated[512];
+        CHECK(!ks_snippets_migrate(L"a = b{n}c\n", migrated, 512), "a current file is not migrated");
+        CHECK(!ks_snippets_migrate(L"p = C:\\new\\folder\n", migrated, 512), "a Windows path is not an old escape");
+        CHECK(ks_snippets_migrate(L"sig = Hi\\n Sia\n", migrated, 512) &&
+              wcscmp(migrated, L"sig = Hi{n} Sia\n") == 0, "old escapes without the old header are migrated");
+        CHECK(ks_snippets_migrate(L"# {time}  \\n = new line (Enter)\r\nsig = Hi\\nSia\\tX\r\n# keep \\t\r\n",
+                                  migrated, 512), "an old file is migrated");
+        CHECK(wcscmp(migrated, L"# {time}  {n} = new line (Enter)\r\nsig = Hi{n}Sia{t}X\r\n# keep \\t\r\n") == 0,
+              "escapes become macros only in snippet lines");
+    }
     wcscpy(text, L"hello, world? 42");
     CHECK(!ks_text_is_persian(text), "English text detected");
     CHECK(!ks_clean_text(text, 1, KS_DIGITS_BY_LAYOUT, 1), "English text untouched by clean-up");
@@ -63,13 +85,19 @@ int main(void) {
     /* Abbreviations */
     CHECK(ks_is_abbreviation(L"dr") && ks_is_abbreviation(L"etc") && ks_is_abbreviation(L"e"),
           "abbreviations recognised");
-    CHECK(!ks_is_abbreviation(L"house") && !ks_is_abbreviation(L"done") && !ks_is_abbreviation(L"no"),
+    CHECK(!ks_is_abbreviation(L"house") && !ks_is_abbreviation(L"done") && !ks_is_abbreviation(L"no") &&
+          !ks_is_abbreviation(L"app") && !ks_is_abbreviation(L"net"),
           "words are not abbreviations");
     CHECK(ks_persian_form(0x06C0) == 0x06C0, "heh with hamza above (Shift+G) is left alone");
     wcscpy(text, L"\x0633\x0627\x06CC\x062A site.com/page?id=123 \x0648 \x06F1\x06F2 12?");
     CHECK(ks_clean_text(text, 1, KS_DIGITS_BY_LAYOUT, 1) &&
           wcscmp(text, L"\x0633\x0627\x06CC\x062A site.com/page?id=123 \x0648 \x06F1\x06F2 \x06F1\x06F2\x061F") == 0,
           "URL token keeps its digits and marks, plain tokens are shaped");
+
+    wcscpy(text, L"\x0642\x06CC\x0645\x062A 1,000 \x0648 2,5");
+    CHECK(ks_clean_text(text, 1, KS_DIGITS_BY_LAYOUT, 1) &&
+          wcscmp(text, L"\x0642\x06CC\x0645\x062A \x06F1,\x06F0\x06F0\x06F0 \x0648 \x06F2,\x06F5") == 0,
+          "a thousands separator between digits is not turned into a Persian comma");
 
     /* Jalali calendar: known dates */
     CHECK(check_jalali(2026, 3, 21, 1405, 1, 1), "Nowruz 1405");
@@ -115,8 +143,11 @@ int main(void) {
     ks_expand_macros(L"{date} {date:long} {time} {time:fa}", &now, out, 256);
     CHECK(wcscmp(out, L"2026-09-12 12 September 2026 14:05 \x06F1\x06F4:\x06F0\x06F5") == 0,
           "Gregorian date and time macros");
-    ks_expand_macros(L"a\\nb{n}c{t}d{{x}{unknown}", &now, out, 256);
-    CHECK(wcscmp(out, L"a\nb\nc\td{x}{unknown}") == 0, "escapes, braces, unknown macro kept");
+    ks_expand_macros(L"a{n}b{t}c{{x}}{unknown}", &now, out, 256);
+    CHECK(wcscmp(out, L"a\nb\tc{x}{unknown}") == 0, "macros, doubled braces, unknown macro kept");
+    ks_expand_macros(L"\\\\fileserver\\transfer\\new C:\\temp\\new", &now, out, 256);
+    CHECK(wcscmp(out, L"\\\\fileserver\\transfer\\new C:\\temp\\new") == 0,
+          "Windows paths in snippets keep their backslashes");
     CHECK(ks_expand_macros(L"0123456789", &now, out, 5) == 4 && wcscmp(out, L"0123") == 0,
           "expansion respects capacity");
 

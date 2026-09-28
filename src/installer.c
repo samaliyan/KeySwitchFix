@@ -10,7 +10,7 @@
 #include "../resources/resource.h"
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"3.1.0"
+#define APP_VERSION L"3.2.0"
 #define APP_WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 #define WM_APP_EXIT (WM_APP + 9)
 
@@ -25,6 +25,7 @@ static wchar_t g_start_menu_shortcut[MAX_PATH];
 static int g_install_complete;
 static int g_launch_after_finish;
 static int g_shortcuts_created;
+static int g_was_running;
 
 static void set_registry_string(HKEY key, const wchar_t *name, const wchar_t *value) {
     RegSetValueExW(key, name, 0, REG_SZ, (const BYTE *)value,
@@ -75,21 +76,24 @@ static int process_path_equals(DWORD process_id, const wchar_t *expected_path) {
     return matches;
 }
 
-static void stop_running_app(void) {
+static int stop_running_app(void) {
     HWND window = FindWindowW(APP_WINDOW_CLASS, NULL);
     int attempt;
+    int was_running = 0;
     if (window) {
         DWORD process_id = 0;
         GetWindowThreadProcessId(window, &process_id);
-        if (process_path_equals(process_id, g_app_path))
+        if (process_path_equals(process_id, g_app_path)) {
+            was_running = 1;
             PostMessageW(window, WM_APP_EXIT, 0, 0);
+        }
     }
     for (attempt = 0; attempt < 20 && FindWindowW(APP_WINDOW_CLASS, NULL); ++attempt) Sleep(50);
 
     {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         PROCESSENTRY32W entry;
-        if (snapshot == INVALID_HANDLE_VALUE) return;
+        if (snapshot == INVALID_HANDLE_VALUE) return was_running;
         ZeroMemory(&entry, sizeof(entry));
         entry.dwSize = sizeof(entry);
         if (Process32FirstW(snapshot, &entry)) {
@@ -98,6 +102,7 @@ static void stop_running_app(void) {
                     _wcsicmp(entry.szExeFile, L"KeySwitchFix.exe") == 0 &&
                     process_path_equals(entry.th32ProcessID, g_app_path)) {
                     HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID);
+                    was_running = 1;
                     if (process) {
                         if (WaitForSingleObject(process, 300) == WAIT_TIMEOUT) TerminateProcess(process, 0);
                         CloseHandle(process);
@@ -107,6 +112,7 @@ static void stop_running_app(void) {
         }
         CloseHandle(snapshot);
     }
+    return was_running;
 }
 
 static int write_resource_file(int resource_id, const wchar_t *target) {
@@ -188,6 +194,26 @@ static void update_startup(int enabled) {
     RegCloseKey(key);
 }
 
+/* An upgrade keeps the user's earlier choice: the Run entry exists only when
+   "Start with Windows" was on. A fresh install defaults to on. */
+static int startup_default(void) {
+    HKEY key;
+    int present = 0;
+    if (GetFileAttributesW(g_settings_path) == INVALID_FILE_ATTRIBUTES) return 1;
+    /* Kept settings (an uninstall that kept the data, or an upgrade) hold
+       the user's choice; the Run entry is only a fallback. */
+    {
+        int saved = (int)GetPrivateProfileIntW(L"General", L"StartWithWindows", -1, g_settings_path);
+        if (saved == 0 || saved == 1) return saved;
+    }
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+        present = RegQueryValueExW(key, APP_NAME, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+        RegCloseKey(key);
+    }
+    return present;
+}
+
 static void write_initial_settings(int startup) {
     wchar_t number[8];
     int settings_existed = GetFileAttributesW(g_settings_path) != INVALID_FILE_ATTRIBUTES;
@@ -229,11 +255,27 @@ static void register_uninstaller(void) {
     RegCloseKey(key);
 }
 
+/* A cleanup left by an uninstall that could not delete a running file
+   would delete the new installation at the next sign-in. */
+static void cancel_pending_cleanup(void) {
+    HKEY key;
+    int serial;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+                      0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) return;
+    for (serial = 1; serial <= 8; ++serial) {
+        wchar_t name[40];
+        swprintf(name, 40, L"KeySwitchFix cleanup %d", serial);
+        RegDeleteValueW(key, name);
+    }
+    RegCloseKey(key);
+}
+
 static int perform_install(HWND dialog, int startup) {
     int desktop_created;
     int start_menu_created;
     ensure_directories();
-    stop_running_app();
+    cancel_pending_cleanup();
+    g_was_running = stop_running_app();
     if (!write_resource_file(IDR_APP_BINARY, g_app_path)) {
         MessageBoxW(dialog,
                     L"The application file could not be installed. Close any previous version and try again.",
@@ -269,7 +311,9 @@ static void show_install_complete(HWND dialog) {
     SetDlgItemTextW(dialog, IDC_STARTUP, L"Launch KeySwitchFix now");
     SendDlgItemMessageW(dialog, IDC_STARTUP, BM_SETCHECK, BST_CHECKED, 0);
     SetDlgItemTextW(dialog, IDC_INSTALL_NOTE,
-                    L"Click Finish to close Setup. The application will open afterwards.");
+                    g_was_running
+                        ? L"The running copy was closed for the update. Click Finish to start the new version."
+                        : L"Click Finish to close Setup. The application will open afterwards.");
     SetDlgItemTextW(dialog, IDC_INSTALL, L"Finish");
     EnableWindow(GetDlgItem(dialog, IDC_INSTALL), TRUE);
     ShowWindow(GetDlgItem(dialog, IDC_CANCEL), SW_HIDE);
@@ -284,7 +328,8 @@ static INT_PTR CALLBACK installer_dialog_proc(HWND dialog, UINT message, WPARAM 
             g_launch_after_finish = 0;
             SendMessageW(dialog, WM_SETICON, ICON_BIG,
                          (LPARAM)LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP)));
-            SendDlgItemMessageW(dialog, IDC_STARTUP, BM_SETCHECK, BST_CHECKED, 0);
+            SendDlgItemMessageW(dialog, IDC_STARTUP, BM_SETCHECK,
+                                startup_default() ? BST_CHECKED : BST_UNCHECKED, 0);
             return TRUE;
         case WM_COMMAND:
             if (LOWORD(wparam) == IDC_INSTALL) {
@@ -332,6 +377,29 @@ static int current_module_is_installed_uninstaller(void) {
     return length > 0 && length < MAX_PATH && _wcsicmp(self, g_uninstaller_path) == 0;
 }
 
+/* A file that is still in use is deleted at the next sign-in: a per-user
+   uninstaller cannot use MOVEFILE_DELAY_UNTIL_REBOOT (it needs admin). */
+static int delete_at_next_sign_in(const wchar_t *path) {
+    HKEY key;
+    wchar_t system_directory[MAX_PATH];
+    wchar_t command[MAX_PATH * 3];
+    wchar_t name[40];
+    static int serial;
+    int ok = 0;
+    if (!GetSystemDirectoryW(system_directory, MAX_PATH)) return 0;
+    swprintf(command, MAX_PATH * 3,
+             L"\"%ls\\cmd.exe\" /D /C del /F /Q \"%ls\" & rmdir \"%ls\"",
+             system_directory, path, g_install_directory);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return 0;
+    swprintf(name, 40, L"KeySwitchFix cleanup %d", ++serial);
+    ok = RegSetValueExW(key, name, 0, REG_SZ, (const BYTE *)command,
+                        (DWORD)((wcslen(command) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+    RegCloseKey(key);
+    return ok;
+}
+
 static void schedule_self_delete(void) {
     wchar_t self[MAX_PATH];
     wchar_t system_directory[MAX_PATH];
@@ -358,23 +426,26 @@ static void schedule_self_delete(void) {
                        &startup, &process)) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
-    } else MoveFileExW(self, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    } else delete_at_next_sign_in(self);
 }
 
-static int perform_uninstall(int silent) {
-    int remove_settings = 0;
+static int perform_uninstall(int silent, int purge) {
+    int remove_settings = purge;
     int pending_restart = 0;
     if (!silent) {
         if (MessageBoxW(NULL, L"Uninstall KeySwitchFix from this Windows account?",
                         L"Uninstall KeySwitchFix", MB_YESNO | MB_ICONQUESTION) != IDYES)
             return 0;
-        remove_settings = MessageBoxW(NULL, L"Also remove your settings and preferences?",
+        remove_settings = MessageBoxW(NULL,
+                                      L"Also remove your settings and everything KeySwitchFix learned "
+                                      L"(personal dictionary, snippets, writing memory and statistics)?\n\n"
+                                      L"Choose No to keep them for a later reinstall.",
                                       L"Uninstall KeySwitchFix",
-                                      MB_YESNO | MB_ICONQUESTION) == IDYES;
+                                      MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
     }
     stop_running_app();
     if (!DeleteFileW(g_app_path) && GetFileAttributesW(g_app_path) != INVALID_FILE_ATTRIBUTES) {
-        if (MoveFileExW(g_app_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+        if (delete_at_next_sign_in(g_app_path)) {
             pending_restart = 1;
         } else {
             if (!silent)
@@ -387,14 +458,26 @@ static int perform_uninstall(int silent) {
     update_startup(0);
     remove_uninstall_registry();
     remove_shortcuts();
-    if (remove_settings || silent) {
-        DeleteFileW(g_settings_path);
+    /* A silent uninstall (winget, scripts, "reinstall") keeps the user's
+       data; /purge removes it. */
+    if (remove_settings) {
+        static const wchar_t *const data_files[] = {
+            L"settings.ini", L"personal-dictionary.txt", L"snippets.txt",
+            L"stats.ini", L"writing-memory.txt", L"settings.ini.tmp", L"stats.ini.tmp",
+            L"personal-dictionary.txt.tmp", L"snippets.txt.tmp", L"writing-memory.txt.tmp"
+        };
+        size_t i;
+        wchar_t path[MAX_PATH];
+        for (i = 0; i < sizeof(data_files) / sizeof(data_files[0]); ++i) {
+            swprintf(path, MAX_PATH, L"%ls\\%ls", g_data_directory, data_files[i]);
+            DeleteFileW(path);
+        }
         RemoveDirectoryW(g_data_directory);
     }
     if (!silent) {
         MessageBoxW(NULL,
                     pending_restart
-                        ? L"KeySwitchFix will be completely removed after the next Windows restart."
+                        ? L"KeySwitchFix will be completely removed the next time you sign in to Windows."
                         : L"KeySwitchFix was removed successfully.",
                     L"Uninstall complete", MB_OK | MB_ICONINFORMATION);
     }
@@ -407,12 +490,26 @@ static int perform_uninstall(int silent) {
     return 1;
 }
 
+/* Command-line switches are whole arguments, matched without regard to
+   case (/SILENT). The program path (argument 0) is never a switch. */
+static int has_switch(const wchar_t *command_line, const wchar_t *name) {
+    int count = 0;
+    int i;
+    int found = 0;
+    LPWSTR *arguments = CommandLineToArgvW(command_line, &count);
+    if (!arguments) return 0;
+    for (i = 1; i < count && !found; ++i)
+        if (_wcsicmp(arguments[i], name) == 0) found = 1;
+    LocalFree(arguments);
+    return found;
+}
+
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, int show_command) {
     const wchar_t *wide_command = GetCommandLineW();
     wchar_t module_path[MAX_PATH];
     const wchar_t *base_name;
     int uninstall;
-    int silent = wcsstr(wide_command, L"/silent") != NULL;
+    int silent = has_switch(wide_command, L"/silent");
     (void)previous;
     (void)command_line;
     (void)show_command;
@@ -421,9 +518,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
     GetModuleFileNameW(NULL, module_path, MAX_PATH);
     base_name = wcsrchr(module_path, L'\\');
     if (base_name) ++base_name; else base_name = module_path;
-    uninstall = wcsstr(wide_command, L"/uninstall") != NULL ||
+    uninstall = has_switch(wide_command, L"/uninstall") ||
                 wcsstr(base_name, L"Uninstall") != NULL;
-    if (uninstall) return perform_uninstall(silent) ? 0 : 1;
+    if (uninstall) return perform_uninstall(silent, has_switch(wide_command, L"/purge")) ? 0 : 1;
     {
         INT_PTR result = DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_INSTALLER), NULL,
                                          installer_dialog_proc, 0);

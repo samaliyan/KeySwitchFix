@@ -76,8 +76,8 @@ const wchar_t *ks_english_month_name(int month);
  * {jdate:long} ۲۱ شهریور ۱۴۰۵, {jweekday} شنبه, {jyear} {jmonth} {jday},
  * {date} 2026-09-12, {date:long} 12 September 2026, {weekday} Saturday,
  * {time} 14:05, {time:fa} ۱۴:۰۵, {year} {month} {day} {hour} {minute},
- * {n} newline (also \n), {t} tab, {{ literal brace. Unknown macros are
- * kept verbatim. Returns the number of characters written.
+ * {n} newline, {t} tab, {{ and }} literal braces. Backslashes are literal.
+ * Unknown macros are kept verbatim. Returns the number of characters written.
  */
 size_t ks_expand_macros(const wchar_t *template_text, const KS_DATE_INFO *now,
                         wchar_t *output, size_t capacity);
@@ -105,6 +105,14 @@ typedef struct KS_SNIPPET_TABLE {
  * of snippets loaded.
  */
 int ks_snippets_parse(KS_SNIPPET_TABLE *table, const wchar_t *content);
+
+/*
+ * A snippets.txt written by 3.0/3.1 (recognised by its template header)
+ * used \n and \t for Enter and Tab. Rewrites those escapes in snippet lines
+ * to {n} and {t}, and the header line to the current one, into `output`
+ * (capacity in characters). Returns 1 when the file needed migrating and fit.
+ */
+int ks_snippets_migrate(const wchar_t *content, wchar_t *output, size_t capacity);
 const KS_SNIPPET *ks_snippet_find(const KS_SNIPPET_TABLE *table, const wchar_t *key);
 
 /* ---- Statistics --------------------------------------------------------- */

@@ -375,6 +375,18 @@ static void enumerate_joins(KS_SEARCH *search) {
             /* Suffix joins (کتابها) are riskier than verb prefixes: many
                nouns end in مان/شان/ات; they are Aggressive-only. */
             if (is_suffix && search->level < KS_SPELL_AGGRESSIVE) is_suffix = 0;
+            /* Never on a word a vocabulary pack or the writing memory knows
+               (کلاستر is not کلاس‌تر). The possessive and personal endings
+               (مان تان شان ام ات اش) also end ordinary nouns, so they join
+               only a word the dictionary does not know: ساختمان is not
+               ساخت‌مان. The plural and comparative endings (ها، تر) join
+               dictionary words too, whose stored form lacks the joiner. */
+            if (is_suffix && ks_spell_rank(search->lexicon, typed) >= 0) is_suffix = 0;
+            if (is_suffix && wcscmp(right, L"ها") != 0 && wcscmp(right, L"های") != 0 &&
+                wcscmp(right, L"هایی") != 0 && wcscmp(right, L"تر") != 0 &&
+                wcscmp(right, L"ترین") != 0 &&
+                ks_text_known(typed, language, search->lexicon->words, NULL))
+                is_suffix = 0;
             /*
              * After می/نمی the stem must look like a verb: Persian verb
              * forms end in a personal ending (م ی د ند یم ید) or a past-stem

@@ -2,6 +2,98 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] - 2026-09-28
+
+A reliability and design release, the result of three rounds of strict review.
+
+### Dashboard and tray
+
+- New dashboard: a status card that says what is wrong and what to do, four
+  pages (Correction, Typing, Memory & words, Statistics) and a footer that is
+  always on screen. Settings apply the moment they change; there is no Save
+  button.
+- Per-monitor DPI (manifest, PerMonitorV2): the window is rebuilt when it
+  moves to a monitor with another scale and shrinks to fit small screens, so
+  no control can end up off screen. Frame sizes use the monitor's DPI.
+- Full keyboard use: Tab order, Alt+letter on every setting, Enter and Space
+  on buttons, Left/Right and Ctrl+Tab between pages, Esc hides; the focused
+  control is kept when you switch away and back.
+- High-contrast themes use the system colours.
+- The tray icon turns grey while paused; the menu opens at the keyboard
+  anchor; only the Ctrl+Win+K hotkey shows a notification. Explorer restarts
+  and taskbar DPI changes reload the icon. Opening a second copy shows the
+  running one.
+- Visual styles (comctl32 v6) through an embedded manifest in all three
+  executables; `tests/verify_pe.py` checks it.
+
+### Correction engine
+
+- Password fields in browsers, Electron and WPF are detected through
+  accessibility (MSAA protected state); a field counts as protected until the
+  check answers. Superclassed edit controls (WinForms, Delphi, VB6) are
+  checked too. Typing helpers and the writing memory follow focus changes
+  inside one browser window at once (they used a 3-second cache).
+- Corrections never run in remote-desktop and VM windows, and sentence
+  rewrites are off in Word, Outlook, OneNote and PowerPoint (their own
+  autocorrect edits the text).
+- Undo only in the same field, within 5 seconds for Backspace (15 for
+  Ctrl+Win+Backspace), and never across Enter or Tab.
+- Every engine operation (hook, pause timer, Undo, clean-up, focus query) is
+  guarded against keys that arrive meanwhile; the word such a key belongs to
+  is left alone. A correction is skipped if Windows already passed the key on
+  because the system was busy.
+- Stuck modifier keys are re-synchronised on every key; swallowed keys always
+  get their key-up; dead keys are left alone.
+- Excel: the AutoComplete Delete is sent only in a freshly entered cell, never
+  while editing existing text (F2 or double-click).
+- Ctrl+Win+X is cancelled if you switch windows, fields or type before it
+  pastes, and its temporary clipboard text stays out of Win+V history.
+- Snippets also expand at a capitalised sentence start; very long snippets
+  can always be undone.
+
+### Language
+
+- Abbreviations are no longer rewritten inside an English sentence (`src`,
+  `mv`, `cfg`, `pg`); three-key words whose other reading is rare wait for the
+  end of the word. Shell and admin commands (`mkdir`, `lsof`, `chkdsk`,
+  `robocopy`, …) joined the IT vocabulary.
+- IT-pack and memory words that are also dictionary words (`int`, `svn`) are
+  protected in collisions.
+- Words at a pause: two-key words and words that are the start of a longer
+  word are only repaired at the end of the word.
+- Writing memory: when the table is full, words used since the previous
+  clean-up lose a quarter of their count (a known word stays known) and words
+  not used since lose more, so they fade; files are written atomically.
+- Short English words and IT terms typed on the Persian layout inside
+  Persian text are repaired (`یدس` → `dns`); a frequent word is not turned
+  into a rare word of the other language by context alone (`آخر` stays).
+- Clean-up keeps IP addresses, version numbers and Windows paths ASCII inside
+  Persian text; dates such as `1403/05/12` get Persian digits.
+
+### Snippets
+
+- `\n` and `\t` are no longer escapes: backslashes are typed as they are, so
+  Windows paths work. Use `{n}` for Enter and `{t}` for Tab, `{{` `}}` for
+  braces. A `snippets.txt` from 3.0/3.1 is converted automatically the first
+  time it is loaded. A snippet with a thousands separator (`1,000`) keeps it.
+
+### Installer
+
+- The uninstaller asks whether to remove your data with No as the default,
+  and removes all of it (settings, personal dictionary, snippets, writing
+  memory, statistics) when asked. A silent uninstall keeps the data; `/purge`
+  removes it. Files in use are removed at the next sign-in (a reinstall
+  before then cancels that). Switches are not case-sensitive.
+- An upgrade or reinstall keeps your "Start with Windows" choice and
+  restarts the app if it was running. A copy run outside the install folder no longer adds
+  itself to startup.
+
+### Build and tests
+
+- `tests/corpus_tests.c`: false-positive and recall thresholds on word lists
+  (English, Persian, punctuated, tech, abbreviations); CI runs the language
+  tests under AddressSanitizer and UBSan.
+
 ## [3.1.0] - 2026-09-26
 
 ### Added

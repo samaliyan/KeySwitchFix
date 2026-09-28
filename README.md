@@ -26,6 +26,17 @@ application's layout automatically.
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
 
+Version 3.2 is a reliability and design release: a new dashboard with four
+pages (Correction, Typing, Memory & words, Statistics) whose settings apply
+instantly, full keyboard navigation, per-monitor DPI scaling that always keeps
+every control on screen, a grey tray icon while paused, and password fields in
+browsers detected through accessibility. It stops corrections after Enter or
+Tab, in remote-desktop windows and in Office autocorrect conflicts, fixes stuck
+modifier keys, and leaves the IT terms and pack words you type alone. In
+snippets, Enter and Tab are now written `{n}` and `{t}` (backslashes are typed
+as they are, so Windows paths work); an existing `snippets.txt` is converted
+automatically. See the [changelog](CHANGELOG.md).
+
 Version 3.1 adds an opt-in **writing memory** that learns the repairs you
 make by hand (`عسیسم` → `عزیزم` after you fix it twice) and the words you
 use most, kept only on your PC, and an **IT & computing vocabulary** of
@@ -86,9 +97,9 @@ inferred from the available keys or context alone.
 - `Ctrl + Win + X` cleans up selected text anywhere (letters, digits, punctuation), and puts your clipboard back
 - Statistics: fixes today and all time, keys, active days, time saved, most-corrected words
 - **Exclude this app** from the tray menu and `Ctrl + Win + K` to pause/resume
-- English-only dashboard, tray controls, sensitivity settings, and live diagnostics
+- English-only dashboard (settings apply instantly), tray controls and a Statistics page with diagnostics
 - Per-user installer, desktop/Start Menu shortcuts, startup option, and clean uninstaller
-- No network access, telemetry, cloud processing, typed-text log, or background service
+- No network access, telemetry, cloud processing, typed-text log, or background service (the opt-in writing memory keeps only word counts and repairs, on your PC)
 - Compact native executable with all word resources embedded
 
 ## Install
@@ -103,7 +114,8 @@ The executable is currently unsigned, so Microsoft Defender SmartScreen may disp
 ## Use
 
 - KeySwitchFix starts enabled and can start automatically with Windows.
-- Double-click the tray icon or use the desktop shortcut to open the dashboard.
+- Click the tray icon or use the desktop shortcut to open the dashboard. Settings take effect as soon as you change them; there is no Save button.
+- The tray icon turns grey while correction is paused.
 - Right-click the tray icon to pause correction, choose **Writing language**, toggle **Fix spelling mistakes**, exclude the app you last typed in, or exit.
 - Press `Ctrl + Win + K` to pause or resume correction from anywhere.
 - Press `Ctrl + Win + X` to clean up the selected text in any application.
@@ -111,13 +123,12 @@ The executable is currently unsigned, so Microsoft Defender SmartScreen may disp
 - Closing the dashboard hides it to the tray; choosing **Exit** stops the program.
 - If Windows Explorer restarts, the tray icon restores itself automatically.
 
-If correction does not occur, open **Live diagnostics** and confirm:
+If correction does not occur, open the dashboard and confirm:
 
-- `Protection is active`
-- `Keyboard hook: Running`
-- `Current context` reports an English or Persian layout
-- `Input observed` increases while typing in another application
-- No warning about a missing Persian or English keyboard layout is shown
+- The status card at the top says `Protection is active` (not `Not working: …`, which names the problem)
+- On the **Statistics** page, `Keyboard hook: running`
+- On the **Statistics** page, `Typing in <app> with the English/Persian layout` names the application you typed in
+- The app is not listed under **Excluded apps**, and is not a code editor, terminal or remote-desktop window (those are skipped on purpose)
 
 ## Privacy and security
 
@@ -125,8 +136,11 @@ KeySwitchFix processes only the current word and the current sentence in
 memory, bounded to 32 words or 512 characters. That history is discarded on
 caret movement, mouse clicks, window changes, sentence termination, or
 unsupported punctuation. It does not include network code and never stores
-typed text. Standard Win32 password fields and common password-manager
-processes are skipped. See
+typed text; the only exception is the optional writing memory (off by
+default), which keeps word counts and your hand repairs in a file on your PC
+that you can open, edit or delete. Password fields (standard Windows fields,
+and browser fields that report themselves as protected through
+accessibility), password managers and remote-desktop windows are skipped. See
 [Privacy design](docs/PRIVACY.md) and [Security policy](SECURITY.md).
 
 Windows prevents lower-integrity processes from injecting input into elevated applications. If a target application runs as administrator, KeySwitchFix must run at the same integrity level to edit it.
@@ -170,7 +184,7 @@ See [Architecture](docs/ARCHITECTURE.md), the
 
 ## Uninstall
 
-Use **Windows Settings → Apps → Installed apps → KeySwitchFix → Uninstall**. The uninstaller removes the application, startup entry, Installed Apps registration, and KeySwitchFix shortcuts. You can choose whether to keep personal settings.
+Use **Windows Settings → Apps → Installed apps → KeySwitchFix → Uninstall**. The uninstaller removes the application, startup entry, Installed Apps registration, and KeySwitchFix shortcuts. You can choose whether to keep your settings and learned data (the default keeps them). A silent uninstall (`/silent`) keeps them too; add `/purge` to remove them.
 
 ## License
 

@@ -61,6 +61,7 @@ if (-not (Test-Path resources\en-rank.bin) -or -not (Test-Path resources\fa-rank
 }
 
 Step "Metadata verification"
+Run $python @("tools\generate_domain_words.py")
 Run $python @("tests\verify_metadata.py")
 
 $common = @("cc", "-target", "x86_64-windows-gnu", "-DUNICODE", "-D_UNICODE", "-std=c11", "-O2",
@@ -80,6 +81,9 @@ if (-not $SkipTests) {
     Step "Writing memory and vocabulary tests"
     Run $Zig ($common + @("src\core.c", "src\spell.c", "src\domain.c", "src\memory.c", "tests\memory_tests.c", "-o", "dist\memory_tests.exe"))
     Run "dist\memory_tests.exe" @()
+    Step "Layout corpus tests"
+    Run $Zig ($common + @("src\core.c", "src\domain.c", "tests\corpus_tests.c", "-o", "dist\corpus_tests.exe"))
+    Run "dist\corpus_tests.exe" @()
 }
 
 # --- application ----------------------------------------------------------
@@ -89,7 +93,7 @@ Run $Zig @("rc", "/:auto-includes", "gnu", "/c", "65001", "/fo", "app.res", "app
 Pop-Location
 Run $Zig ($common + @("src\app.c", "src\core.c", "src\spell.c", "src\typing.c", "src\domain.c", "src\memory.c", "resources\app.res",
           "-o", "dist\KeySwitchFix.exe",
-          "-luser32", "-lgdi32", "-lcomctl32", "-lshell32", "-ladvapi32", "-Wl,/subsystem:windows"))
+          "-luser32", "-lgdi32", "-lcomctl32", "-lshell32", "-ladvapi32", "-lole32", "-loleaut32", "-loleacc", "-luxtheme", "-ldwmapi", "-Wl,/subsystem:windows"))
 
 Step "KeySwitchFix-Uninstall.exe"
 Push-Location resources

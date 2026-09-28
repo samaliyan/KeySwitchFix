@@ -91,3 +91,7 @@ bytes byte kilobyte megabyte gigabyte terabyte petabyte kb mb gb tb pb kbps mbps
 bit bits bitrate baud pixel pixels dpi resolution framerate fps codec codecs
 spam inbox email emails attachment attachments smtp dkim dmarc spf mx
 browser browsers chrome chromium firefox edge safari opera brave tor
+# Added in 3.2 from the tech-word benchmark
+pfsense opnsense veeam vscode hikvision icloud  ocp hdd xray fortios sophos proxmox ceph glusterfs minio nextcloud owncloud zimbra kerio mikrotik winbox unifi pfblocker
+# Shell and admin abbreviations (3.2): without them src, cfg or mkdir were rewritten to Persian.
+src cfg srv mkdir rmdir lsof pvs vgs chkdsk lsblk fdisk umount sysctl chroot mkfs fsck regedit msconfig gpedit diskpart robocopy xcopy dism winget choco npx

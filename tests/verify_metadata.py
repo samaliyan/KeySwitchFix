@@ -21,7 +21,9 @@ def require(path: str, value: str) -> None:
 def main() -> None:
     require("src/app.c", f'#define APP_VERSION L"{VERSION}"')
     require("src/installer.c", f'#define APP_VERSION L"{VERSION}"')
-    require("src/app.c", f'L"KeySwitchFix {VERSION}"')
+    require("src/app.c", 'L"KeySwitchFix " APP_VERSION')
+    require("resources/app.manifest", f'version="{VERSION}.0"')
+    require("CHANGELOG.md", f"## [{VERSION}]")
     require("src/core.h", "#define KS_MAX_SEQUENCE_WORDS 32")
     require("src/core.h", "#define KS_MAX_SEQUENCE_CHARS 512")
     require("src/core.c", "int ks_is_word_scancode(")

@@ -16,3 +16,6 @@
 *.exe binary
 *.zip binary
 
+*.bin binary
+*.txt text eol=lf
+*.manifest text eol=crlf
