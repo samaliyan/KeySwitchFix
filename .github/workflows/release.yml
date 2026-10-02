@@ -15,7 +15,7 @@ jobs:
   release:
     if: contains(github.event.head_commit.message, '[release]')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     steps:
       - name: Check out source
@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install wordfreq for the spelling rank tables
+      - name: Install wordfreq for the rank tables and language packs
         run: python3 -m pip install --quiet wordfreq==3.1.1
 
       - name: Install Zig cross-compiler
@@ -76,6 +76,7 @@ jobs:
             "dist/KeySwitchFix-Setup.exe" \
             "dist/KeySwitchFix-Uninstall.exe" \
             "dist/KeySwitchFix-${VERSION}-Windows-x64.zip" \
+            "dist/KeySwitchFix-${VERSION}-Windows-x64.zip.sha256" \
             "dist/SHA256SUMS.txt" \
             --verify-tag \
             --title "KeySwitchFix ${VERSION}" \

@@ -2,7 +2,7 @@
 
 ## Writing memory
 
-Setting: **Learn my writing (kept on this PC)** on the dashboard, or
+Setting: **Learn my writing (kept only on this PC)** on the dashboard, or
 **Writing memory → Learn my writing** in the tray menu. Off by default.
 
 When it is on, KeySwitchFix learns two things from the way you type:
@@ -32,6 +32,13 @@ known word: it is never "corrected", it is repaired to when you mistype it
 (`سیاوس` → `سیاوش`), and it counts for layout repair (typed on the wrong
 layout, it is switched). Dictionary words you use often rank higher, so an
 ambiguous typo resolves toward the word you actually write.
+
+Both work for every language pair (4.0): German or Russian repairs and words
+are learned the same way. A known word counts only for the language whose
+alphabet it is written in, and the "real word" check for a repair uses that
+language's dictionary (the spelling dictionaries for English and Persian,
+the language pack otherwise). Words of a cased language are kept in lower
+case.
 
 ### What is stored, and where
 

@@ -1,7 +1,7 @@
 <div align="center">
   <img src="resources/app-icon.png" width="96" alt="KeySwitchFix icon">
   <h1>KeySwitchFix</h1>
-  <p>Lightweight, private, automatic Persian ↔ English keyboard layout repair and spelling correction for Windows.</p>
+  <p>Lightweight, private, automatic keyboard layout repair for Windows: Persian ↔ English, or any two languages you choose, with spelling correction for Persian and English.</p>
 
   [![CI](https://github.com/samaliyan/KeySwitchFix/actions/workflows/ci.yml/badge.svg)](https://github.com/samaliyan/KeySwitchFix/actions/workflows/ci.yml)
   [![Latest release](https://img.shields.io/github/v/release/samaliyan/KeySwitchFix)](https://github.com/samaliyan/KeySwitchFix/releases/latest)
@@ -14,8 +14,10 @@
 ## What it does
 
 KeySwitchFix notices when a word or sentence fragment was typed using the wrong
-Persian or English keyboard layout, replaces it, and switches the target
-application's layout automatically.
+keyboard layout, replaces it, and switches the target application's layout
+automatically. It works between English and Persian out of the box, and
+between any two of 16 languages you pick on the dashboard (see
+[Language pairs](#language-pairs)).
 
 | Physical keys | Wrong output | Corrected output |
 | --- | --- | --- |
@@ -25,6 +27,16 @@ application's layout automatically.
 | `nv clhkd ;i` | `nv clhkd ;i` | `در زمانی که` |
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
+
+Version 4.0 lets you choose the **two languages** you switch between: English,
+Persian, Arabic, Bulgarian, Dutch, French, German, Greek, Hebrew, Italian,
+Polish, Portuguese, Russian, Spanish, Turkish or Ukrainian, in any
+combination (`ghbdtn` → `привет` for English and Russian, `yeitung` →
+`zeitung` for English and German). The languages beyond English and Persian
+come as language packs built from wordfreq; anyone can build a pack for
+another language. It is also the result of a full independent review of the
+whole program. See the [changelog](CHANGELOG.md) and
+[Language packs](docs/LANGUAGE_PACKS.md).
 
 Version 3.2 is a reliability and design release: a new dashboard with four
 pages (Correction, Typing, Memory & words, Statistics) whose settings apply
@@ -74,6 +86,7 @@ inferred from the available keys or context alone.
 ## Highlights
 
 - Native Win32 C application with no .NET or external runtime
+- Any two languages: English and Persian built in, 14 more as language packs (Arabic, Bulgarian, Dutch, French, German, Greek, Hebrew, Italian, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian), and a tool to build packs for others
 - Offline spelling correction for Persian and English with Off / Conservative / Balanced / Aggressive levels
 - Half-space (`می‌پرسیدند`) and missing-space (`in the`, `در خانه`) repair
 - Learns your own vocabulary: a word typed twice is never "corrected"; an optional personal dictionary keeps undone words across restarts
@@ -85,7 +98,7 @@ inferred from the available keys or context alone.
 - Protects valid longer words with offline prefix dictionaries and an adaptive pause
 - Recognizes common two-key and three-key words using sentence context
 - Re-evaluates the current sentence from its beginning, so later evidence can repair earlier words
-- Auto, Prefer Persian, and Prefer English modes for ambiguous collisions
+- Auto mode for ambiguous collisions, or a fixed preference for either language of the pair
 - Recognizes common unshifted initial `آ` spellings such as `ایا`
 - Undo the latest correction with one plain **Backspace**; `Ctrl + Win + Backspace` remains a fallback
 - Treats Shift+Space as a Persian ZWNJ boundary, so `می‌خواهم` and `کتاب‌ها` are repaired and re-typed exactly
@@ -94,13 +107,35 @@ inferred from the available keys or context alone.
 - Digits that follow the language (`۱۲۳` in Persian, `123` in English), Persian `؟ ، ؛` after Persian words, Arabic `ي ك` typed as Persian `ی ک`
 - Capitalises English sentences and the lone `i`, without touching code editors
 - Snippets with date and time macros, including the Jalali calendar (`{jdate:long}` → `۲۱ شهریور ۱۴۰۵`)
-- `Ctrl + Win + X` cleans up selected text anywhere (letters, digits, punctuation), and puts your clipboard back
+- `Ctrl + Win + X` cleans up selected text anywhere (Persian letters, digits, punctuation, when Persian is one of your two languages), and puts your clipboard back
 - Statistics: fixes today and all time, keys, active days, time saved, most-corrected words
 - **Exclude this app** from the tray menu and `Ctrl + Win + K` to pause/resume
 - English-only dashboard (settings apply instantly), tray controls and a Statistics page with diagnostics
 - Per-user installer, desktop/Start Menu shortcuts, startup option, and clean uninstaller
 - No network access, telemetry, cloud processing, typed-text log, or background service (the opt-in writing memory keeps only word counts and repairs, on your PC)
 - Compact native executable with all word resources embedded
+
+## Language pairs
+
+Open the dashboard and choose the two languages on the **Correction** page
+(**Languages**). Both keyboards must be installed in Windows
+(**Settings → Time & language → Language & region**). The change applies at
+once; the status card names a keyboard that is missing.
+
+- English and Persian are built in. They also have spelling correction, the
+  IT vocabulary and the typing helpers (Persian digits and punctuation, Arabic
+  `ي ك` as Persian `ی ک`, English capitalisation). A helper whose language
+  is not in your pair is switched off (greyed); layout repair, Undo,
+  snippets and the writing memory work for every language.
+- The other languages are files in the `languages` folder next to
+  `KeySwitchFix.exe` (Setup installs them). **Language packs…** opens a
+  folder where you can add your own: a pack you copy there appears the next
+  time you open a list. [Language packs](docs/LANGUAGE_PACKS.md) explains
+  how to build one.
+- A keyboard counts for a language when Windows files it under that
+  language (a German keyboard under German) and it types that alphabet, or,
+  for a non-Latin alphabet, when it is filed under English and only one
+  language of the pair writes that alphabet.
 
 ## Install
 
@@ -116,6 +151,7 @@ The executable is currently unsigned, so Microsoft Defender SmartScreen may disp
 - KeySwitchFix starts enabled and can start automatically with Windows.
 - Click the tray icon or use the desktop shortcut to open the dashboard. Settings take effect as soon as you change them; there is no Save button.
 - The tray icon turns grey while correction is paused.
+- Choose your two languages on the **Correction** page (**Languages**).
 - Right-click the tray icon to pause correction, choose **Writing language**, toggle **Fix spelling mistakes**, exclude the app you last typed in, or exit.
 - Press `Ctrl + Win + K` to pause or resume correction from anywhere.
 - Press `Ctrl + Win + X` to clean up the selected text in any application.
@@ -127,7 +163,7 @@ If correction does not occur, open the dashboard and confirm:
 
 - The status card at the top says `Protection is active` (not `Not working: …`, which names the problem)
 - On the **Statistics** page, `Keyboard hook: running`
-- On the **Statistics** page, `Typing in <app> with the English/Persian layout` names the application you typed in
+- On the **Statistics** page, `Typing in <app> with the <language> layout` names the application you typed in and one of your two languages (`Unsupported` means the keyboard belongs to neither)
 - The app is not listed under **Excluded apps**, and is not a code editor, terminal or remote-desktop window (those are skipped on purpose)
 
 ## Privacy and security
@@ -148,7 +184,7 @@ Windows prevents lower-integrity processes from injecting input into elevated ap
 ## Requirements
 
 - Windows 10 or Windows 11, x64
-- English and Persian keyboard layouts installed in Windows
+- The keyboard layouts of your two languages installed in Windows (English and Persian by default)
 
 ## Build from source
 
@@ -159,7 +195,7 @@ npm install --prefix /tmp/keyswitchfix-zig @oven/zig-linux-x64@0.12.0-dev.1286
 ZIG=/tmp/keyswitchfix-zig/node_modules/@oven/zig-linux-x64/zig ./build-native.sh
 ```
 
-Required tools: Bash, GCC, Python 3 with `wordfreq==3.1.1` (for the spelling rank tables), npm, and `zip` for release packaging.
+Required tools: Bash, GCC, Python 3 with `wordfreq==3.1.1` (for the spelling rank tables and the language packs), npm, and `zip` and `unzip` for release packaging. wordfreq is needed to generate the rank tables once; after that, a build without wordfreq skips the language packs (English and Persian only).
 
 On Windows, `build-windows.ps1` performs the same steps natively (Python 3 and a
 Zig 0.12+ zip extracted to `C:\zig` are the only requirements):
@@ -173,6 +209,9 @@ The build performs:
 - strict C compilation with `-Wall -Wextra -Werror`
 - generation of the spelling rank tables from wordfreq when they are absent
 - positive and negative dictionary/mapping tests and the spelling test suite
+- language-pack tests, and a check that the pack builder (Python) and the app (C) normalise words identically
+- a simulation of the keyboard hook on Linux: words typed through the real hook code with simulated US, Persian, Russian, German, French (AZERTY) and Arabic keyboards, plus Setup's language-pack step
+- every test again under AddressSanitizer and UBSan
 - x64 Windows GUI PE validation
 - exact verification of embedded dictionaries and Setup payloads
 
@@ -184,7 +223,7 @@ See [Architecture](docs/ARCHITECTURE.md), the
 
 ## Uninstall
 
-Use **Windows Settings → Apps → Installed apps → KeySwitchFix → Uninstall**. The uninstaller removes the application, startup entry, Installed Apps registration, and KeySwitchFix shortcuts. You can choose whether to keep your settings and learned data (the default keeps them). A silent uninstall (`/silent`) keeps them too; add `/purge` to remove them.
+Use **Windows Settings → Apps → Installed apps → KeySwitchFix → Uninstall**. The uninstaller removes the application, startup entry, Installed Apps registration, and KeySwitchFix shortcuts. You can choose whether to keep your settings and learned data (the default keeps them); removing them also removes the language packs you added to `%LOCALAPPDATA%\KeySwitchFix\languages`. A silent uninstall (`/silent`) keeps them too; add `/purge` to remove them.
 
 ## License
 
@@ -196,4 +235,5 @@ The physical keys for Persian `مثل` also spell valid English `leg`; similarly
 `of` maps to Persian `خب`. Auto mode uses weighted document language and
 sentence position. A two-key collision is never guessed from frequency alone.
 If Persian should win even for an isolated collision, right-click the tray icon
-and choose **Writing language → Prefer Persian for collisions**.
+and choose **Writing language → Prefer Persian for collisions** (the menu names
+the two languages of your pair).

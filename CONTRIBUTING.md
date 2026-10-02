@@ -6,9 +6,11 @@ Thank you for improving KeySwitchFix. Small, focused changes with tests are pref
 
 Required tools:
 
-- Bash, GCC, and Python 3 for native core tests;
+- Bash, GCC, and Python 3 for native core tests and the hook simulation;
+- Python package `wordfreq==3.1.1` for the spelling rank tables and the
+  language packs (without it the build skips the packs);
 - Zig `0.12.0-dev.1286` with the x86_64 Windows GNU target;
-- `zip` for release packaging.
+- `zip` and `unzip` for release packaging.
 
 Build and validate:
 
@@ -42,6 +44,19 @@ PYTHONPATH=/tmp/keyswitchfix-wordfreq python3 tools/generate_blooms.py \
 
 The generator verifies the exact SHA-256 of the pinned English and Persian
 wordfreq data before changing a resource.
+
+## Adding a language
+
+Add the language to `LANGUAGES` in `tools/build_language_pack.py` (English
+and native name, Windows primary language id, flags); `build-native.sh`
+builds it and Setup installs it. A language wordfreq does not cover can be
+built from a word list (`--code`, `--word-list`). Check a new pair in
+`tests/app_sim.c` with a simulated keyboard of that language. See
+[Language packs](docs/LANGUAGE_PACKS.md).
+
+When `src/app.c` or `src/installer.c` starts using a Win32 function that
+`tests/win32sim/windows.h` does not declare yet, add its declaration there
+(the type check and the simulations in `build-native.sh` need it).
 
 ## Coding style
 

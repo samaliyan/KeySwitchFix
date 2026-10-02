@@ -2,6 +2,129 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [4.0.0] - 2026-10-02
+
+Any two languages, and a full independent review of the whole program.
+
+### Language pairs
+
+- Choose the two languages you switch between on the **Correction** page
+  (**Languages**): English and Persian are built in; Arabic, Bulgarian,
+  Dutch, French, German, Greek, Hebrew, Italian, Polish, Portuguese,
+  Russian, Spanish, Turkish and Ukrainian come as language packs that Setup
+  installs (`languages\*.kslang`). Choosing the language of the other list
+  swaps the two. The pair applies at once, and the status card names a
+  keyboard Windows lacks.
+- Everything that repairs layout works for every pair: live and end-of-word
+  repair, sentence repair, the layout switch, typing the keys for an
+  application that switches late, Undo with Backspace, snippets, the writing
+  memory (repairs and known words per alphabet). Spelling correction, the IT
+  vocabulary and the typing helpers stay with English and Persian; with a
+  pair that lacks them their settings are greyed out.
+- **Language packs…** opens `%LOCALAPPDATA%\KeySwitchFix\languages`; a pack
+  copied there appears the next time a list is opened.
+  `tools/build_language_pack.py` builds
+  packs from wordfreq or from any word list (see
+  [Language packs](docs/LANGUAGE_PACKS.md)). A missing or damaged pack is
+  replaced by English or Persian with a message, and the choice is kept.
+- **Writing language** names the languages of the pair (*Prefer German for
+  collisions*); swapping the two languages keeps the preferred one.
+  Settings: `[Languages] First=en, Second=fa`. A list changed with the arrow
+  keys applies when it closes or loses the focus.
+- Pairs whose keyboards differ more than English and Persian: a full stop
+  that is a letter in the other language (Russian `ю`) no longer turns
+  `it.` into a Russian word; a key that types two characters (Arabic
+  lam-alef) or a dead key makes the word it is in untouched instead of
+  splitting it (and an application that has not switched yet still gets
+  that key in the right layout); digits are never part of words (French
+  AZERTY).
+- With English and Persian (either order) behaviour is unchanged: checked
+  over 6.6 million engine decisions and 3,000 random mixed sentences typed
+  through the hook of 3.2.1 and 4.0.0 (a one-off comparison; the kept
+  scenarios are in `tests/app_sim.c`). Two deliberate differences: a
+  Cyrillic or Greek keyboard filed under English is no longer taken for an
+  English one, and the word after a dead key is left alone.
+- The word after a dead key (`^` `´` on German and French keyboards, `'` on
+  US-International) is left alone: the hook cannot see the composed letter.
+- Language packs are checked like any untrusted file: a damaged or hostile
+  pack is refused whole (bounds, sizes, a Bloom filter too small to read),
+  a pack must be named `<code>.kslang`, and a folder is not scanned past 256
+  files. Every pack a build produces is loaded with the program's own parser
+  before it ships.
+
+### Fixed (independent review)
+
+- Hook and timing: the clipboard clean-up checks the target again right
+  before Ctrl+C and Ctrl+V and refuses to run on a partial clipboard
+  snapshot; the layout request never waits past the hook's time budget;
+  modifier keys and the key counter are tracked the same way while an
+  operation runs; focus changes and clicks during an operation are applied
+  when it ends; the accessibility (password-field) query is limited to 200 ms
+  and retried once, and a field that becomes a password field is noticed.
+- Privacy: text typed in terminals and in protected fields is never shown on
+  the dashboard or counted by name, and Enter is never replayed in a
+  terminal; a password field that cannot be asked is treated as one; the
+  clean-up's clipboard data is hidden from clipboard history; the
+  injected-input marker is chosen at random at start-up; DLLs load from
+  System32 only; Notepad and `ping` are started from System32; more password
+  managers are excluded by default.
+- Files: settings report a failed save instead of "Setting saved."; the
+  status line says when settings cannot be saved; a start-up warning is no
+  longer overwritten by "Ready"; a copy run from Downloads no longer takes
+  over the Run entry of the installed copy; files saved as ANSI or UTF-16 BE
+  are read correctly; a writing-memory file that cannot be read is never
+  overwritten, a failed save is retried with back-off and reported once, and
+  "Forget everything" checks that the file is really gone; the personal
+  dictionary never glues a new word to the last line; a too-long excluded
+  list is cut at a whole name with a warning; the snippets migration keeps
+  working when the file cannot be rewritten.
+- Setup and uninstall: an upgrade writes the new files next to the old ones
+  and swaps them only when all are written, rolling back otherwise and
+  restarting the copy it closed; problems with settings, startup, shortcuts,
+  the Installed-apps entry or language packs are listed on the finish page;
+  paths are length-checked; the app gets five seconds to save before it is
+  stopped; `/purge` also removes backups and the temporary-folder fallback;
+  the deferred clean-up command stays under the RunOnce length limit.
+- Second review round: an Excel double-click that arrives while the program
+  is busy is still seen (a correction there no longer deletes the character
+  after the caret); a field whose state changes while a word is typed is
+  re-checked for a password after the word, not in the middle of it;
+  holding Ctrl+Win+X no longer cancels the clean-up; exiting between the
+  clean-up's copy and paste restores your clipboard; a locked
+  writing-memory file is no longer reloaded every two seconds, and a retry
+  that fails again keeps what the session learned; a failed
+  Start-with-Windows entry is reported as such; the clean-up hotkey's Persian
+  parts and the digit setting follow the language pair; uninstalling with
+  your data removed also removes the language packs you added (the question
+  says so).
+- Dashboard: owner-drawn buttons no longer act twice on a double-click; an
+  unsaved edit of the excluded-apps box is kept when an app is excluded from
+  the tray; the "Forget everything" box cannot be opened twice and comes to
+  the front when the dashboard is hidden; open-file actions report failures.
+- Build: the release runs every test under AddressSanitizer and UBSan
+  (`build-native.sh`); CI fails when `src/domain_words.inc` is out of date
+  and keeps no credentials; the release zip carries `README_FA.md` and the
+  language packs, `SHA256SUMS.txt` covers the packs, and the zip gets a
+  `.sha256` file next to it; the metadata and PE checks no longer rely on
+  `assert`; changelog links fixed; the license notices cover the packs.
+
+### Tests
+
+- `tests/app_sim.c`: the real keyboard hook (`src/app.c`) runs on Linux
+  against `tests/win32sim`, with simulated US, Persian, Russian, German,
+  French (AZERTY) and Arabic keyboards, applications that switch layouts
+  late or never, and language packs: English/Persian in both orders,
+  English/Russian, German/English, English/Arabic, English/French, missing
+  and renamed packs, packs added while running, dead keys, and the
+  dashboard's two language lists (mouse and keyboard, swaps).
+- `tests/pack_check.c`: every pack a build makes is loaded with the app's
+  parser.
+- `tests/installer_sim.c`: Setup's language-pack step in an in-memory folder
+  (unsafe names, damaged bundles, upgrades, write failures, uninstall).
+- `tests/language_pack_tests.c`: pack parsing under truncation and
+  corruption, and Russian/German decisions; `tests/verify_language_rules.py`:
+  the pack builder and the app normalise every character alike.
+
 ## [3.2.1] - 2026-09-28
 
 Fixes from an outside code review.
@@ -584,6 +707,14 @@ A reliability and design release, the result of three rounds of strict review.
 - Native x64 Win32 application, per-user Setup, standalone Uninstaller, tray UI, diagnostics, and offline Bloom dictionaries.
 - Physical scan-code detection for Persian and English layout mismatches.
 
+[4.0.0]: https://github.com/samaliyan/KeySwitchFix/compare/v3.2.1...v4.0.0
+[3.2.1]: https://github.com/samaliyan/KeySwitchFix/compare/v3.2.0...v3.2.1
+[3.2.0]: https://github.com/samaliyan/KeySwitchFix/compare/v3.1.0...v3.2.0
+[3.1.0]: https://github.com/samaliyan/KeySwitchFix/compare/v3.0.1...v3.1.0
+[3.0.1]: https://github.com/samaliyan/KeySwitchFix/compare/v3.0.0...v3.0.1
+[3.0.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.9.0...v3.0.0
+[2.9.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.8.0...v2.9.0
+[2.8.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.7.0...v2.8.0
 [2.7.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.4.0...v2.5.0
@@ -592,7 +723,7 @@ A reliability and design release, the result of three rounds of strict review.
 [2.3.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/samaliyan/KeySwitchFix/compare/v2.1.0...v2.1.1
-[2.1.0]: https://github.com/samaliyan/KeySwitchFix/releases/tag/v2.1.0
-[2.0.2]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.2...v2.1.0
-[2.0.1]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.1...v2.0.2
+[2.1.0]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.2...v2.1.0
+[2.0.2]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/samaliyan/KeySwitchFix/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/samaliyan/KeySwitchFix/releases/tag/v2.0.0

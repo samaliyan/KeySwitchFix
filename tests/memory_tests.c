@@ -55,15 +55,19 @@ static int tokens_for(const char *keys, KS_TOKEN *tokens) {
 /* The app's hooks, reduced to what the tests need. */
 static KS_WRITING_MEMORY g_memory;
 
-static int extra_contains(const void *context, KS_LANGUAGE language, const wchar_t *word) {
+static KS_LANGUAGE slot_language(KS_SLOT slot) {
+    return slot == KS_SLOT_A ? KS_LANG_ENGLISH : slot == KS_SLOT_B ? KS_LANG_PERSIAN : KS_LANG_OTHER;
+}
+
+static int extra_contains(const void *context, KS_SLOT slot, const wchar_t *word) {
     (void)context;
-    return ks_domain_contains(KS_DOMAIN_IT, language, word) ||
+    return ks_domain_contains(KS_DOMAIN_IT, slot_language(slot), word) ||
            ks_memory_word_count(&g_memory, word) >= KS_MEMORY_KNOWN_COUNT;
 }
 
-static int extra_prefix(const void *context, KS_LANGUAGE language, const wchar_t *prefix) {
+static int extra_prefix(const void *context, KS_SLOT slot, const wchar_t *prefix) {
     (void)context;
-    return ks_domain_has_prefix(KS_DOMAIN_IT, language, prefix);
+    return ks_domain_has_prefix(KS_DOMAIN_IT, slot_language(slot), prefix);
 }
 
 /* Same composition as app.c's spell_rank_adjust. */
@@ -279,45 +283,45 @@ int main(void) {
         ks_bloom_init(&enp, enp_data, enp_size);
         ks_bloom_init(&fap, fap_data, fap_size);
         memset(&lexicons, 0, sizeof(lexicons));
-        lexicons.english_words = &en;
-        lexicons.persian_words = &fa;
-        lexicons.english_common = &enc;
-        lexicons.persian_common = &fac;
-        lexicons.english_prefixes = &enp;
-        lexicons.persian_prefixes = &fap;
+        lexicons.words[KS_SLOT_A] = &en;
+        lexicons.words[KS_SLOT_B] = &fa;
+        lexicons.common[KS_SLOT_A] = &enc;
+        lexicons.common[KS_SLOT_B] = &fac;
+        lexicons.prefixes[KS_SLOT_A] = &enp;
+        lexicons.prefixes[KS_SLOT_B] = &fap;
         ks_memory_reset(&g_memory);
 
         count = tokens_for("kubectl", tokens);
-        ks_classify_word(tokens, count, &lexicons, &english_known, &persian_known, NULL, NULL);
+        { int known[3], frequent[3]; ks_classify_word(tokens, count, &lexicons, known, frequent); english_known = known[KS_SLOT_A]; persian_known = known[KS_SLOT_B]; (void)persian_known; }
         CHECK(!english_known, "kubectl is not in the base dictionary");
-        CHECK(ks_evaluate_contextual(tokens, count, KS_LANG_PERSIAN, 1, KS_LANG_OTHER, 0, 0,
+        CHECK(ks_evaluate_contextual(tokens, count, KS_SLOT_B, 1, KS_SLOT_NONE, 0, 0,
                                      KS_PHASE_BOUNDARY, &lexicons, &decision) == KS_LIVE_NONE,
               "without the pack, kubectl typed on the Persian layout stays gibberish");
         extra.contains = extra_contains;
         extra.has_prefix = extra_prefix;
         extra.context = NULL;
         lexicons.extra = &extra;
-        ks_classify_word(tokens, count, &lexicons, &english_known, &persian_known, NULL, NULL);
+        { int known[3], frequent[3]; ks_classify_word(tokens, count, &lexicons, known, frequent); english_known = known[KS_SLOT_A]; persian_known = known[KS_SLOT_B]; (void)persian_known; }
         CHECK(english_known, "with the pack, kubectl is an English word");
-        CHECK(ks_evaluate_contextual(tokens, count, KS_LANG_PERSIAN, 1, KS_LANG_OTHER, 0, 0,
+        CHECK(ks_evaluate_contextual(tokens, count, KS_SLOT_B, 1, KS_SLOT_NONE, 0, 0,
                                      KS_PHASE_BOUNDARY, &lexicons, &decision) == KS_LIVE_CORRECT_NOW &&
               wcscmp(decision.replacement, L"kubectl") == 0,
               "kubectl typed on the Persian layout is repaired to English");
         count = tokens_for("tablespace", tokens);
-        CHECK(ks_evaluate_contextual(tokens, count, KS_LANG_ENGLISH, 1, KS_LANG_OTHER, 0, 0,
+        CHECK(ks_evaluate_contextual(tokens, count, KS_SLOT_A, 1, KS_SLOT_NONE, 0, 0,
                                      KS_PHASE_BOUNDARY, &lexicons, &decision) == KS_LIVE_NONE,
               "tablespace on the English layout is left alone");
         for (i = 3; i < 7; ++i)
             CHECK(ks_evaluate_contextual(tokens_for("kubernetes", tokens) ? tokens : tokens, i,
-                                         KS_LANG_ENGLISH, 1, KS_LANG_PERSIAN, 4, 0,
+                                         KS_SLOT_A, 1, KS_SLOT_B, 4, 0,
                                          KS_PHASE_LIVE, &lexicons, &decision) != KS_LIVE_CORRECT_NOW,
                   "no prefix of kubernetes is switched to Persian while typing");
         /* A word from the user's memory counts once it is frequent. */
         count = tokens_for("siavash", tokens);
-        ks_classify_word(tokens, count, &lexicons, &english_known, &persian_known, NULL, NULL);
+        { int known[3], frequent[3]; ks_classify_word(tokens, count, &lexicons, known, frequent); english_known = known[KS_SLOT_A]; persian_known = known[KS_SLOT_B]; (void)persian_known; }
         CHECK(!english_known, "a name is unknown at first");
         for (i = 0; i < KS_MEMORY_KNOWN_COUNT; ++i) ks_memory_observe_word(&g_memory, L"siavash");
-        ks_classify_word(tokens, count, &lexicons, &english_known, &persian_known, NULL, NULL);
+        { int known[3], frequent[3]; ks_classify_word(tokens, count, &lexicons, known, frequent); english_known = known[KS_SLOT_A]; persian_known = known[KS_SLOT_B]; (void)persian_known; }
         CHECK(english_known, "a name typed three times is known");
     }
 

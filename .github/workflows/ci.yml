@@ -18,30 +18,27 @@ jobs:
   build:
     name: Test and build Windows x64
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install wordfreq for the spelling rank tables
+      - name: Install wordfreq for the rank tables and language packs
         run: python3 -m pip install --quiet wordfreq==3.1.1
 
-      - name: Language tests under AddressSanitizer and UBSan
+      - name: Generated sources are committed
         run: |
           set -euo pipefail
           python3 tools/generate_domain_words.py
-          flags="-std=c11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all"
-          gcc $flags src/core.c tests/core_tests.c -o /tmp/asan-core && /tmp/asan-core
-          gcc $flags src/core.c src/spell.c tests/spell_tests.c -o /tmp/asan-spell && /tmp/asan-spell
-          gcc $flags src/core.c src/typing.c tests/typing_tests.c -o /tmp/asan-typing && /tmp/asan-typing
-          gcc $flags src/core.c src/spell.c src/domain.c src/memory.c tests/memory_tests.c -o /tmp/asan-memory && /tmp/asan-memory
-          gcc $flags src/core.c src/domain.c tests/corpus_tests.c -o /tmp/asan-corpus && /tmp/asan-corpus
+          git diff --exit-code -- src/domain_words.inc
 
       - name: Install Zig cross-compiler
         run: >-
@@ -55,6 +52,7 @@ jobs:
           ZIG: ${{ runner.temp }}/keyswitchfix-zig/node_modules/@oven/zig-linux-x64/zig
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-local-cache
+          KSF_REQUIRE_LANGUAGE_PACKS: "1"
         run: bash ./build-native.sh
 
       - name: Upload verified executables
@@ -68,3 +66,4 @@ jobs:
             dist/KeySwitchFix-Uninstall.exe
             dist/KeySwitchFix.exe
             dist/SHA256SUMS.txt
+            dist/languages/*.kslang

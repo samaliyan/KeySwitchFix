@@ -22,5 +22,5 @@ You should receive an initial acknowledgement within seven days. A validated iss
 
 - KeySwitchFix is not a credential manager and does not guarantee detection of every custom browser or framework password field.
 - Windows UIPI prevents a normal process from editing an elevated target. This is expected operating-system behavior.
-- Release executables are currently unsigned. Verify SHA-256 checksums published with each release.
+- Release executables are currently unsigned. Verify SHA-256 checksums published with each release: the zip has its own `.sha256` file, and `SHA256SUMS.txt` (also inside the zip) covers the three programs and the language packs, so check the downloaded files with `sha256sum -c --ignore-missing SHA256SUMS.txt`, or everything inside the unzipped folder with `sha256sum -c SHA256SUMS.txt`.
 

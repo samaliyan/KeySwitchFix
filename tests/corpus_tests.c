@@ -17,14 +17,19 @@
 static KS_BLOOM g_blooms[10];
 static KS_LEXICONS g_lexicons;
 
-static int extra_contains(const void *context, KS_LANGUAGE language, const wchar_t *word) {
-    (void)context;
-    return ks_domain_contains(KS_DOMAIN_IT, language, word);
+/* Slot A is English and slot B Persian here (the default pair). */
+static KS_LANGUAGE slot_language(KS_SLOT slot) {
+    return slot == KS_SLOT_A ? KS_LANG_ENGLISH : slot == KS_SLOT_B ? KS_LANG_PERSIAN : KS_LANG_OTHER;
 }
 
-static int extra_prefix(const void *context, KS_LANGUAGE language, const wchar_t *prefix) {
+static int extra_contains(const void *context, KS_SLOT slot, const wchar_t *word) {
     (void)context;
-    return ks_domain_has_prefix(KS_DOMAIN_IT, language, prefix);
+    return ks_domain_contains(KS_DOMAIN_IT, slot_language(slot), word);
+}
+
+static int extra_prefix(const void *context, KS_SLOT slot, const wchar_t *prefix) {
+    (void)context;
+    return ks_domain_has_prefix(KS_DOMAIN_IT, slot_language(slot), prefix);
 }
 
 static const KS_EXTRA_WORDS g_extra = {extra_contains, extra_prefix, NULL};
@@ -79,7 +84,7 @@ static uint32_t persian_scan(wchar_t c, int *shift) {
     KS_TOKEN token;
     for (scan = 1; scan < 0x40; ++scan) {
         for (*shift = 0; *shift < 2; ++*shift)
-            if (ks_map_scancode(scan, *shift, 0, &token) && token.persian == c) return scan;
+            if (ks_map_scancode(scan, *shift, 0, &token) && token.b == c) return scan;
     }
     *shift = 0;
     return 0;
@@ -101,8 +106,8 @@ static int tokens_for(const wchar_t *word, int persian, KS_TOKEN *tokens) {
 
 /* 1 when typing the word key by key (with a pause after every key, then
    Space) makes the engine replace it. */
-static int would_rewrite(const KS_TOKEN *tokens, int count, KS_LANGUAGE layout,
-                         KS_LANGUAGE context, int strength) {
+static int would_rewrite(const KS_TOKEN *tokens, int count, KS_SLOT layout,
+                         KS_SLOT context, int strength) {
     KS_DECISION decision;
     int k;
     for (k = 1; k <= count; ++k) {
@@ -121,7 +126,7 @@ typedef struct RUN {
     const char *file;
     int persian_words;     /* the list holds Persian words */
     int wrong_layout;      /* typed on the other layout (recall) */
-    KS_LANGUAGE context;
+    KS_SLOT context;
     int strength;
     double limit;          /* max false-positive % or min recall % */
     const char *label;
@@ -132,24 +137,24 @@ int main(void) {
         "en", "fa", "en-common", "fa-common", "en-frequent", "fa-frequent",
         "en-prefix", "fa-prefix", "en-common-prefix", "fa-common-prefix" };
     static const RUN runs[] = {
-        {"tests/corpus/english-common.txt", 0, 0, KS_LANG_OTHER, 0, 0.0, "English, no context"},
-        {"tests/corpus/english-common.txt", 0, 0, KS_LANG_PERSIAN, 4, 1.5, "English inside Persian text"},
-        {"tests/corpus/english-punctuated.txt", 0, 0, KS_LANG_OTHER, 0, 0.1, "English with quotes/commas"},
-        {"tests/corpus/english-tech.txt", 0, 0, KS_LANG_OTHER, 0, 1.0, "English tech words"},
-        {"tests/corpus/persian-common.txt", 1, 0, KS_LANG_OTHER, 0, 0.0, "Persian, no context"},
-        {"tests/corpus/persian-common.txt", 1, 0, KS_LANG_ENGLISH, 4, 2.5, "Persian inside English text"},
+        {"tests/corpus/english-common.txt", 0, 0, KS_SLOT_NONE, 0, 0.0, "English, no context"},
+        {"tests/corpus/english-common.txt", 0, 0, KS_SLOT_B, 4, 1.5, "English inside Persian text"},
+        {"tests/corpus/english-punctuated.txt", 0, 0, KS_SLOT_NONE, 0, 0.1, "English with quotes/commas"},
+        {"tests/corpus/english-tech.txt", 0, 0, KS_SLOT_NONE, 0, 1.0, "English tech words"},
+        {"tests/corpus/persian-common.txt", 1, 0, KS_SLOT_NONE, 0, 0.0, "Persian, no context"},
+        {"tests/corpus/persian-common.txt", 1, 0, KS_SLOT_A, 4, 2.5, "Persian inside English text"},
         /* One miss: vhd, whose Persian reading رای is a frequent word. */
-        {"tests/corpus/english-abbrev.txt", 0, 0, KS_LANG_ENGLISH, 3, 1.0, "Abbreviations in English text"},
+        {"tests/corpus/english-abbrev.txt", 0, 0, KS_SLOT_A, 3, 1.0, "Abbreviations in English text"},
         /* Ratchet: the misses are two-key tokens (fi, il, mv) whose Persian
            readings are core words (به, هم, پر); with no context those are
            taken as Persian on purpose. */
-        {"tests/corpus/english-abbrev.txt", 0, 0, KS_LANG_OTHER, 0, 16.0, "Abbreviations, no context"},
-        {"tests/corpus/english-common.txt", 0, 1, KS_LANG_OTHER, 0, 98.5, "English typed on the Persian layout"},
-        {"tests/corpus/english-common.txt", 0, 1, KS_LANG_PERSIAN, 3, 97.0, "English on the Persian layout, Persian text"},
-        {"tests/corpus/english-tech.txt", 0, 1, KS_LANG_PERSIAN, 4, 95.0, "Tech words on the Persian layout, Persian text"},
-        {"tests/corpus/persian-common.txt", 1, 1, KS_LANG_ENGLISH, 3, 92.0, "Persian on the English layout, English text"},
-        {"tests/corpus/persian-common.txt", 1, 1, KS_LANG_OTHER, 0, 98.5, "Persian typed on the English layout"},
-        {"tests/corpus/english-tech.txt", 0, 1, KS_LANG_OTHER, 0, 95.0, "Tech words typed on the Persian layout"},
+        {"tests/corpus/english-abbrev.txt", 0, 0, KS_SLOT_NONE, 0, 16.0, "Abbreviations, no context"},
+        {"tests/corpus/english-common.txt", 0, 1, KS_SLOT_NONE, 0, 98.5, "English typed on the Persian layout"},
+        {"tests/corpus/english-common.txt", 0, 1, KS_SLOT_B, 3, 97.0, "English on the Persian layout, Persian text"},
+        {"tests/corpus/english-tech.txt", 0, 1, KS_SLOT_B, 4, 95.0, "Tech words on the Persian layout, Persian text"},
+        {"tests/corpus/persian-common.txt", 1, 1, KS_SLOT_A, 3, 92.0, "Persian on the English layout, English text"},
+        {"tests/corpus/persian-common.txt", 1, 1, KS_SLOT_NONE, 0, 98.5, "Persian typed on the English layout"},
+        {"tests/corpus/english-tech.txt", 0, 1, KS_SLOT_NONE, 0, 95.0, "Tech words typed on the Persian layout"},
     };
     size_t i;
     int failed = 0;
@@ -166,16 +171,16 @@ int main(void) {
             return 1;
         }
     }
-    g_lexicons.english_words = &g_blooms[0];
-    g_lexicons.persian_words = &g_blooms[1];
-    g_lexicons.english_common = &g_blooms[2];
-    g_lexicons.persian_common = &g_blooms[3];
-    g_lexicons.english_frequent = &g_blooms[4];
-    g_lexicons.persian_frequent = &g_blooms[5];
-    g_lexicons.english_prefixes = &g_blooms[6];
-    g_lexicons.persian_prefixes = &g_blooms[7];
-    g_lexicons.english_common_prefixes = &g_blooms[8];
-    g_lexicons.persian_common_prefixes = &g_blooms[9];
+    g_lexicons.words[KS_SLOT_A] = &g_blooms[0];
+    g_lexicons.words[KS_SLOT_B] = &g_blooms[1];
+    g_lexicons.common[KS_SLOT_A] = &g_blooms[2];
+    g_lexicons.common[KS_SLOT_B] = &g_blooms[3];
+    g_lexicons.frequent[KS_SLOT_A] = &g_blooms[4];
+    g_lexicons.frequent[KS_SLOT_B] = &g_blooms[5];
+    g_lexicons.prefixes[KS_SLOT_A] = &g_blooms[6];
+    g_lexicons.prefixes[KS_SLOT_B] = &g_blooms[7];
+    g_lexicons.common_prefixes[KS_SLOT_A] = &g_blooms[8];
+    g_lexicons.common_prefixes[KS_SLOT_B] = &g_blooms[9];
     g_lexicons.extra = &g_extra;
 
     for (i = 0; i < sizeof(runs) / sizeof(runs[0]); ++i) {
@@ -193,13 +198,13 @@ int main(void) {
             wchar_t word[128];
             KS_TOKEN tokens[KS_MAX_WORD];
             int count;
-            KS_LANGUAGE layout;
+            KS_SLOT layout;
             line[strcspn(line, "\r\n")] = 0;
             if (!line[0] || line[0] == '#' || mbstowcs(word, line, 128) == (size_t)-1) continue;
             count = tokens_for(word, run->persian_words, tokens);
             if (count < 1) continue;
             /* Typed on the intended layout, or on the other one. */
-            layout = (run->persian_words != run->wrong_layout) ? KS_LANG_PERSIAN : KS_LANG_ENGLISH;
+            layout = (run->persian_words != run->wrong_layout) ? KS_SLOT_B : KS_SLOT_A;
             ++total;
             if (would_rewrite(tokens, count, layout, run->context, run->strength)) ++rewritten;
         }

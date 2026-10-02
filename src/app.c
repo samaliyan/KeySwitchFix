@@ -13,6 +13,8 @@
 #include "typing.h"
 #include "domain.h"
 #include "memory.h"
+#include "defaults.h"
+#include "paths.h"
 #include "../resources/resource.h"
 
 #ifndef MOD_NOREPEAT
@@ -20,7 +22,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"3.2.1"
+#define APP_VERSION L"4.0.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -30,6 +32,8 @@
 /* Posted from the hook: work that must not run inside the hook callback. */
 #define WM_APP_SAVE_STATS (WM_APP + 3)
 #define WM_APP_FOCUS_QUERY (WM_APP + 4)
+/* Load the language pair chosen in the settings (never inside a hook call). */
+#define WM_APP_LANGUAGES (WM_APP + 5)
 
 #define ID_TRAY 1
 #define ID_TIMER_STATUS 10
@@ -44,6 +48,8 @@
 #define ID_TIMER_SNIPPETS 19
 #define ID_TIMER_TRAY_RETRY 20
 #define ID_TIMER_FOCUS_QUERY 21
+#define ID_TIMER_STATE_QUERY 22
+#define ID_TIMER_LANGUAGES 23
 
 /*
  * Windows silently removes a low-level hook whose callback exceeds the
@@ -73,6 +79,9 @@
 #define IDC_STATS_LABEL 119
 #define IDC_LEARN_WRITING 140
 #define IDC_VOCAB_IT 141
+#define IDC_LANGUAGE_FIRST 142
+#define IDC_LANGUAGE_SECOND 143
+#define IDC_LANGUAGE_PACKS 144
 #define IDC_TILE_VALUE 120      /* 120..123 */
 #define IDC_TILE_CAPTION 130    /* 130..133 */
 #define UI_TILE_COUNT 4
@@ -99,7 +108,10 @@
 #define IDM_FORGET_MEMORY 216
 #define IDM_VOCAB_IT 217
 
-#define INPUT_MARKER ((ULONG_PTR)0x4B534632u)
+/* Marks the input KeySwitchFix injects. Chosen at start-up, so another
+   program cannot make its keys look like ours. */
+static ULONG_PTR g_input_marker = (ULONG_PTR)0x4B534632u;
+#define INPUT_MARKER g_input_marker
 #define KS_MAX_PHRASE_CHARS KS_MAX_SEQUENCE_CHARS
 
 typedef struct SETTINGS {
@@ -126,6 +138,11 @@ typedef struct SETTINGS {
        and the IT & computing vocabulary pack. */
     int learn_writing;
     int vocab_it;
+    /* 4.0: the two languages the user switches between (ISO codes, slot A
+       and slot B). English and Persian are built in; others come from
+       language packs. */
+    wchar_t language_first[8];
+    wchar_t language_second[8];
     wchar_t excluded[512];
 } SETTINGS;
 
@@ -135,7 +152,7 @@ typedef struct UNDO_RECORD {
     /* The control that had keyboard focus: an undo is only ever typed back
        into the same field (after Tab the caret is in another one). */
     HWND focus;
-    KS_LANGUAGE source_language;
+    KS_SLOT source_language;
     UINT delimiter;
     int delimiter_zwnj;
     /* 1 when this was a spelling fix; undoing it teaches the ignore list. */
@@ -150,7 +167,7 @@ typedef struct UNDO_RECORD {
 typedef struct WORD_HISTORY {
     KS_TOKEN tokens[KS_MAX_WORD];
     int count;
-    KS_LANGUAGE visible_language;
+    KS_SLOT visible_language;
     /* The character that followed this word on screen: Space or ZWNJ. */
     wchar_t separator;
 } WORD_HISTORY;
@@ -199,6 +216,10 @@ static KS_WRITING_MEMORY g_memory;
 static int g_memory_active;
 static wchar_t g_memory_path[MAX_PATH];
 static DWORD g_memory_saved_at;
+static int g_memory_save_failed;   /* reported once until a save succeeds */
+static int g_memory_read_only;     /* the file could not be read: never overwrite it */
+static DWORD g_memory_read_only_at;
+static int g_memory_read_only_reported;
 /* Last-write time of writing-memory.txt as this process last read or wrote
    it: a newer file means the user edited it, and the file wins. */
 static FILETIME g_memory_file_time;
@@ -243,6 +264,7 @@ static FOCUS_FACTS g_facts;
 static unsigned long g_settings_generation = 1;
 /* Focus changes reported by the WinEvent hook. */
 static HWINEVENTHOOK g_focus_event_hook;
+static HWINEVENTHOOK g_state_event_hook;
 static unsigned long g_focus_serial;
 static HWND g_focus_event_window;
 static LONG g_focus_event_object;
@@ -255,12 +277,15 @@ static int g_focus_event_protected;
 static int g_engine_depth;
 static int g_engine_interrupted;
 static int g_com_ready;           /* COM initialised on the UI thread (MSAA queries) */
-static int g_word_skip_untrusted;   /* the current word is skipped only because it is untrusted */
-static DWORD g_hook_entered_at;
+/* The current word is skipped only because it is untrusted (or follows a
+   letter key the pair cannot read): a pending layout switch still types
+   its keys. */
+static int g_word_skip_untrusted;
+static DWORD g_hook_entered_at;   /* tick when the hook call being handled began */
 /* How long the hook may work on one key before Windows may already have
    passed the key on: half of LowLevelHooksTimeout when that is set lower
    than usual, never more than 150 ms. */
-static DWORD g_hook_budget_ms = 150u;   /* tick when the hook call being handled began */
+static DWORD g_hook_budget_ms = 150u;
 /* Excel: 1 while the active cell's content is exactly what was typed since
    the cell was entered (Enter, Tab, arrows, a single click), so the rest of
    an AutoComplete suggestion may sit selected after the caret. F2 or a
@@ -275,7 +300,7 @@ static int g_key_swallowed;
    it can reopen it for editing. */
 static KS_TOKEN g_prev_word[KS_MAX_WORD];
 static int g_prev_word_count;
-static KS_LANGUAGE g_prev_word_language;
+static KS_SLOT g_prev_word_language;
 static HWND g_prev_word_window;
 static unsigned long g_prev_word_serial;
 static DWORD g_prev_word_at;
@@ -286,7 +311,7 @@ static HWND g_capitalize_window;
 static int g_last_key_was_digit;
 /* Language of the last finished word, for shaping the punctuation typed
    after it. */
-static KS_LANGUAGE g_last_word_language;
+static KS_SLOT g_last_word_language;
 static HWND g_last_word_window;
 static DWORD g_last_word_at;
 /* 1 while the key before the current word was Space/Enter/Tab: the word
@@ -309,6 +334,7 @@ typedef struct CLIPBOARD_SNAPSHOT {
     SIZE_T size[CLIPBOARD_SNAPSHOT_MAX];
     int count;
     int valid;
+    int partial;   /* something could not be copied: never restore half of it */
 } CLIPBOARD_SNAPSHOT;
 static CLIPBOARD_SNAPSHOT g_cleanup_saved_clipboard;
 static int g_dpi = 96;
@@ -324,8 +350,41 @@ static int g_control_down;
 static int g_alt_down;
 static int g_windows_down;
 static UINT g_taskbar_created_message;
-static HKL g_last_english_layout;
-static HKL g_last_persian_layout;
+/*
+ * The language pair. Slot A is the first language, slot B the second. Each
+ * slot has a profile (how its words are looked up), dictionaries (built in
+ * for English and Persian, from a language pack otherwise) and the keyboard
+ * layout that last typed it.
+ */
+#define MAX_LANGUAGE_CHOICES 48
+typedef struct LANGUAGE_CHOICE {
+    wchar_t code[8];
+    wchar_t english_name[48];
+    wchar_t native_name[48];
+    wchar_t path[MAX_PATH];     /* the pack file; empty for English and Persian */
+} LANGUAGE_CHOICE;
+static LANGUAGE_CHOICE g_language_choices[MAX_LANGUAGE_CHOICES];
+static int g_language_choice_count;
+
+/* Writing systems, for matching a keyboard to a language pack. */
+typedef enum KS_SCRIPT {
+    SCRIPT_NONE = 0, SCRIPT_LATIN, SCRIPT_GREEK, SCRIPT_CYRILLIC, SCRIPT_ARMENIAN,
+    SCRIPT_HEBREW, SCRIPT_ARABIC, SCRIPT_GEORGIAN, SCRIPT_THAI, SCRIPT_DEVANAGARI
+} KS_SCRIPT;
+
+typedef struct SLOT_STATE {
+    KS_LANG_PACK pack;          /* the loaded language pack (not for en / fa) */
+    unsigned char *pack_data;   /* its file, which the pack's Blooms point into */
+    const KS_LANG_PROFILE *profile;
+    KS_SCRIPT script;
+    wchar_t code[8];
+    wchar_t name[48];           /* English name, for messages */
+    HKL last_layout;            /* the layout that last typed this language */
+} SLOT_STATE;
+static SLOT_STATE g_slots[3];
+static wchar_t g_language_notice[400];   /* why the chosen pair is not what is loaded */
+/* Bumped whenever the pair changes: every per-layout cache is rebuilt. */
+static unsigned long g_pair_generation = 1;
 /*
  * The window that really receives the user's keys. GetForegroundWindow() is
  * not always it: a Store/UWP application (the Windows 11 Notepad, Settings,
@@ -344,9 +403,9 @@ static KS_INPUT_TARGET g_target;
 
 /* The most recent layout switch this application asked for. */
 static HWND g_layout_request_window;
-static KS_LANGUAGE g_layout_request_language;
+static KS_SLOT g_layout_request_language;
 /* The layout that was active when the switch was requested. */
-static KS_LANGUAGE g_layout_request_from;
+static KS_SLOT g_layout_request_from;
 static DWORD g_layout_request_at;
 /* Set once per request when the target is seen ignoring it; drives the
    diagnostics and the self-translation fallback. */
@@ -383,14 +442,14 @@ static KS_TOKEN g_word[KS_MAX_WORD];
 /* The layout that actually rendered each key of the current word. Normally
    all equal g_word_language; they differ when a layout switch we requested
    landed in the middle of a word (see mixed-word repair). */
-static KS_LANGUAGE g_word_visible[KS_MAX_WORD];
+static KS_SLOT g_word_visible[KS_MAX_WORD];
 static int g_word_mixed;
 static int g_word_count;
 static int g_overflow_count;
 static int g_has_context;
 static int g_skip_word;
 static HWND g_word_window;
-static KS_LANGUAGE g_word_language;
+static KS_SLOT g_word_language;
 /* Key-downs the hook swallowed: their key-ups must be swallowed too. One
    slot per virtual key, because fast typing overlaps key-downs and key-ups. */
 static DWORD g_suppressed_at[256];
@@ -436,15 +495,29 @@ static void safe_copy(wchar_t *destination, size_t capacity, const wchar_t *sour
     destination[capacity - 1] = 0;
 }
 
+static unsigned g_activity_count;   /* how many activity messages so far */
+
 static void set_activity(const wchar_t *text) {
+    ++g_activity_count;
     safe_copy(g_last_activity, sizeof(g_last_activity) / sizeof(g_last_activity[0]), text);
     if (g_window) PostMessageW(g_window, WM_APP_DIAGNOSTIC, 0, 0);
+}
+
+/* Text typed in a terminal (a password prompt cannot be detected there)
+   or in a protected field is never shown or counted by name. Uses the
+   facts already cached for the field, so it never waits on another app. */
+static int typed_text_private(void) {
+    return g_facts.focus && (g_facts.developer_tool || g_facts.protected_field);
 }
 
 static void set_activity_pair(const wchar_t *prefix, const wchar_t *from, const wchar_t *to) {
     wchar_t buffer[384];
     wchar_t from_preview[97];
     wchar_t to_preview[97];
+    if (typed_text_private()) {
+        set_activity(prefix);
+        return;
+    }
     safe_copy(from_preview, sizeof(from_preview) / sizeof(from_preview[0]), from);
     safe_copy(to_preview, sizeof(to_preview) / sizeof(to_preview[0]), to);
     swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%ls: %ls  ->  %ls",
@@ -479,24 +552,7 @@ static int load_rank_resource(int identifier, KS_RANK_TABLE *table) {
     return data && ks_rank_table_init(table, data, (size_t)size);
 }
 
-/* dir + separator + name into out (capacity in characters); 0 when it
-   does not fit, and then out is empty rather than a truncated path. */
-static int path_join(wchar_t *out, size_t capacity, const wchar_t *dir, const wchar_t *separator,
-                     const wchar_t *name) {
-    size_t a = wcslen(dir), b = wcslen(separator), c = wcslen(name);
-    if (!capacity) return 0;
-    if (a + b + c + 1 > capacity) {
-        out[0] = 0;
-        return 0;
-    }
-    memmove(out, dir, a * sizeof(wchar_t));
-    memcpy(out + a, separator, b * sizeof(wchar_t));
-    memcpy(out + a + b, name, (c + 1) * sizeof(wchar_t));
-    return 1;
-}
-
-/* The longest file name derived from the data folder, plus ".tmp". */
-#define DATA_NAME_ROOM (sizeof("\\personal-dictionary.txt.bak.tmp") - 1)
+#define path_join ks_path_join
 
 static int g_paths_ok;
 
@@ -504,17 +560,7 @@ static int g_paths_ok;
    path is too long for every file name below to fit (a very long user name
    or a redirected profile). Without either, nothing is written. */
 static void build_paths(void) {
-    wchar_t base[MAX_PATH];
-    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
-    size_t capacity = sizeof(g_data_directory) / sizeof(g_data_directory[0]);
-    int ok = length > 0 && length < MAX_PATH &&
-             path_join(g_data_directory, capacity - DATA_NAME_ROOM, base, L"\\", L"KeySwitchFix");
-    if (!ok) {
-        length = GetTempPathW(MAX_PATH, base);
-        ok = length > 0 && length < MAX_PATH &&
-             path_join(g_data_directory, capacity - DATA_NAME_ROOM, base,
-                       base[length - 1] == L'\\' ? L"" : L"\\", L"KeySwitchFix");
-    }
+    int ok = ks_data_directory(g_data_directory, NULL);
     g_paths_ok = ok;
     if (!ok) {
         /* Never fall back to a relative path (the current directory). */
@@ -550,6 +596,25 @@ static int running_installed_copy(void) {
     return wcslen(self) > prefix && _wcsnicmp(self, expected, prefix) == 0;
 }
 
+/* A language code as settings.ini may hold it: 2..7 characters of a-z,
+   0-9 and '-' (case is folded). */
+static int valid_language_code(wchar_t *code) {
+    int i;
+    for (i = 0; code[i]; ++i) {
+        if (code[i] >= L'A' && code[i] <= L'Z') code[i] = (wchar_t)(code[i] - L'A' + L'a');
+        if (!((code[i] >= L'a' && code[i] <= L'z') || (code[i] >= L'0' && code[i] <= L'9') || code[i] == L'-'))
+            return 0;
+    }
+    return i >= 2 && i <= 7;
+}
+
+/* Invalid codes fall back to English / Persian; the two must differ. */
+static void normalize_language_pair(wchar_t *first, wchar_t *second) {
+    if (!valid_language_code(first)) wcscpy(first, L"en");
+    if (!valid_language_code(second)) wcscpy(second, L"fa");
+    if (wcscmp(first, second) == 0) wcscpy(second, wcscmp(first, L"fa") == 0 ? L"en" : L"fa");
+}
+
 static void load_settings(void) {
     DWORD attributes;
     build_paths();
@@ -582,73 +647,118 @@ static void load_settings(void) {
     g_settings.snippets = GetPrivateProfileIntW(L"Typing", L"Snippets", 1, g_settings_path) != 0;
     g_settings.learn_writing = GetPrivateProfileIntW(L"Memory", L"LearnWriting", 0, g_settings_path) != 0;
     g_settings.vocab_it = GetPrivateProfileIntW(L"Vocabulary", L"IT", 1, g_settings_path) != 0;
-    GetPrivateProfileStringW(L"General", L"ExcludedProcesses",
-                             L"1Password.exe,Bitwarden.exe,CredentialUIBroker.exe,KeePass.exe,KeePassXC.exe,LastPass.exe,LockApp.exe",
-                             g_settings.excluded,
-                             (DWORD)(sizeof(g_settings.excluded) / sizeof(wchar_t)), g_settings_path);
+    GetPrivateProfileStringW(L"Languages", L"First", L"en", g_settings.language_first, 8, g_settings_path);
+    GetPrivateProfileStringW(L"Languages", L"Second", L"fa", g_settings.language_second, 8, g_settings_path);
+    normalize_language_pair(g_settings.language_first, g_settings.language_second);
+    {
+        DWORD capacity = (DWORD)(sizeof(g_settings.excluded) / sizeof(wchar_t));
+        DWORD length = GetPrivateProfileStringW(L"General", L"ExcludedProcesses", KS_DEFAULT_EXCLUDED,
+                                                g_settings.excluded, capacity, g_settings_path);
+        if (length >= capacity - 1) {
+            /* Longer than the setting holds: keep whole names only, never
+               half of one (which would silently stop excluding it). */
+            wchar_t *comma = wcsrchr(g_settings.excluded, L',');
+            if (comma) *comma = 0;
+            set_activity(L"The excluded-apps list in settings.ini is too long; the last entries were ignored.");
+        }
+    }
 }
 
-static void update_startup_registry(void) {
+/* Registers (or removes) the Run entry. Returns 0 when the wanted state
+   could not be written. A copy that is not the installed one (run from
+   Downloads, say) never takes over an entry that points at another copy. */
+/* Why the last update failed, when there is a more precise reason. */
+static const wchar_t *g_startup_failure;
+
+static int update_startup_registry(void) {
     HKEY key;
     wchar_t executable[MAX_PATH];
     wchar_t command[MAX_PATH + 8];
+    int ok = 1;
+    g_startup_failure = NULL;
     if (RegCreateKeyExW(HKEY_CURRENT_USER,
                         L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, NULL, 0,
-                        KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
+                        KEY_SET_VALUE | KEY_QUERY_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return 0;
     if (g_settings.start_with_windows) {
         DWORD length = GetModuleFileNameW(NULL, executable, MAX_PATH);
         if (!length || length >= MAX_PATH) {
             /* A truncated path would register a program that does not exist. */
             RegCloseKey(key);
-            set_activity(L"Start with Windows is not available: the program's folder path is too long.");
-            return;
+            g_startup_failure = L"Start with Windows is not available: the program's folder path is too long.";
+            return 0;
         }
         swprintf(command, sizeof(command) / sizeof(command[0]), L"\"%ls\"", executable);
-        RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE *)command,
-                       (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+        if (!running_installed_copy()) {
+            wchar_t existing[MAX_PATH + 8];
+            DWORD type = 0;
+            DWORD size = sizeof(existing);
+            existing[0] = 0;
+            if (RegQueryValueExW(key, APP_NAME, NULL, &type, (BYTE *)existing, &size) == ERROR_SUCCESS &&
+                type == REG_SZ && size >= sizeof(wchar_t)) {
+                existing[sizeof(existing) / sizeof(existing[0]) - 1] = 0;
+                if (_wcsicmp(existing, command) != 0) {
+                    /* The installed copy starts with Windows already. */
+                    RegCloseKey(key);
+                    return 1;
+                }
+            }
+        }
+        ok = RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE *)command,
+                            (DWORD)((wcslen(command) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
     } else {
-        RegDeleteValueW(key, APP_NAME);
+        LONG result = RegDeleteValueW(key, APP_NAME);
+        ok = result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
     }
     RegCloseKey(key);
+    return ok;
 }
 
-static void save_settings(void) {
+static int g_startup_registry_failed;   /* the last save could not set the Run entry */
+
+/* Writes every setting; returns 0 when any of them could not be written
+   (no data folder, read-only file, full disk). The Run entry is reported
+   separately (g_startup_registry_failed). */
+static int save_settings(void) {
+    int ok = 1;
     wchar_t number[16];
     ++g_settings_generation;   /* cached per-focus facts depend on settings */
     if (!g_settings_path[0]) {   /* no usable data folder: never write elsewhere */
-        update_startup_registry();
-        return;
+        g_startup_registry_failed = !update_startup_registry();
+        return 0;
     }
     swprintf(number, 16, L"%d", g_settings.enabled);
-    WritePrivateProfileStringW(L"General", L"Enabled", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"General", L"Enabled", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.sensitivity);
-    WritePrivateProfileStringW(L"General", L"Sensitivity", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"General", L"Sensitivity", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.language_mode);
-    WritePrivateProfileStringW(L"General", L"LanguageMode", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"General", L"LanguageMode", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.start_with_windows);
-    WritePrivateProfileStringW(L"General", L"StartWithWindows", number, g_settings_path);
-    WritePrivateProfileStringW(L"General", L"ExcludedProcesses", g_settings.excluded, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"General", L"StartWithWindows", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"General", L"ExcludedProcesses", g_settings.excluded, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.spelling);
-    WritePrivateProfileStringW(L"Spelling", L"Level", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Spelling", L"Level", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.spelling_last_level);
-    WritePrivateProfileStringW(L"Spelling", L"LastLevel", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Spelling", L"LastLevel", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.personal_dictionary);
-    WritePrivateProfileStringW(L"Spelling", L"PersonalDictionary", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Spelling", L"PersonalDictionary", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.digits);
-    WritePrivateProfileStringW(L"Typing", L"Digits", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Typing", L"Digits", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.punctuation);
-    WritePrivateProfileStringW(L"Typing", L"Punctuation", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Typing", L"Punctuation", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.persian_letters);
-    WritePrivateProfileStringW(L"Typing", L"PersianLetters", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Typing", L"PersianLetters", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.auto_capitalize);
-    WritePrivateProfileStringW(L"Typing", L"Capitalize", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Typing", L"Capitalize", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.snippets);
-    WritePrivateProfileStringW(L"Typing", L"Snippets", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Typing", L"Snippets", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.learn_writing);
-    WritePrivateProfileStringW(L"Memory", L"LearnWriting", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Memory", L"LearnWriting", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.vocab_it);
-    WritePrivateProfileStringW(L"Vocabulary", L"IT", number, g_settings_path);
-    update_startup_registry();
+    ok &= WritePrivateProfileStringW(L"Vocabulary", L"IT", number, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Languages", L"First", g_settings.language_first, g_settings_path);
+    ok &= WritePrivateProfileStringW(L"Languages", L"Second", g_settings.language_second, g_settings_path);
+    g_startup_registry_failed = !update_startup_registry();
+    return ok;
 }
 
 /* ---- Statistics persistence ---------------------------------------------- */
@@ -717,7 +827,7 @@ static void stats_count_key(void) {
 
 static void stats_count_correction(const wchar_t *original, int spelling) {
     stats_touch_day();
-    ks_stats_observe_correction(&g_stats, original, spelling);
+    ks_stats_observe_correction(&g_stats, typed_text_private() ? NULL : original, spelling);
 }
 
 /* ---- Text files (UTF-8, or UTF-16 LE with BOM as Notepad saves it) ------- */
@@ -756,11 +866,30 @@ static wchar_t *read_text_file(const wchar_t *path, FILETIME *written) {
             memcpy(text, bytes + 2, (size_t)characters * sizeof(wchar_t));
             text[characters] = 0;
         }
+    } else if (read >= 2 && (unsigned char)bytes[0] == 0xFE && (unsigned char)bytes[1] == 0xFF) {
+        /* UTF-16 big-endian: swap the byte order. */
+        int i;
+        characters = (int)((read - 2) / 2);
+        text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, ((size_t)characters + 1) * sizeof(wchar_t));
+        if (text) {
+            for (i = 0; i < characters; ++i)
+                text[i] = (wchar_t)(((unsigned char)bytes[2 + 2 * i] << 8) | (unsigned char)bytes[3 + 2 * i]);
+            text[characters] = 0;
+        }
     } else {
-        characters = read ? MultiByteToWideChar(CP_UTF8, 0, bytes, (int)read, NULL, 0) : 0;
+        /* UTF-8 (the format KeySwitchFix writes). A file that is not valid
+           UTF-8 was saved by an older editor in the ANSI code page (Persian
+           Windows: 1256): decode it that way instead of turning every
+           Persian letter into a replacement character. */
+        UINT code_page = CP_UTF8;
+        characters = read ? MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, (int)read, NULL, 0) : 0;
+        if (read && characters <= 0) {
+            code_page = CP_ACP;
+            characters = MultiByteToWideChar(CP_ACP, 0, bytes, (int)read, NULL, 0);
+        }
         text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, ((size_t)(characters > 0 ? characters : 0) + 1) * sizeof(wchar_t));
         if (text) {
-            if (characters > 0) MultiByteToWideChar(CP_UTF8, 0, bytes, (int)read, text, characters);
+            if (characters > 0) MultiByteToWideChar(code_page, 0, bytes, (int)read, text, characters);
             text[characters > 0 ? characters : 0] = 0;
         }
     }
@@ -864,18 +993,41 @@ static void snippets_reload(int force) {
         wchar_t *migrated = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(wchar_t));
         wchar_t backup[MAX_PATH + 8];
         swprintf(backup, sizeof(backup) / sizeof(backup[0]), L"%ls.bak", g_snippets_path);
-        if (migrated && ks_snippets_migrate(text, migrated, capacity) &&
-            CopyFileW(g_snippets_path, backup, FALSE) && write_text_file(g_snippets_path, migrated)) {
+        if (migrated && ks_snippets_migrate(text, migrated, capacity)) {
+            /* The converted text is used even when the file cannot be
+               rewritten (read-only folder): old snippets keep working. */
+            int saved = CopyFileW(g_snippets_path, backup, FALSE) &&
+                        write_text_file(g_snippets_path, migrated);
             HeapFree(GetProcessHeap(), 0, text);
             text = migrated;
             migrated = NULL;
-            ZeroMemory(&g_snippets_loaded_time, sizeof(g_snippets_loaded_time));
-            set_activity(L"snippets.txt was updated: \\n and \\t are now written {n} and {t}.");
+            if (saved) ZeroMemory(&g_snippets_loaded_time, sizeof(g_snippets_loaded_time));
+            set_activity(saved ? L"snippets.txt was updated: \\n and \\t are now written {n} and {t}."
+                               : L"snippets.txt uses the old \\n escapes and could not be updated; they still work this session.");
         }
         if (migrated) HeapFree(GetProcessHeap(), 0, migrated);
     }
     ks_snippets_parse(&g_snippets, text);
     HeapFree(GetProcessHeap(), 0, text);
+}
+
+/* Opens a text file in Notepad from the Windows folder (never a notepad.exe
+   from the current directory). Returns 0 and says so on failure. */
+static int open_in_notepad(const wchar_t *path) {
+    wchar_t notepad[MAX_PATH];
+    wchar_t argument[MAX_PATH + 4];
+    UINT length = GetSystemDirectoryW(notepad, MAX_PATH);
+    if (!path || !*path || !length || length >= MAX_PATH - 12 ||
+        !path_join(notepad, MAX_PATH, notepad, L"\\", L"notepad.exe") ||
+        !path_join(argument, MAX_PATH + 4, L"\"", path, L"\"")) {
+        set_activity(L"The file could not be opened.");
+        return 0;
+    }
+    if ((INT_PTR)ShellExecuteW(NULL, L"open", notepad, argument, NULL, SW_SHOWNORMAL) <= 32) {
+        set_activity(L"Notepad could not be started to open the file.");
+        return 0;
+    }
+    return 1;
 }
 
 static void open_snippets_file(void) {
@@ -885,8 +1037,8 @@ static void open_snippets_file(void) {
             return;
         }
     }
-    ShellExecuteW(NULL, L"open", L"notepad.exe", g_snippets_path, NULL, SW_SHOWNORMAL);
-    set_activity(L"snippets.txt opened; save it and the new shortcuts are live within seconds.");
+    if (open_in_notepad(g_snippets_path))
+        set_activity(L"snippets.txt opened; save it and the new shortcuts are live within seconds.");
 }
 
 /* ---- Writing memory ------------------------------------------------------ */
@@ -913,7 +1065,14 @@ static void memory_save(void) {
     if (memory_file_edited()) {
         /* Hand edits win over what was learned since the last save. */
         memory_load();
-        set_activity(L"writing-memory.txt was edited; KeySwitchFix reloaded it.");
+        if (!g_memory_read_only) set_activity(L"writing-memory.txt was edited; KeySwitchFix reloaded it.");
+        return;
+    }
+    /* A file that could not be read (over 4 MB, locked) is never replaced
+       by the little learned since: learning goes on in memory only, and the
+       file is tried again every five minutes (a lock may be gone). */
+    if (g_memory_read_only) {
+        if (GetTickCount() - g_memory_read_only_at > 300000u) memory_load();
         return;
     }
     if (!g_memory.dirty) return;
@@ -926,22 +1085,54 @@ static void memory_save(void) {
         memory_file_time(&g_memory_file_time);
         g_memory_saved_at = GetTickCount();   /* only a real save delays the next */
     } else {
-        set_activity(L"Could not save writing-memory.txt in the KeySwitchFix data folder.");
+        /* Retry later, not on every two-second tick; say it once. */
+        g_memory_saved_at = GetTickCount();
+        if (!g_memory_save_failed)
+            set_activity(L"Could not save writing-memory.txt in the KeySwitchFix data folder.");
+        g_memory_save_failed = 1;
+        HeapFree(GetProcessHeap(), 0, text);
+        return;
     }
+    g_memory_save_failed = 0;
     HeapFree(GetProcessHeap(), 0, text);
 }
 
 static void memory_load(void) {
     wchar_t *text;
-    ks_memory_reset(&g_memory);
-    g_memory_active = 0;
-    if (!g_settings.learn_writing) return;
-    ZeroMemory(&g_memory_file_time, sizeof(g_memory_file_time));
-    text = read_text_file(g_memory_path, &g_memory_file_time);
+    FILETIME written;
+    int was_active = g_memory_active;
+    if (!g_settings.learn_writing) {
+        ks_memory_reset(&g_memory);
+        g_memory_active = 0;
+        return;
+    }
+    ZeroMemory(&written, sizeof(written));
+    text = read_text_file(g_memory_path, &written);
     if (text) {
+        ks_memory_reset(&g_memory);
+        g_memory_file_time = written;
+        g_memory_read_only = 0;
         ks_memory_parse(&g_memory, text);
         HeapFree(GetProcessHeap(), 0, text);
+    } else if (GetFileAttributesW(g_memory_path) == INVALID_FILE_ATTRIBUTES) {
+        /* No file yet: a fresh memory (or "Forget everything"). */
+        ks_memory_reset(&g_memory);
+        ZeroMemory(&g_memory_file_time, sizeof(g_memory_file_time));
+        g_memory_read_only = 0;
+    } else {
+        /* There but unreadable: what this session learned stays in memory
+           (a retry that fails again must not wipe it). */
+        if (!was_active) ks_memory_reset(&g_memory);
+        g_memory_read_only = 1;
+        g_memory_read_only_at = GetTickCount();
+        /* The file as it is now: only a real change (an edit, the lock
+           gone and the file rewritten) reloads it, not every tick. */
+        memory_file_time(&g_memory_file_time);
+        if (!g_memory_read_only_reported)
+            set_activity(L"writing-memory.txt could not be read (too large or locked); it is left untouched.");
+        g_memory_read_only_reported = 1;
     }
+    if (!g_memory_read_only) g_memory_read_only_reported = 0;
     g_memory_active = 1;
 }
 
@@ -956,11 +1147,18 @@ static void memory_apply_setting(void) {
 }
 
 static void memory_forget(void) {
+    int gone;
     ks_memory_reset(&g_memory);
-    DeleteFileW(g_memory_path);
-    ZeroMemory(&g_memory_file_time, sizeof(g_memory_file_time));
+    SetFileAttributesW(g_memory_path, FILE_ATTRIBUTE_NORMAL);   /* a read-only flag */
+    gone = DeleteFileW(g_memory_path) || GetLastError() == ERROR_FILE_NOT_FOUND;
+    /* Locked by another program: overwrite it with an empty memory instead,
+       so it cannot be read back at the next check. */
+    if (!gone) gone = write_text_file(g_memory_path, L"");
+    memory_file_time(&g_memory_file_time);
     g_memory_saved_at = 0;
-    set_activity(L"Writing memory cleared: every learned word and repair is forgotten.");
+    g_memory_read_only = 0;
+    set_activity(gone ? L"Writing memory cleared: every learned word and repair is forgotten."
+                      : L"writing-memory.txt could not be deleted (it is in use); close the program using it and try again.");
 }
 
 static void open_memory_file(void) {
@@ -971,21 +1169,32 @@ static void open_memory_file(void) {
         set_activity(L"Turn on \u201cLearn my writing\u201d first; the memory file is created as you type.");
         return;
     }
-    ShellExecuteW(NULL, L"open", L"notepad.exe", g_memory_path, NULL, SW_SHOWNORMAL);
-    set_activity(L"writing-memory.txt opened. Save it and your edits apply within seconds.");
+    if (g_memory_save_failed) {
+        set_activity(L"Could not save writing-memory.txt in the KeySwitchFix data folder, so it cannot be opened.");
+        return;
+    }
+    if (open_in_notepad(g_memory_path))
+        set_activity(L"writing-memory.txt opened. Save it and your edits apply within seconds.");
 }
 
-/* Known words beyond the Blooms: the vocabulary pack, and words this user
-   types often. English arrives lower-case, Persian without diacritics. */
-static int extra_word_known(const void *context, KS_LANGUAGE language, const wchar_t *word) {
+static KS_LANGUAGE slot_model(KS_SLOT slot);
+static KS_SCRIPT script_of(wchar_t c);
+
+/* Known words beyond the Blooms: the vocabulary pack (English and Persian),
+   and words this user types often, in the slot's own alphabet. Words arrive
+   in lookup form (lower case, without diacritics). */
+static int extra_word_known(const void *context, KS_SLOT slot, const wchar_t *word) {
     (void)context;
-    if (g_settings.vocab_it && ks_domain_contains(KS_DOMAIN_IT, language, word)) return 1;
-    return g_memory_active && ks_memory_word_count(&g_memory, word) >= KS_MEMORY_KNOWN_COUNT;
+    if (g_settings.vocab_it && ks_domain_contains(KS_DOMAIN_IT, slot_model(slot), word)) return 1;
+    if (!g_memory_active || (slot != KS_SLOT_A && slot != KS_SLOT_B) ||
+        script_of(word[0]) != g_slots[slot].script)
+        return 0;
+    return ks_memory_word_count(&g_memory, word) >= KS_MEMORY_KNOWN_COUNT;
 }
 
-static int extra_word_prefix(const void *context, KS_LANGUAGE language, const wchar_t *prefix) {
+static int extra_word_prefix(const void *context, KS_SLOT slot, const wchar_t *prefix) {
     (void)context;
-    return g_settings.vocab_it && ks_domain_has_prefix(KS_DOMAIN_IT, language, prefix);
+    return g_settings.vocab_it && ks_domain_has_prefix(KS_DOMAIN_IT, slot_model(slot), prefix);
 }
 
 /* Spelling ranks: pack terms rank as everyday words (zipf 4.0); the user's
@@ -999,21 +1208,26 @@ static int spell_rank_adjust(const void *context, const wchar_t *word, int table
     return g_memory_active ? ks_memory_rank_adjust(&g_memory, word, table_rank) : table_rank;
 }
 
-static int letters_only_word(const wchar_t *text, KS_LANGUAGE language) {
-    if (!text || !text[0] || !text[1]) return 0;
+/* Two or more letters of the slot's alphabet and nothing else. */
+static int letters_only_word(const wchar_t *text, KS_SLOT slot) {
+    KS_LANGUAGE model = slot_model(slot);
+    if (!text || !text[0] || !text[1] || (slot != KS_SLOT_A && slot != KS_SLOT_B)) return 0;
     for (; *text; ++text) {
-        if (language == KS_LANG_ENGLISH ? !ks_is_latin_letter(*text) : !ks_is_persian_letter(*text))
+        if (model == KS_LANG_ENGLISH ? !ks_is_latin_letter(*text)
+            : model == KS_LANG_PERSIAN ? !ks_is_persian_letter(*text)
+            : (!ks_is_letter(*text) || script_of(*text) != g_slots[slot].script))
             return 0;
     }
     return 1;
 }
 
 /* all lower-case, or only the first letter capital ("Teh" at a sentence
-   start); ALL-CAPS and camelCase are names, acronyms or code. */
+   start); ALL-CAPS and camelCase are names, acronyms or code. Uncased
+   alphabets (Persian, Arabic, Hebrew) always pass. */
 static int ordinary_case(const wchar_t *text) {
     const wchar_t *cursor;
     for (cursor = text; *cursor; ++cursor)
-        if (*cursor >= L'A' && *cursor <= L'Z' && cursor != text) return 0;
+        if (cursor != text && ks_to_lower(*cursor) != *cursor) return 0;
     return 1;
 }
 
@@ -1022,13 +1236,23 @@ static void lower_first(wchar_t *text) {
         if (*text >= L'A' && *text <= L'Z') *text = (wchar_t)(*text - L'A' + L'a');
 }
 
+/* The form a word is remembered and looked up in: English lower-case (as
+   before), a cased pack language through the engine's own lower-casing. */
+static void lower_for_slot(wchar_t *text, KS_SLOT slot) {
+    KS_LANGUAGE model = slot_model(slot);
+    if (model == KS_LANG_ENGLISH) lower_first(text);
+    else if (model == KS_LANG_OTHER && (slot == KS_SLOT_A || slot == KS_SLOT_B) &&
+             g_slots[slot].profile && (g_slots[slot].profile->flags & KS_PROFILE_CASED))
+        for (; *text; ++text) *text = ks_to_lower(*text);
+}
+
 /* One finished word, as it now stands on screen. Never called for
    developer tools, excluded apps or password fields (typing_helpers). */
-static void memory_note_word(const wchar_t *text, KS_LANGUAGE language) {
+static void memory_note_word(const wchar_t *text, KS_SLOT language) {
     wchar_t word[KS_MAX_WORD + 1];
     if (!g_memory_active || !text || wcslen(text) > KS_MAX_WORD) return;
     safe_copy(word, KS_MAX_WORD + 1, text);
-    if (language == KS_LANG_ENGLISH) lower_first(word);
+    lower_for_slot(word, language);
     if (!letters_only_word(word, language)) return;
     ks_memory_observe_word(&g_memory, word);
     safe_copy(g_last_noted, KS_MAX_WORD + 1, word);
@@ -1072,7 +1296,7 @@ static void clear_word(void) {
     g_has_context = 0;
     g_skip_word = 0;
     g_word_window = NULL;
-    g_word_language = KS_LANG_OTHER;
+    g_word_language = KS_SLOT_NONE;
     g_last_word_key_at = 0;
 }
 
@@ -1096,6 +1320,7 @@ static void clear_history(void) {
  */
 static int g_word_untrusted;
 static int g_engine_key_interrupted;
+static int g_reset_pending;   /* a focus change or click arrived during an operation */
 
 static int engine_enter(void) {
     if (g_engine_depth > 0) return 0;
@@ -1106,6 +1331,14 @@ static int engine_enter(void) {
 }
 
 static void engine_leave(void) {
+    /* A focus change or click during the operation: its reset waited for
+       the operation to finish, so nothing the operation still uses (the
+       input target, the layout request) changed under it. */
+    if (g_reset_pending) {
+        g_reset_pending = 0;
+        engine_reset_for_focus();
+        g_engine_interrupted = 1;
+    }
     if (g_engine_interrupted) {
         clear_word();
         clear_history();
@@ -1131,10 +1364,10 @@ static void abandon_history(void) {
 }
 
 static void store_pending_word(HWND window, const KS_TOKEN *tokens, int count,
-                               KS_LANGUAGE visible_language) {
+                               KS_SLOT visible_language) {
     if (!window || !tokens || count < 1 || count > KS_MAX_WORD ||
-        (visible_language != KS_LANG_ENGLISH &&
-         visible_language != KS_LANG_PERSIAN)) {
+        (visible_language != KS_SLOT_A &&
+         visible_language != KS_SLOT_B)) {
         abandon_history();
         return;
     }
@@ -1151,12 +1384,12 @@ static void store_pending_word(HWND window, const KS_TOKEN *tokens, int count,
 }
 
 static void history_push(HWND window, const KS_TOKEN *tokens, int count,
-                         KS_LANGUAGE visible_language, UINT delimiter,
+                         KS_SLOT visible_language, UINT delimiter,
                          int delimiter_zwnj) {
     if (!window || !tokens || count < 1 || count > KS_MAX_WORD ||
         delimiter != VK_SPACE ||
-        (visible_language != KS_LANG_ENGLISH &&
-         visible_language != KS_LANG_PERSIAN)) {
+        (visible_language != KS_SLOT_A &&
+         visible_language != KS_SLOT_B)) {
         clear_history();
         return;
     }
@@ -1201,8 +1434,8 @@ static void clear_intent(void) {
     g_intent_updated_at = 0;
 }
 
-static void remember_intent(HWND window, KS_LANGUAGE language, int strength) {
-    if (!window || (language != KS_LANG_ENGLISH && language != KS_LANG_PERSIAN)) return;
+static void remember_intent(HWND window, KS_SLOT language, int strength) {
+    if (!window || (language != KS_SLOT_A && language != KS_SLOT_B)) return;
     if (g_intent_window != window) {
         ks_context_reset(&g_intent_context);
         g_intent_window = window;
@@ -1211,20 +1444,20 @@ static void remember_intent(HWND window, KS_LANGUAGE language, int strength) {
     g_intent_updated_at = GetTickCount64();
 }
 
-static KS_LANGUAGE current_intent(HWND window, int *strength) {
+static KS_SLOT current_intent(HWND window, int *strength) {
     if (strength) *strength = 0;
     if (g_settings.language_mode == 1) {
         if (strength) *strength = 5;
-        return KS_LANG_PERSIAN;
+        return KS_SLOT_B;
     }
     if (g_settings.language_mode == 2) {
         if (strength) *strength = 5;
-        return KS_LANG_ENGLISH;
+        return KS_SLOT_A;
     }
     if (!window || window != g_intent_window || !g_intent_updated_at ||
         GetTickCount64() - g_intent_updated_at > 90000u) {
         clear_intent();
-        return KS_LANG_OTHER;
+        return KS_SLOT_NONE;
     }
     return ks_context_current(&g_intent_context, strength);
 }
@@ -1349,50 +1582,433 @@ static int is_sentence_terminator(UINT key) {
     return 0;
 }
 
+/* ---- The language pair --------------------------------------------------- */
+
+static KS_SCRIPT script_of(wchar_t c) {
+    if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+        (c >= 0x00C0 && c <= 0x024F && c != 0x00D7 && c != 0x00F7) ||
+        (c >= 0x1E00 && c <= 0x1EFF))
+        return SCRIPT_LATIN;
+    if ((c >= 0x0370 && c <= 0x03FF) || (c >= 0x1F00 && c <= 0x1FFF)) return SCRIPT_GREEK;
+    if (c >= 0x0400 && c <= 0x052F) return SCRIPT_CYRILLIC;
+    if (c >= 0x0530 && c <= 0x058F) return SCRIPT_ARMENIAN;
+    if (c >= 0x0590 && c <= 0x05FF) return SCRIPT_HEBREW;
+    if ((c >= 0x0600 && c <= 0x06FF) || (c >= 0x0750 && c <= 0x077F) ||
+        (c >= 0xFB50 && c <= 0xFDFF) || (c >= 0xFE70 && c <= 0xFEFF))
+        return SCRIPT_ARABIC;
+    if (c >= 0x0900 && c <= 0x097F) return SCRIPT_DEVANAGARI;
+    if (c >= 0x0E00 && c <= 0x0E7F) return SCRIPT_THAI;
+    if (c >= 0x10A0 && c <= 0x10FF) return SCRIPT_GEORGIAN;
+    return SCRIPT_NONE;
+}
+
+static int slot_valid(KS_SLOT slot) {
+    return slot == KS_SLOT_A || slot == KS_SLOT_B;
+}
+
+/* The language model behind a slot: English and Persian have spelling,
+   typing helpers and the IT vocabulary; every pack language is "other". */
+static KS_LANGUAGE slot_model(KS_SLOT slot) {
+    if (!slot_valid(slot) || !g_slots[slot].profile) return KS_LANG_OTHER;
+    return g_slots[slot].profile->model;
+}
+
+static int slot_is(KS_SLOT slot, KS_LANGUAGE language) {
+    return language != KS_LANG_OTHER && slot_model(slot) == language;
+}
+
+static KS_SLOT slot_of_model(KS_LANGUAGE language) {
+    if (slot_is(KS_SLOT_A, language)) return KS_SLOT_A;
+    if (slot_is(KS_SLOT_B, language)) return KS_SLOT_B;
+    return KS_SLOT_NONE;
+}
+
+/* The original pair (in either order): the built-in key table and the
+   fixed set of word keys apply exactly as before 4.0. */
+static int pair_is_english_persian(void) {
+    return slot_of_model(KS_LANG_ENGLISH) != KS_SLOT_NONE &&
+           slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE;
+}
+
+/* Spelling correction, Persian helpers and English capitalisation exist for
+   the built-in languages only. */
+static int pair_has_spelling(void) {
+    return slot_of_model(KS_LANG_ENGLISH) != KS_SLOT_NONE || slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE;
+}
+
+static const wchar_t *language_name(KS_SLOT slot) {
+    return slot_valid(slot) && g_slots[slot].name[0] ? g_slots[slot].name : L"Unsupported";
+}
+
+static void add_language_choice(const wchar_t *code, const wchar_t *english_name,
+                                const wchar_t *native_name, const wchar_t *path) {
+    LANGUAGE_CHOICE *choice;
+    int i;
+    if (g_language_choice_count >= MAX_LANGUAGE_CHOICES) return;
+    for (i = 0; i < g_language_choice_count; ++i)
+        if (wcscmp(g_language_choices[i].code, code) == 0) return;   /* the first copy wins */
+    choice = &g_language_choices[g_language_choice_count++];
+    safe_copy(choice->code, 8, code);
+    safe_copy(choice->english_name, 48, english_name && english_name[0] ? english_name : code);
+    safe_copy(choice->native_name, 48, native_name ? native_name : L"");
+    safe_copy(choice->path, MAX_PATH, path ? path : L"");
+}
+
+/* Reads the first `wanted` bytes (or the whole file when `whole`). The
+   buffer is HeapAlloc'd; NULL on any failure or when the file is larger
+   than `limit`. */
+static unsigned char *read_binary_file(const wchar_t *path, DWORD wanted, int whole,
+                                       DWORD limit, DWORD *size) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    LARGE_INTEGER length;
+    unsigned char *data = NULL;
+    DWORD total = 0;
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    if (!GetFileSizeEx(file, &length) || length.QuadPart < 1 || length.QuadPart > (LONGLONG)limit) {
+        CloseHandle(file);
+        return NULL;
+    }
+    if (whole) wanted = (DWORD)length.QuadPart;
+    else if ((LONGLONG)wanted > length.QuadPart) wanted = (DWORD)length.QuadPart;
+    data = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, wanted ? wanted : 1);
+    while (data && total < wanted) {
+        DWORD read = 0;
+        if (!ReadFile(file, data + total, wanted - total, &read, NULL) || read == 0) {
+            HeapFree(GetProcessHeap(), 0, data);
+            data = NULL;
+            break;
+        }
+        total += read;
+    }
+    CloseHandle(file);
+    if (data && size) *size = total;
+    return data;
+}
+
+#define LANGUAGE_PACK_LIMIT (64u * 1024u * 1024u)
+
+static void pack_code(const KS_LANG_PACK *pack, wchar_t *code) {
+    int i;
+    for (i = 0; i < 7 && pack->profile.code[i]; ++i) code[i] = (wchar_t)(unsigned char)pack->profile.code[i];
+    code[i] = 0;
+}
+
+static void scan_language_folder(const wchar_t *folder) {
+    wchar_t pattern[MAX_PATH];
+    WIN32_FIND_DATAW found;
+    HANDLE search;
+    static KS_LANG_PACK header;   /* large: kept off the stack */
+    int examined = 0;
+    if (!folder || !folder[0] || !path_join(pattern, MAX_PATH, folder, L"\\", L"*.kslang")) return;
+    search = FindFirstFileW(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) return;
+    do {
+        wchar_t path[MAX_PATH];
+        wchar_t code[8];
+        wchar_t expected_name[16];
+        unsigned char *data;
+        DWORD size = 0;
+        int ok;
+        /* Every file costs a read on the UI thread: a folder of thousands
+           of files is not scanned to its end. */
+        if (++examined > 256 || g_language_choice_count >= MAX_LANGUAGE_CHOICES) break;
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!path_join(path, MAX_PATH, folder, L"\\", found.cFileName)) continue;
+        data = read_binary_file(path, KS_PACK_HEADER_SIZE, 0, LANGUAGE_PACK_LIMIT, &size);
+        if (!data) continue;
+        ok = ks_pack_parse_header(data, size, &header);
+        HeapFree(GetProcessHeap(), 0, data);
+        if (!ok) continue;
+        pack_code(&header, code);
+        /* English and Persian are built in and always win. */
+        if (wcscmp(code, L"en") == 0 || wcscmp(code, L"fa") == 0) continue;
+        /* A pack is "<code>.kslang": a copy saved under another name can
+           never stand in for the real one. */
+        swprintf(expected_name, 16, L"%ls.kslang", code);
+        if (_wcsicmp(found.cFileName, expected_name) != 0) continue;
+        add_language_choice(code, header.english_name, header.native_name, path);
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+}
+
+/* The languages to choose from: the built-in pair, the packs installed next
+   to the program (languages\*.kslang), then packs the user added to the
+   data folder (%LOCALAPPDATA%\KeySwitchFix\languages). */
+static void scan_languages(void) {
+    wchar_t folder[MAX_PATH];
+    wchar_t self[MAX_PATH];
+    DWORD length;
+    int i;
+    int j;
+    g_language_choice_count = 0;
+    add_language_choice(L"en", L"English", L"English", L"");
+    add_language_choice(L"fa", L"Persian", L"فارسی", L"");
+    length = GetModuleFileNameW(NULL, self, MAX_PATH);
+    if (length && length < MAX_PATH) {
+        wchar_t *slash = wcsrchr(self, L'\\');
+        if (slash) {
+            *slash = 0;
+            if (path_join(folder, MAX_PATH, self, L"\\", L"languages")) scan_language_folder(folder);
+        }
+    }
+    if (g_paths_ok && g_data_directory[0] &&
+        path_join(folder, MAX_PATH, g_data_directory, L"\\", L"languages"))
+        scan_language_folder(folder);
+    /* Packs in alphabetical order of their English names, after the two
+       built-in languages. */
+    for (i = 3; i < g_language_choice_count; ++i) {
+        LANGUAGE_CHOICE moving = g_language_choices[i];
+        for (j = i; j > 2 && _wcsicmp(g_language_choices[j - 1].english_name, moving.english_name) > 0; --j)
+            g_language_choices[j] = g_language_choices[j - 1];
+        g_language_choices[j] = moving;
+    }
+}
+
+static const LANGUAGE_CHOICE *find_language_choice(const wchar_t *code) {
+    int i;
+    for (i = 0; i < g_language_choice_count; ++i)
+        if (wcscmp(g_language_choices[i].code, code) == 0) return &g_language_choices[i];
+    return NULL;
+}
+
+/* The writing system of a pack, from its own short words. */
+static KS_SCRIPT pack_script(const KS_LANG_PACK *pack) {
+    int i;
+    for (i = 0; i < pack->profile.short_count; ++i) {
+        KS_SCRIPT script = script_of(pack->profile.short_words[i][0]);
+        if (script != SCRIPT_NONE) return script;
+    }
+    return (pack->profile.flags & KS_PROFILE_LATIN) ? SCRIPT_LATIN : SCRIPT_NONE;
+}
+
+/* Prepares one language. The profile pointer of a pack is set by the
+   caller once the state sits at its final address. Returns 0 when the
+   language cannot be used (pack missing, damaged or for another code). */
+static int load_language(const wchar_t *code, SLOT_STATE *state) {
+    const LANGUAGE_CHOICE *choice;
+    unsigned char *data;
+    DWORD size = 0;
+    wchar_t loaded_code[8];
+    memset(state, 0, sizeof(*state));
+    safe_copy(state->code, 8, code);
+    if (wcscmp(code, L"en") == 0) {
+        state->profile = ks_profile_english();
+        state->script = SCRIPT_LATIN;
+        safe_copy(state->name, 48, L"English");
+        return 1;
+    }
+    if (wcscmp(code, L"fa") == 0) {
+        state->profile = ks_profile_persian();
+        state->script = SCRIPT_ARABIC;
+        safe_copy(state->name, 48, L"Persian");
+        return 1;
+    }
+    choice = find_language_choice(code);
+    if (!choice || !choice->path[0]) return 0;
+    data = read_binary_file(choice->path, 0, 1, LANGUAGE_PACK_LIMIT, &size);
+    if (!data) return 0;
+    if (!ks_pack_parse(data, size, &state->pack)) {
+        HeapFree(GetProcessHeap(), 0, data);
+        return 0;
+    }
+    pack_code(&state->pack, loaded_code);
+    if (wcscmp(loaded_code, code) != 0) {   /* replaced on disk since the scan */
+        HeapFree(GetProcessHeap(), 0, data);
+        memset(state, 0, sizeof(*state));
+        return 0;
+    }
+    /* Spelling, typing helpers and the IT vocabulary exist only for the
+       built-in English and Persian; a pack never borrows them. */
+    state->pack.profile.model = KS_LANG_OTHER;
+    state->pack_data = data;
+    state->script = pack_script(&state->pack);
+    safe_copy(state->code, 8, code);
+    safe_copy(state->name, 48, state->pack.english_name);
+    return 1;
+}
+
+static void bind_slot_lexicons(KS_SLOT slot) {
+    SLOT_STATE *state = &g_slots[slot];
+    if (state->pack_data) {
+        state->profile = &state->pack.profile;
+        g_lexicons.words[slot] = &state->pack.words;
+        g_lexicons.common[slot] = state->pack.common.valid ? &state->pack.common : NULL;
+        g_lexicons.frequent[slot] = state->pack.frequent.valid ? &state->pack.frequent : NULL;
+        g_lexicons.prefixes[slot] = &state->pack.prefixes;
+        g_lexicons.common_prefixes[slot] =
+            state->pack.common_prefixes.valid ? &state->pack.common_prefixes : NULL;
+    } else if (state->profile && state->profile->model == KS_LANG_PERSIAN) {
+        g_lexicons.words[slot] = &g_persian_bloom;
+        g_lexicons.common[slot] = &g_persian_common_bloom;
+        g_lexicons.frequent[slot] = &g_persian_frequent_bloom;
+        g_lexicons.prefixes[slot] = &g_persian_prefix_bloom;
+        g_lexicons.common_prefixes[slot] = &g_persian_common_prefix_bloom;
+    } else {
+        g_lexicons.words[slot] = &g_english_bloom;
+        g_lexicons.common[slot] = &g_english_common_bloom;
+        g_lexicons.frequent[slot] = &g_english_frequent_bloom;
+        g_lexicons.prefixes[slot] = &g_english_prefix_bloom;
+        g_lexicons.common_prefixes[slot] = &g_english_common_prefix_bloom;
+    }
+    g_lexicons.profile[slot] = state->profile;
+}
+
 /*
- * Which alphabet a keyboard layout types. The language ID of the HKL is the
- * input *language*, not the keyboard: a Persian keyboard can be added under
- * English and vice versa. So the layout is asked what the A and Q keys
- * produce; the language ID is only the fallback. Cached per HKL.
+ * Loads the pair named in the settings and resets everything that was
+ * learned about the old one. A language whose pack cannot be loaded is
+ * replaced by English or Persian (the setting itself is kept, so the pack
+ * is used again once it is back). Runs on the UI thread, never inside a
+ * hook call. Returns 0 when a replacement was needed.
  */
-static KS_LANGUAGE language_from_layout(HKL layout) {
+static HWND g_language_first_combo;
+static HWND g_language_second_combo;
+
+static int language_list_open(void) {
+    return (g_language_first_combo && SendMessageW(g_language_first_combo, CB_GETDROPPEDSTATE, 0, 0)) ||
+           (g_language_second_combo && SendMessageW(g_language_second_combo, CB_GETDROPPEDSTATE, 0, 0));
+}
+
+static int apply_language_pair(void) {
+    static SLOT_STATE loaded[3];   /* large: kept off the stack */
+    const wchar_t *wanted[3];
+    wchar_t message[400];
+    int slot;
+    int ok = 1;
+    message[0] = 0;
+    wanted[0] = NULL;
+    wanted[KS_SLOT_A] = g_settings.language_first;
+    wanted[KS_SLOT_B] = g_settings.language_second;
+    /* An open language list holds indices into the current table: it is
+       not rebuilt under it (the list rescans when it is opened next). */
+    if (!language_list_open()) scan_languages();
+    for (slot = KS_SLOT_A; slot <= KS_SLOT_B; ++slot) {
+        if (!load_language(wanted[slot], &loaded[slot])) {
+            const wchar_t *other = slot == KS_SLOT_A ? wanted[KS_SLOT_B] : loaded[KS_SLOT_A].code;
+            const wchar_t *fallback = slot == KS_SLOT_A ? L"en" : L"fa";
+            if (wcscmp(fallback, other) == 0) fallback = slot == KS_SLOT_A ? L"fa" : L"en";
+            {
+                size_t used = wcslen(message);
+                swprintf(message + used, sizeof(message) / sizeof(message[0]) - used,
+                         L"%lsThe language pack \u201c%ls\u201d is missing or damaged; %ls is used instead.",
+                         used ? L" " : L"", wanted[slot], wcscmp(fallback, L"en") == 0 ? L"English" : L"Persian");
+            }
+            load_language(fallback, &loaded[slot]);
+            ok = 0;
+        }
+    }
+    for (slot = KS_SLOT_A; slot <= KS_SLOT_B; ++slot) {
+        if (g_slots[slot].pack_data) HeapFree(GetProcessHeap(), 0, g_slots[slot].pack_data);
+        g_slots[slot] = loaded[slot];
+        loaded[slot].pack_data = NULL;
+        bind_slot_lexicons((KS_SLOT)slot);
+    }
+    ++g_pair_generation;
+    engine_reset_for_focus();
+    clear_intent();
+    g_last_word_at = 0;
+    g_last_word_window = NULL;
+    safe_copy(g_language_notice, sizeof(g_language_notice) / sizeof(g_language_notice[0]), message);
+    if (message[0]) set_activity(message);
+    return ok;
+}
+
+/* Frees the packs at exit, so leak checkers stay quiet. */
+static void release_language_pair(void) {
+    int slot;
+    for (slot = KS_SLOT_A; slot <= KS_SLOT_B; ++slot) {
+        g_lexicons.words[slot] = g_lexicons.common[slot] = g_lexicons.frequent[slot] = NULL;
+        g_lexicons.prefixes[slot] = g_lexicons.common_prefixes[slot] = NULL;
+        if (g_slots[slot].pack_data) HeapFree(GetProcessHeap(), 0, g_slots[slot].pack_data);
+        g_slots[slot].pack_data = NULL;
+    }
+}
+
+/*
+ * Which language of the pair a keyboard layout types. The language ID of
+ * the HKL is the input *language*, not the keyboard: a Persian keyboard can
+ * be added under English and vice versa. So the layout is asked what the A
+ * and Q keys produce, and the language ID decides together with that.
+ * Cached per HKL until the pair changes.
+ */
+static KS_SLOT slot_from_layout(HKL layout) {
     static HKL cached_layouts[16];
-    static KS_LANGUAGE cached_languages[16];
+    static KS_SLOT cached_slots[16];
     static int cached_count;
+    static unsigned long cached_generation;
     LANGID language_id = LOWORD((ULONG_PTR)layout);
     WORD primary = PRIMARYLANGID(language_id);
-    KS_LANGUAGE language = KS_LANG_OTHER;
+    KS_SLOT slot = KS_SLOT_NONE;
     static const UINT probes[2] = {0x1E, 0x10};
+    wchar_t probe = 0;
+    KS_SCRIPT script;
     int i;
-    if (!layout) return KS_LANG_OTHER;
+    int s;
+    if (!layout) return KS_SLOT_NONE;
+    if (cached_generation != g_pair_generation) {
+        cached_count = 0;
+        cached_generation = g_pair_generation;
+    }
     for (i = 0; i < cached_count; ++i)
-        if (cached_layouts[i] == layout) return cached_languages[i];
-    for (i = 0; i < 2 && language == KS_LANG_OTHER; ++i) {
+        if (cached_layouts[i] == layout) return cached_slots[i];
+    for (i = 0; i < 2 && !probe; ++i) {
         BYTE state[256];
         wchar_t output[4];
         UINT virtual_key = MapVirtualKeyExW(probes[i], MAPVK_VSC_TO_VK_EX, layout);
-        int count;
         if (!virtual_key) continue;
         ZeroMemory(state, sizeof(state));
-        count = ToUnicodeEx(virtual_key, probes[i], state, output, 4, 4, layout);
-        if (count != 1) continue;
-        if ((output[0] >= L'a' && output[0] <= L'z') || (output[0] >= L'A' && output[0] <= L'Z'))
-            language = KS_LANG_ENGLISH;
-        else if (output[0] >= 0x0600 && output[0] <= 0x06FF)
-            language = primary == 0x29 || primary == LANG_ENGLISH || primary == 0 ? KS_LANG_PERSIAN
-                                                                                  : KS_LANG_OTHER;
+        if (ToUnicodeEx(virtual_key, probes[i], state, output, 4, 4, layout) == 1 && ks_is_letter(output[0]))
+            probe = output[0];
     }
-    /* An Arabic, Urdu or Kurdish keyboard also types Arabic script; only a
-       Persian one (or one filed under English) is ours. Latin keyboards
-       for other languages (German, French) stay unsupported. */
-    if (language == KS_LANG_ENGLISH && primary != LANG_ENGLISH && primary != 0x29) language = KS_LANG_OTHER;
-    if (language == KS_LANG_OTHER && primary == LANG_ENGLISH) language = KS_LANG_ENGLISH;
-    if (language == KS_LANG_OTHER && primary == 0x29) language = KS_LANG_PERSIAN;
+    script = probe ? script_of(probe) : SCRIPT_NONE;
+    /* 1. A language pack claims the layouts filed under its own language
+          that type its alphabet. */
+    for (s = KS_SLOT_A; s <= KS_SLOT_B && slot == KS_SLOT_NONE; ++s) {
+        const SLOT_STATE *state = &g_slots[s];
+        if (!state->pack_data) continue;
+        /* A pack never claims the keyboards of English or Persian when that
+           language is the other half of the pair. */
+        if ((primary == LANG_ENGLISH && slot_of_model(KS_LANG_ENGLISH) != KS_SLOT_NONE) ||
+            (primary == 0x29 && slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE))
+            break;
+        for (i = 0; i < state->pack.langid_count; ++i) {
+            if (state->pack.langids[i] == primary &&
+                (script == SCRIPT_NONE || state->script == SCRIPT_NONE || script == state->script)) {
+                slot = (KS_SLOT)s;
+                break;
+            }
+        }
+    }
+    /* 2. English and Persian, exactly as before 4.0: a Latin keyboard filed
+          under English or Persian is English; an Arabic-script keyboard
+          filed under Persian or English is Persian (an Arabic, Urdu or
+          Kurdish one is not); Latin keyboards for other languages are not
+          English. */
+    if (slot == KS_SLOT_NONE) {
+        KS_LANGUAGE model = KS_LANG_OTHER;
+        if (script == SCRIPT_LATIN)
+            model = primary == LANG_ENGLISH || primary == 0x29 ? KS_LANG_ENGLISH : KS_LANG_OTHER;
+        else if (probe >= 0x0600 && probe <= 0x06FF)
+            model = primary == 0x29 || primary == LANG_ENGLISH || primary == 0 ? KS_LANG_PERSIAN : KS_LANG_OTHER;
+        else if (!probe)   /* the layout could not be asked: its language decides */
+            model = primary == LANG_ENGLISH ? KS_LANG_ENGLISH : primary == 0x29 ? KS_LANG_PERSIAN : KS_LANG_OTHER;
+        slot = slot_of_model(model);
+    }
+    /* 3. A keyboard for a pack language filed under English (as a Persian
+          one may be): its alphabet decides, when only one slot writes it. */
+    if (slot == KS_SLOT_NONE && (primary == LANG_ENGLISH || primary == 0) &&
+        script != SCRIPT_NONE && script != SCRIPT_LATIN) {
+        int matches = 0;
+        KS_SLOT match = KS_SLOT_NONE;
+        for (s = KS_SLOT_A; s <= KS_SLOT_B; ++s)
+            if (g_slots[s].pack_data && g_slots[s].script == script) { ++matches; match = (KS_SLOT)s; }
+        if (matches == 1) slot = match;
+    }
     if (cached_count < 16) {
         cached_layouts[cached_count] = layout;
-        cached_languages[cached_count++] = language;
+        cached_slots[cached_count++] = slot;
     }
-    return language;
+    return slot;
 }
 
 static void resolve_input_target(HWND foreground, KS_INPUT_TARGET *target) {
@@ -1430,33 +2046,26 @@ static const KS_INPUT_TARGET *input_target(HWND foreground) {
     return &g_target;
 }
 
-static KS_LANGUAGE target_language(const KS_INPUT_TARGET *target) {
+static KS_SLOT target_language(const KS_INPUT_TARGET *target) {
     HKL layout;
-    KS_LANGUAGE language;
-    if (!target || !target->thread) return KS_LANG_OTHER;
+    KS_SLOT language;
+    if (!target || !target->thread) return KS_SLOT_NONE;
     layout = GetKeyboardLayout(target->thread);
     /* A thread whose layout cannot be read (it may be exiting): fall back to
        the foreground window's thread rather than going blind. */
     if (!layout && target->top)
         layout = GetKeyboardLayout(GetWindowThreadProcessId(target->top, NULL));
-    language = language_from_layout(layout);
-    if (language == KS_LANG_ENGLISH) g_last_english_layout = layout;
-    else if (language == KS_LANG_PERSIAN) g_last_persian_layout = layout;
+    language = slot_from_layout(layout);
+    if (slot_valid(language)) g_slots[language].last_layout = layout;
     return language;
 }
 
-static KS_LANGUAGE foreground_language(HWND foreground) {
-    if (!foreground) return KS_LANG_OTHER;
+static KS_SLOT foreground_language(HWND foreground) {
+    if (!foreground) return KS_SLOT_NONE;
     /* Always re-resolve: focus moves between controls without the foreground
        window changing (Tab between fields, a dialog's edit box). */
     resolve_input_target(foreground, &g_target);
     return target_language(&g_target);
-}
-
-static const wchar_t *language_name(KS_LANGUAGE language) {
-    if (language == KS_LANG_ENGLISH) return L"English";
-    if (language == KS_LANG_PERSIAN) return L"Persian";
-    return L"Unsupported";
 }
 
 static int basename_equals(const wchar_t *path, const wchar_t *candidate, size_t length) {
@@ -1622,22 +2231,22 @@ static int edit_control_protected(HWND foreground) {
     return 0;
 }
 
-static HKL find_layout(KS_LANGUAGE language) {
-    int count = GetKeyboardLayoutList(0, NULL);
+static HKL find_layout(KS_SLOT language) {
+    int count;
     HKL layouts[32];
     int i;
-    HKL remembered =
-        language == KS_LANG_PERSIAN
-            ? g_last_persian_layout : g_last_english_layout;
-    if (remembered && language_from_layout(remembered) == language)
+    HKL remembered;
+    if (!slot_valid(language)) return NULL;
+    remembered = g_slots[language].last_layout;
+    if (remembered && slot_from_layout(remembered) == language)
         return remembered;
+    count = GetKeyboardLayoutList(0, NULL);
     if (count > 32) count = 32;
     if (count > 0) {
         count = GetKeyboardLayoutList(count, layouts);
         for (i = 0; i < count; ++i) {
-            if (language_from_layout(layouts[i]) == language) {
-                if (language == KS_LANG_PERSIAN) g_last_persian_layout = layouts[i];
-                else g_last_english_layout = layouts[i];
+            if (slot_from_layout(layouts[i]) == language) {
+                g_slots[language].last_layout = layouts[i];
                 return layouts[i];
             }
         }
@@ -1651,11 +2260,11 @@ static HKL find_layout(KS_LANGUAGE language) {
     return NULL;
 }
 
-/* The keyboard layout Windows lacks: KS_LANG_OTHER when both exist. */
-static KS_LANGUAGE missing_layout(void) {
-    if (!find_layout(KS_LANG_PERSIAN)) return KS_LANG_PERSIAN;
-    if (!find_layout(KS_LANG_ENGLISH)) return KS_LANG_ENGLISH;
-    return KS_LANG_OTHER;
+/* The keyboard layout Windows lacks: KS_SLOT_NONE when both exist. */
+static KS_SLOT missing_layout(void) {
+    if (!find_layout(KS_SLOT_B)) return KS_SLOT_B;
+    if (!find_layout(KS_SLOT_A)) return KS_SLOT_A;
+    return KS_SLOT_NONE;
 }
 
 static int translated_layout_character(HKL layout, DWORD scan_code,
@@ -1684,6 +2293,25 @@ static int translated_layout_character(HKL layout, DWORD scan_code,
     return 1;
 }
 
+/* 2 when the layout types this key as exactly two printable characters
+   (the Arabic lam-alef), which land in `output`. */
+static int translated_layout_pair(HKL layout, DWORD scan_code, int shift, int caps, wchar_t *output) {
+    BYTE keyboard_state[256];
+    wchar_t text[4];
+    UINT virtual_key;
+    if (!layout) return 0;
+    ZeroMemory(keyboard_state, sizeof(keyboard_state));
+    if (shift) keyboard_state[VK_SHIFT] = 0x80;
+    if (caps) keyboard_state[VK_CAPITAL] = 1;
+    virtual_key = MapVirtualKeyExW(scan_code, MAPVK_VSC_TO_VK_EX, layout);
+    if (!virtual_key || ToUnicodeEx(virtual_key, scan_code, keyboard_state, text, 4, 4, layout) != 2 ||
+        text[0] < 0x20 || text[1] < 0x20)
+        return 0;
+    output[0] = text[0];
+    output[1] = text[1];
+    return 2;
+}
+
 /* 1 when the layout that will render this key produces exactly one
    printable character for it (not a dead key, not a ligature, not nothing):
    only then does one key stand for one character on screen. */
@@ -1694,39 +2322,114 @@ static int active_layout_types_one_character(DWORD scan_code, int shift, int cap
     return translated_layout_character(layout, scan_code, shift, caps, &character);
 }
 
+/* 1 when the active layout treats this key as a dead key (^ ´ ` on German,
+   French or US-International keyboards): the next key's character is
+   composed with it, so what reaches the screen is no longer one character
+   per key of the word model. */
+static int active_layout_dead_key(DWORD scan_code, int shift, int caps) {
+    HKL layout = g_target.thread ? GetKeyboardLayout(g_target.thread) : NULL;
+    BYTE keyboard_state[256];
+    wchar_t output[4];
+    UINT virtual_key;
+    if (!layout) return 0;
+    ZeroMemory(keyboard_state, sizeof(keyboard_state));
+    if (shift) keyboard_state[VK_SHIFT] = 0x80;
+    if (caps) keyboard_state[VK_CAPITAL] = 1;
+    virtual_key = MapVirtualKeyExW(scan_code, MAPVK_VSC_TO_VK_EX, layout);
+    return virtual_key && ToUnicodeEx(virtual_key, scan_code, keyboard_state, output, 4, 4, layout) < 0;
+}
+
+/* Set by a dead key: the word it starts ("être" after ^) is left alone. */
+static int g_dead_key_word;
+
+/*
+ * The keys that type letters. For English and Persian this is the fixed set
+ * the engine always used. For any other pair it is computed from the two
+ * keyboards: a key belongs to words when either layout types a letter on it
+ * (with or without Shift), or an apostrophe in a language that writes one
+ * inside words. Recomputed when the pair or one of its layouts changes.
+ */
+static int pair_word_key(DWORD scan_code, HKL first, HKL second) {
+    static unsigned char keys[0x60];
+    static HKL built_for[2];
+    static unsigned long built_generation;
+    static const DWORD candidates[][2] = {
+        {0x02, 0x0D}, {0x10, 0x1B}, {0x1E, 0x29}, {0x2B, 0x35}, {0x56, 0x56}};
+    if (pair_is_english_persian()) return ks_is_word_scancode(scan_code);
+    if (scan_code >= 0x60) return 0;
+    if (built_generation != g_pair_generation || built_for[0] != first || built_for[1] != second) {
+        size_t range;
+        ZeroMemory(keys, sizeof(keys));
+        for (range = 0; range < sizeof(candidates) / sizeof(candidates[0]); ++range) {
+            DWORD scan;
+            for (scan = candidates[range][0]; scan <= candidates[range][1]; ++scan) {
+                int which;
+                for (which = 0; which < 2 && !keys[scan]; ++which) {
+                    HKL layout = which ? second : first;
+                    const KS_LANG_PROFILE *profile = g_slots[which ? KS_SLOT_B : KS_SLOT_A].profile;
+                    int shift;
+                    for (shift = 0; shift < 2; ++shift) {
+                        wchar_t character = 0;
+                        if (!translated_layout_character(layout, scan, shift, 0, &character)) continue;
+                        if (ks_is_letter(character) ||
+                            (character == L'\'' && profile && (profile->flags & KS_PROFILE_APOSTROPHE)))
+                            keys[scan] = 1;
+                    }
+                }
+            }
+        }
+        built_for[0] = first;
+        built_for[1] = second;
+        built_generation = g_pair_generation;
+    }
+    return keys[scan_code];
+}
+
+/* 1: the key types one character in each layout of the pair (a token);
+   0: not a key of words; -1 (pairs other than English/Persian): a key of
+   words that one layout cannot type as a single character (the Arabic
+   lam-alef, a dead key), so the word it is part of cannot be followed. */
 static int map_physical_key(DWORD scan_code, int shift, int caps,
                             KS_TOKEN *token) {
-    HKL english_layout = find_layout(KS_LANG_ENGLISH);
-    HKL persian_layout = find_layout(KS_LANG_PERSIAN);
+    HKL a_layout = find_layout(KS_SLOT_A);
+    HKL b_layout = find_layout(KS_SLOT_B);
     KS_TOKEN fallback;
-    int fallback_ok;
-    int english_ok;
-    int persian_ok;
+    int fallback_ok = 0;
+    int a_ok;
+    int b_ok;
+    KS_SLOT persian = slot_of_model(KS_LANG_PERSIAN);
 
     if (!token) return 0;
     /*
      * ToUnicodeEx also translates Space, digits, and punctuation. They are
-     * printable characters but not members of a Persian/English word. Gate
-     * runtime translation through the deliberately small physical-key map so
-     * Space reaches the boundary evaluator instead of being swallowed into
-     * the current word.
+     * printable characters but not members of a word. Gate runtime
+     * translation through the word keys so Space reaches the boundary
+     * evaluator instead of being swallowed into the current word.
      */
-    if (!ks_is_word_scancode(scan_code)) return 0;
+    if (!pair_word_key(scan_code, a_layout, b_layout)) return 0;
     ZeroMemory(&fallback, sizeof(fallback));
-    fallback_ok = ks_map_scancode(scan_code, shift, caps, &fallback);
-    english_ok = translated_layout_character(
-        english_layout, scan_code, shift, caps, &token->english);
-    persian_ok = translated_layout_character(
-        persian_layout, scan_code, shift, caps, &token->persian);
-    if (!english_ok) token->english = fallback_ok ? fallback.english : 0;
-    if (!persian_ok) token->persian = fallback_ok ? fallback.persian : 0;
-    if (token->english == 0 || token->persian == 0) return 0;
+    /* The built-in English/Persian table stands in for a missing layout of
+       the original pair only. */
+    if (pair_is_english_persian() && ks_map_scancode(scan_code, shift, caps, &fallback)) {
+        fallback_ok = 1;
+        if (persian == KS_SLOT_A) {
+            wchar_t swap = fallback.a;
+            fallback.a = fallback.b;
+            fallback.b = swap;
+        }
+    }
+    a_ok = translated_layout_character(a_layout, scan_code, shift, caps, &token->a);
+    b_ok = translated_layout_character(b_layout, scan_code, shift, caps, &token->b);
+    if (!a_ok) token->a = fallback_ok ? fallback.a : 0;
+    if (!b_ok) token->b = fallback_ok ? fallback.b : 0;
+    if (token->a == 0 || token->b == 0) return pair_is_english_persian() ? 0 : -1;
     /*
      * Diacritics produced by Shift+letter on the Persian layout stay in the
-     * token: the core strips them for dictionary lookup, and the English
-     * side ("Excel" mistyped on the Persian layout) must remain correctable.
+     * token: the core strips them for dictionary lookup, and the other side
+     * ("Excel" mistyped on the Persian layout) must remain correctable.
      */
-    token->persian = ks_canonical_persian(token->persian);
+    if (persian == KS_SLOT_A) token->a = ks_canonical_persian(token->a);
+    else if (persian == KS_SLOT_B) token->b = ks_canonical_persian(token->b);
     return 1;
 }
 
@@ -1735,9 +2438,9 @@ static BOOL CALLBACK post_layout_to_thread_window(HWND window, LPARAM layout) {
     return TRUE;
 }
 
-static int layout_active_on(const KS_INPUT_TARGET *target, KS_LANGUAGE language) {
+static int layout_active_on(const KS_INPUT_TARGET *target, KS_SLOT language) {
     return target->thread &&
-           language_from_layout(GetKeyboardLayout(target->thread)) == language;
+           slot_from_layout(GetKeyboardLayout(target->thread)) == language;
 }
 
 /*
@@ -1759,7 +2462,7 @@ static BOOL CALLBACK post_layout_to_child_window(HWND window, LPARAM layout) {
     return TRUE;
 }
 
-static void request_layout(HWND foreground, KS_LANGUAGE language) {
+static void request_layout(HWND foreground, KS_SLOT language) {
     HKL layout = find_layout(language);
     const KS_INPUT_TARGET *target;
     DWORD_PTR result = 0;
@@ -1791,10 +2494,19 @@ static void request_layout(HWND foreground, KS_LANGUAGE language) {
      * still ahead of the keys the user types next. The low-level hook has a
      * tight time budget, so no second blocking wait follows.
      */
-    if (!SendMessageTimeoutW(target->focus, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)layout,
-                             SMTO_ABORTIFHUNG, 50, &result)) {
-        PostMessageW(target->focus, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)layout);
-        return; /* verified by the hook on the next key */
+    {
+        /* Inside the hook, never wait past its time budget. */
+        UINT wait = 50;
+        if (g_hook_entered_at) {
+            DWORD used = GetTickCount() - g_hook_entered_at;
+            wait = used + 10 >= g_hook_budget_ms ? 0 : (UINT)(g_hook_budget_ms - used - 10);
+            if (wait > 50) wait = 50;
+        }
+        if (!wait || !SendMessageTimeoutW(target->focus, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)layout,
+                                          SMTO_ABORTIFHUNG, wait, &result)) {
+            PostMessageW(target->focus, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)layout);
+            return; /* verified by the hook on the next key */
+        }
     }
     if (layout_active_on(target, language)) return;
     /*
@@ -1839,13 +2551,13 @@ static void forget_layout_request(void) {
  * translated by the layout that was active before the request. The keys the
  * user types in that state are meant for the requested layout.
  */
-static int switch_still_pending(HWND foreground, KS_LANGUAGE now) {
+static int switch_still_pending(HWND foreground, KS_SLOT now) {
     return g_layout_request_at &&
            g_layout_request_window == foreground &&
            now == g_layout_request_from &&
            now != g_layout_request_language &&
-           (g_layout_request_language == KS_LANG_ENGLISH ||
-            g_layout_request_language == KS_LANG_PERSIAN) &&
+           (g_layout_request_language == KS_SLOT_A ||
+            g_layout_request_language == KS_SLOT_B) &&
            GetTickCount() - g_layout_request_at < 3000u &&
            GetTickCount() - g_layout_request_started < 10000u;
 }
@@ -1888,7 +2600,7 @@ static void add_unicode_input(INPUT *inputs, UINT *count, wchar_t character) {
  */
 static int send_replacement(HWND foreground, int delete_count, const wchar_t *replacement,
                             UINT delimiter, int delimiter_zwnj,
-                            KS_LANGUAGE target_language) {
+                            KS_SLOT target_language) {
     INPUT inputs[(KS_MAX_PHRASE_CHARS + 3) * 4];
     UINT count = 0;
     int excel_delete;
@@ -1899,6 +2611,9 @@ static int send_replacement(HWND foreground, int delete_count, const wchar_t *re
         delete_count > KS_MAX_PHRASE_CHARS) return 0;
     replacement_length = wcslen(replacement);
     if (replacement_length > KS_MAX_PHRASE_CHARS) return 0;
+    /* Enter in a terminal submits the line, and a password prompt there
+       looks like any other line: what was typed is sent as typed. */
+    if (delimiter == VK_RETURN && focus_facts(foreground)->developer_tool) return 0;
     /* Excel's AutoComplete leaves the rest of a matching entry selected
        after the caret; the first Backspace would only remove the selection.
        Delete clears it first, but only in a freshly entered cell: while
@@ -1937,7 +2652,7 @@ static int send_replacement(HWND foreground, int delete_count, const wchar_t *re
          * for Persian text, a plain space for English.
          */
         add_unicode_input(inputs, &count,
-                          target_language == KS_LANG_PERSIAN ? (wchar_t)ZWNJ : L' ');
+                          slot_is(target_language, KS_LANG_PERSIAN) ? (wchar_t)ZWNJ : L' ');
     } else if (delimiter) {
         add_virtual_input(inputs, &count, (WORD)delimiter);
     }
@@ -1957,7 +2672,7 @@ static int send_replacement(HWND foreground, int delete_count, const wchar_t *re
     return 1;
 }
 
-static void store_phrase_undo(HWND foreground, KS_LANGUAGE source_language,
+static void store_phrase_undo(HWND foreground, KS_SLOT source_language,
                               UINT delimiter, int delimiter_zwnj,
                               const wchar_t *original,
                               const wchar_t *replacement) {
@@ -1975,11 +2690,11 @@ static void store_phrase_undo(HWND foreground, KS_LANGUAGE source_language,
 
 static void store_undo(HWND foreground, const KS_DECISION *decision,
                        UINT delimiter, int delimiter_zwnj) {
-    store_phrase_undo(foreground, decision->source_language, delimiter,
+    store_phrase_undo(foreground, decision->source_slot, delimiter,
                       delimiter_zwnj, decision->original, decision->replacement);
 }
 
-static void remember_corrected_word(HWND foreground, KS_LANGUAGE language);
+static void remember_corrected_word(HWND foreground, KS_SLOT language);
 
 static int apply_decision(HWND foreground, const KS_DECISION *decision,
                           int delete_count, UINT delimiter, int delimiter_zwnj) {
@@ -1989,23 +2704,22 @@ static int apply_decision(HWND foreground, const KS_DECISION *decision,
     }
     if (!send_replacement(foreground, delete_count, decision->replacement,
                           delimiter, delimiter_zwnj,
-                          decision->target_language)) return 0;
+                          decision->target_slot)) return 0;
     store_undo(foreground, decision, delimiter, delimiter_zwnj);
     mark_sentence_word(foreground);
-    remember_intent(foreground, decision->target_language, 3);
-    remember_corrected_word(foreground, decision->target_language);
+    remember_intent(foreground, decision->target_slot, 3);
+    remember_corrected_word(foreground, decision->target_slot);
     InterlockedIncrement(&g_corrections);
     stats_count_correction(decision->original, 0);
     set_activity_pair(L"Corrected", decision->original, decision->replacement);
     return 1;
 }
 
+/* The text the keys produce in one layout of the pair (slot A when the
+   slot is unknown, as before). */
 static void tokens_to_language(const KS_TOKEN *tokens, int count,
-                               KS_LANGUAGE language, wchar_t *output) {
-    if (language == KS_LANG_PERSIAN)
-        ks_tokens_to_persian(tokens, count, output);
-    else
-        ks_tokens_to_english(tokens, count, output);
+                               KS_SLOT language, wchar_t *output) {
+    ks_tokens_to_slot(tokens, count, language == KS_SLOT_B ? KS_SLOT_B : KS_SLOT_A, output);
 }
 
 static int append_phrase_word(wchar_t *phrase, size_t capacity,
@@ -2025,9 +2739,9 @@ static int append_phrase_word(wchar_t *phrase, size_t capacity,
 static int try_sequence_correction(HWND foreground,
                                    const KS_TOKEN *current_tokens,
                                    int current_count,
-                                   KS_LANGUAGE current_visible_language,
+                                   KS_SLOT current_visible_language,
                                    UINT delimiter, int delimiter_zwnj,
-                                   KS_LANGUAGE context_language,
+                                   KS_SLOT context_language,
                                    int context_strength) {
     KS_SEQUENCE_WORD words[KS_MAX_SEQUENCE_WORDS];
     KS_SEQUENCE_RESULT result;
@@ -2070,7 +2784,7 @@ static int try_sequence_correction(HWND foreground,
         replacement[0] = 0;
         needs_change = 0;
         for (index = 0; index < word_count; ++index) {
-            KS_LANGUAGE visible_language;
+            KS_SLOT visible_language;
             wchar_t separator =
                 index > 0 ? g_history[start + index - 1].separator : 0;
             if (index < word_count - 1) {
@@ -2079,7 +2793,7 @@ static int try_sequence_correction(HWND foreground,
             } else {
                 visible_language = current_visible_language;
             }
-            if (visible_language != result.language) needs_change = 1;
+            if (visible_language != result.slot) needs_change = 1;
             tokens_to_language(words[index].tokens, words[index].count,
                                visible_language, word_text);
             if (!append_phrase_word(original,
@@ -2087,9 +2801,9 @@ static int try_sequence_correction(HWND foreground,
                                     word_text, separator))
                 return 0;
             tokens_to_language(words[index].tokens, words[index].count,
-                               result.language, word_text);
-            /* A ZWNJ only exists in Persian; English words get a space. */
-            if (separator == (wchar_t)ZWNJ && result.language != KS_LANG_PERSIAN)
+                               result.slot, word_text);
+            /* A ZWNJ only exists in Persian; other words get a space. */
+            if (separator == (wchar_t)ZWNJ && !slot_is(result.slot, KS_LANG_PERSIAN))
                 separator = L' ';
             if (!append_phrase_word(replacement,
                                     sizeof(replacement) /
@@ -2104,12 +2818,12 @@ static int try_sequence_correction(HWND foreground,
             return 0;
         }
         if (!send_replacement(foreground, (int)wcslen(original), replacement,
-                              delimiter, delimiter_zwnj, result.language))
+                              delimiter, delimiter_zwnj, result.slot))
             return 0;
         /* The restored text is the phrase as typed: mostly the language
            the replaced words were typed in, the opposite of the result. */
         store_phrase_undo(foreground,
-                          result.language == KS_LANG_ENGLISH ? KS_LANG_PERSIAN : KS_LANG_ENGLISH,
+                          result.slot == KS_SLOT_A ? KS_SLOT_B : KS_SLOT_A,
                           delimiter,
                           delimiter_zwnj, original, replacement);
         /*
@@ -2119,15 +2833,15 @@ static int try_sequence_correction(HWND foreground,
          * Space that SendInput already inserted.
          */
         for (index = 0; index < word_count - 1; ++index) {
-            g_history[start + index].visible_language = result.language;
-            if (result.language != KS_LANG_PERSIAN)
+            g_history[start + index].visible_language = result.slot;
+            if (!slot_is(result.slot, KS_LANG_PERSIAN))
                 g_history[start + index].separator = L' ';
         }
         history_push(foreground, current_tokens, current_count,
-                     result.language, delimiter, delimiter_zwnj);
+                     result.slot, delimiter, delimiter_zwnj);
         mark_sentence_word(foreground);
-        remember_intent(foreground, result.language, 4);
-        remember_corrected_word(foreground, result.language);
+        remember_intent(foreground, result.slot, 4);
+        remember_corrected_word(foreground, result.slot);
         InterlockedIncrement(&g_corrections);
         stats_count_correction(NULL, 0);
         set_activity_pair(L"Phrase corrected", original, replacement);
@@ -2258,9 +2972,10 @@ static void load_personal_dictionary(void) {
 
 static void append_personal_dictionary(const wchar_t *word) {
     HANDLE file;
-    char utf8[KS_MAX_WORD * 4 + 4];
+    char utf8[KS_MAX_WORD * 4 + 6];
     int length;
     DWORD written = 0;
+    LARGE_INTEGER size;
 
     if (!g_settings.personal_dictionary || !word || !*word) return;
     if (ks_vocab_trusted(&g_personal_vocabulary, word)) return;
@@ -2270,15 +2985,33 @@ static void append_personal_dictionary(const wchar_t *word) {
         save_personal_dictionary();
         return;
     }
-    length = WideCharToMultiByte(CP_UTF8, 0, word, -1, utf8, (int)sizeof(utf8) - 3, NULL, NULL);
+    /* utf8[0..1] are reserved for a line break before the word. */
+    length = WideCharToMultiByte(CP_UTF8, 0, word, -1, utf8 + 2, (int)sizeof(utf8) - 5, NULL, NULL);
     if (length <= 1) return;
-    utf8[length - 1] = '\r';
-    utf8[length] = '\n';
-    file = CreateFileW(g_personal_dictionary_path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+    utf8[2 + length - 1] = '\r';
+    utf8[2 + length] = '\n';
+    file = CreateFileW(g_personal_dictionary_path, GENERIC_READ | FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         set_activity(L"The personal dictionary could not be written.");
         return;
+    }
+    {
+        /* A hand-edited file may end without a line break: start a new
+           line first, or two words would merge into one. */
+        char last = '\n';
+        DWORD got = 0;
+        int offset = 2;
+        if (GetFileSizeEx(file, &size) && size.QuadPart > 0 &&
+            SetFilePointer(file, -1, NULL, FILE_END) != INVALID_SET_FILE_POINTER &&
+            ReadFile(file, &last, 1, &got, NULL) && got == 1 && last != '\n') {
+            utf8[0] = '\r';
+            utf8[1] = '\n';
+            offset = 0;
+        }
+        SetFilePointer(file, 0, NULL, FILE_END);
+        memmove(utf8, utf8 + offset, (size_t)(length + 1 + 2 - offset));
+        length += 2 - offset;
     }
     if (WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL) && written == (DWORD)(length + 1))
         ++personal_dictionary_lines;
@@ -2433,13 +3166,17 @@ static void engine_reset_for_focus(void) {
     g_orphan_peak[0] = 0;
     g_capitalize_armed = 0;
     g_capitalize_next = 0;
+    g_dead_key_word = 0;
 }
 
 /* 1 when MSAA reports the focused element as a protected (password) field. */
+/* 1 protected, 0 not, -1 the element could not be asked (a browser builds
+   its accessibility tree on the first request: asking again shortly after
+   usually works). */
 static int accessible_is_protected(HWND window, LONG object_id, LONG child_id) {
     IAccessible *accessible = NULL;
     VARIANT child;
-    int protected_now = 0;
+    int protected_now = -1;
     if (!g_com_ready) return 0;   /* only Windows' own password edits are known then */
     VariantInit(&child);
     if (SUCCEEDED(AccessibleObjectFromEvent(window, (DWORD)object_id, (DWORD)child_id,
@@ -2447,8 +3184,8 @@ static int accessible_is_protected(HWND window, LONG object_id, LONG child_id) {
         VARIANT state;
         VariantInit(&state);
         if (SUCCEEDED(accessible->lpVtbl->get_accState(accessible, child, &state)) &&
-            V_VT(&state) == VT_I4 && (V_I4(&state) & STATE_SYSTEM_PROTECTED))
-            protected_now = 1;
+            V_VT(&state) == VT_I4)
+            protected_now = (V_I4(&state) & STATE_SYSTEM_PROTECTED) ? 1 : 0;
         VariantClear(&state);
         accessible->lpVtbl->Release(accessible);
     }
@@ -2459,6 +3196,8 @@ static int accessible_is_protected(HWND window, LONG object_id, LONG child_id) {
 static void run_focus_query(void);
 static int g_focus_query_posted;
 static int g_focus_query_running;
+static int g_focus_query_attempts;   /* questions asked about the current element */
+static DWORD g_state_query_since;    /* a state-change question waits for the word to end */
 
 static void read_hook_budget(void) {
     HKEY key;
@@ -2477,6 +3216,27 @@ static void CALLBACK focus_event_proc(HWINEVENTHOOK hook, DWORD event, HWND wind
     (void)hook;
     (void)thread_id;
     (void)event_time;
+    if (event == EVENT_OBJECT_STATECHANGE) {
+        /* A field that turns into a password field after it got the focus
+           (type="password" set by a script) is asked again. Between words
+           it counts as protected until the answer arrives. In the middle of
+           a word (an autocomplete list opening and closing as you type) the
+           question waits for the word to end, at most two seconds: asked
+           now, it would cost that word its correction. */
+        if (window && window == g_focus_event_window && object_id == g_focus_event_object &&
+            child_id == g_focus_event_child && g_focus_event_protected == 0 && g_window) {
+            if (!g_has_context && !g_focus_query_posted) {
+                g_focus_event_protected = -1;
+                g_facts.computed_at = 0;
+                g_focus_query_posted = 1;
+                PostMessageW(g_window, WM_APP_FOCUS_QUERY, 0, 0);
+            } else if (g_has_context) {
+                if (!g_state_query_since) g_state_query_since = GetTickCount();
+                SetTimer(g_window, ID_TIMER_STATE_QUERY, 150, NULL);
+            }
+        }
+        return;
+    }
     if (event != EVENT_OBJECT_FOCUS || !window) return;
     if (window == g_focus_event_window && object_id == g_focus_event_object &&
         child_id == g_focus_event_child) return;
@@ -2484,8 +3244,12 @@ static void CALLBACK focus_event_proc(HWINEVENTHOOK hook, DWORD event, HWND wind
     g_focus_event_object = object_id;
     g_focus_event_child = child_id;
     ++g_focus_serial;
-    if (g_engine_depth > 0) g_engine_interrupted = 1;
-    engine_reset_for_focus();
+    if (g_engine_depth > 0) {
+        g_engine_interrupted = 1;
+        g_reset_pending = 1;
+    } else {
+        engine_reset_for_focus();
+    }
     /*
      * Password detection for fields Windows' own controls do not describe:
      * browsers, Electron and WPF mark password inputs "protected" in MSAA.
@@ -2495,6 +3259,7 @@ static void CALLBACK focus_event_proc(HWINEVENTHOOK hook, DWORD event, HWND wind
      * by the query's loop instead of being left unchecked.
      */
     g_focus_event_protected = -1;
+    g_focus_query_attempts = 0;
     g_facts.computed_at = 0;
     if (busy) return;   /* the running query loops and picks this one up */
     /* Inside another operation (even inside the keyboard hook, when it
@@ -2517,17 +3282,34 @@ static void CALLBACK focus_event_proc(HWINEVENTHOOK hook, DWORD event, HWND wind
 static void run_focus_query(void) {
     static int busy;
     int round;
+    DWORD started = GetTickCount();
     if (busy || !engine_enter()) return;
     busy = 1;
     g_focus_query_running = 1;
-    for (round = 0; round < 4; ++round) {
+    /* A hung application can make each question slow: stop following a
+       moving focus after a fifth of a second (the field stays "unknown"
+       and is asked again from the message loop). */
+    for (round = 0; round < 4 && GetTickCount() - started < 200u; ++round) {
         HWND queried_window = g_focus_event_window;
         LONG queried_object = g_focus_event_object;
         LONG queried_child = g_focus_event_child;
         unsigned long serial = g_focus_serial;
         int protected_now = accessible_is_protected(queried_window, queried_object, queried_child);
         if (serial == g_focus_serial) {
-            g_focus_event_protected = protected_now;
+            if (protected_now < 0) {
+                /* Not answerable yet: unknown (treated as protected) and
+                   asked once more shortly; after that, an element that
+                   never answers is treated as an ordinary field. */
+                if (g_focus_query_attempts++ == 0) {
+                    g_focus_event_protected = -1;
+                    if (g_window) SetTimer(g_window, ID_TIMER_FOCUS_QUERY, 300, NULL);
+                    g_focus_query_posted = 1;
+                } else {
+                    g_focus_event_protected = 0;
+                }
+            } else {
+                g_focus_event_protected = protected_now;
+            }
             break;
         }
     }
@@ -2555,8 +3337,10 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
 
     if (!g_spelling_available || g_settings.spelling == KS_SPELL_OFF) return SPELL_NOT_CONSULTED;
     if (!foreground || g_word_count < 3 || g_word_count > KS_MAX_WORD) return SPELL_NOT_CONSULTED;
-    if (g_word_language != KS_LANG_ENGLISH && g_word_language != KS_LANG_PERSIAN) return SPELL_NOT_CONSULTED;
-    lexicon = g_word_language == KS_LANG_PERSIAN ? &g_persian_spelling : &g_english_spelling;
+    /* Spelling models exist for English and Persian only. */
+    if (!slot_is(g_word_language, KS_LANG_ENGLISH) && !slot_is(g_word_language, KS_LANG_PERSIAN))
+        return SPELL_NOT_CONSULTED;
+    lexicon = slot_is(g_word_language, KS_LANG_PERSIAN) ? &g_persian_spelling : &g_english_spelling;
     tokens_to_language(g_word, g_word_count, g_word_language, typed);
     /* A capital the hook itself put at a sentence start is not the user's
        signal for a name: check the lower-case word, restore the capital. The
@@ -2590,8 +3374,8 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
     decision.should_correct = 1;
     decision.key_count = g_word_count;
     decision.confidence = result.confidence;
-    decision.source_language = g_word_language;
-    decision.target_language = g_word_language;
+    decision.source_slot = g_word_language;
+    decision.target_slot = g_word_language;
     safe_copy(decision.original, KS_MAX_WORD + 1, result.original);
     safe_copy(decision.replacement, KS_MAX_WORD + 1, result.replacement);
     if (!send_replacement(foreground, g_word_count, decision.replacement,
@@ -2639,7 +3423,7 @@ static void observe_vocabulary(HWND foreground) {
  * soon as the whole sequence spells a word in exactly one language the
  * on-screen mixture is replaced by that word.
  */
-static int layout_change_was_ours(HWND foreground, KS_LANGUAGE now) {
+static int layout_change_was_ours(HWND foreground, KS_SLOT now) {
     if (g_layout_request_window != foreground) return 0;
     /* The switch we asked for arriving late... */
     if (g_layout_request_language == now && GetTickCount() - g_layout_request_at < 3000u) return 1;
@@ -2650,7 +3434,7 @@ static int layout_change_was_ours(HWND foreground, KS_LANGUAGE now) {
            GetTickCount() - g_layout_request_started < 10000u;
 }
 
-static KS_LANGUAGE current_word_layout(void) {
+static KS_SLOT current_word_layout(void) {
     return g_word_mixed && g_word_count > 0 ? g_word_visible[g_word_count - 1] : g_word_language;
 }
 
@@ -2664,21 +3448,16 @@ static int word_is_uniform(void) {
 static void mixed_visible_text(wchar_t *output) {
     int i;
     for (i = 0; i < g_word_count; ++i)
-        output[i] = g_word_visible[i] == KS_LANG_PERSIAN ? g_word[i].persian : g_word[i].english;
+        output[i] = g_word_visible[i] == KS_SLOT_B ? g_word[i].b : g_word[i].a;   /* per slot */
     output[g_word_count] = 0;
-}
-
-static void lowercase_ascii(wchar_t *text) {
-    for (; *text; ++text)
-        if (*text >= L'A' && *text <= L'Z') *text = *text - L'A' + L'a';
 }
 
 static KS_LIVE_RESULT evaluate_mixed_word(HWND foreground, KS_EVALUATION_PHASE phase,
                                           KS_DECISION *decision) {
-    int english_known = 0;
-    int persian_known = 0;
-    KS_LANGUAGE winner;
+    int known[3] = {0, 0, 0};
+    KS_SLOT winner;
     wchar_t candidate[KS_MAX_WORD + 1];
+    wchar_t form[KS_MAX_WORD + 1];
     int strength = 0;
 
     memset(decision, 0, sizeof(*decision));
@@ -2692,18 +3471,17 @@ static KS_LIVE_RESULT evaluate_mixed_word(HWND foreground, KS_EVALUATION_PHASE p
         return KS_LIVE_NONE;
     }
     if (g_word_count < 2) return KS_LIVE_NONE;
-    if (!ks_classify_word(g_word, g_word_count, &g_lexicons,
-                          &english_known, &persian_known, NULL, NULL))
+    if (!ks_classify_word(g_word, g_word_count, &g_lexicons, known, NULL))
         return KS_LIVE_NONE;
-    if (english_known && !persian_known) winner = KS_LANG_ENGLISH;
-    else if (persian_known && !english_known) winner = KS_LANG_PERSIAN;
-    else if (english_known && persian_known) {
+    if (known[KS_SLOT_A] && !known[KS_SLOT_B]) winner = KS_SLOT_A;
+    else if (known[KS_SLOT_B] && !known[KS_SLOT_A]) winner = KS_SLOT_B;
+    else if (known[KS_SLOT_A] && known[KS_SLOT_B]) {
         /* Both readings are words: only at a boundary, and only when the
            document language says which one. */
-        KS_LANGUAGE intent = current_intent(foreground, &strength);
+        KS_SLOT intent = current_intent(foreground, &strength);
         if (phase != KS_PHASE_BOUNDARY || strength < 2) return KS_LIVE_NONE;
         winner = intent;
-        if (winner != KS_LANG_ENGLISH && winner != KS_LANG_PERSIAN) return KS_LIVE_NONE;
+        if (winner != KS_SLOT_A && winner != KS_SLOT_B) return KS_LIVE_NONE;
     } else {
         return KS_LIVE_NONE;
     }
@@ -2712,17 +3490,16 @@ static KS_LIVE_RESULT evaluate_mixed_word(HWND foreground, KS_EVALUATION_PHASE p
     decision->should_correct = 1;
     decision->key_count = g_word_count;
     decision->confidence = 90;
-    decision->source_language = g_word_visible[g_word_count - 1];
-    decision->target_language = winner;
+    decision->source_slot = g_word_visible[g_word_count - 1];
+    decision->target_slot = winner;
     mixed_visible_text(decision->original);
     safe_copy(decision->replacement, KS_MAX_WORD + 1, candidate);
 
     if (phase == KS_PHASE_BOUNDARY) return KS_LIVE_CORRECT_NOW;
     /* While typing continues, a word that is also the beginning of a longer
        word waits for the adaptive pause, exactly like layout repair. */
-    if (winner == KS_LANG_ENGLISH) lowercase_ascii(candidate);
-    if (ks_bloom_contains(winner == KS_LANG_ENGLISH ? g_lexicons.english_prefixes
-                                                     : g_lexicons.persian_prefixes, candidate))
+    if (ks_lookup_form(g_lexicons.profile[winner], candidate, form) > 0 &&
+        ks_bloom_contains(g_lexicons.prefixes[winner], form))
         return KS_LIVE_WAIT_FOR_IDLE;
     return KS_LIVE_CORRECT_NOW;
 }
@@ -2739,8 +3516,8 @@ static void try_smart_correction(void) {
 
 static void try_smart_correction_body(void) {
     HWND foreground;
-    KS_LANGUAGE language;
-    KS_LANGUAGE intent;
+    KS_SLOT language;
+    KS_SLOT intent;
     int intent_strength;
     KS_DECISION decision;
 
@@ -2763,7 +3540,7 @@ static void try_smart_correction_body(void) {
         KS_LIVE_RESULT mixed = evaluate_mixed_word(foreground, KS_PHASE_IDLE, &decision);
         if (mixed == KS_LIVE_CORRECT_NOW &&
             apply_decision(foreground, &decision, g_word_count, 0, 0)) {
-            store_pending_word(foreground, g_word, g_word_count, decision.target_language);
+            store_pending_word(foreground, g_word, g_word_count, decision.target_slot);
             clear_word();
             return;
         }
@@ -2778,7 +3555,7 @@ static void try_smart_correction_body(void) {
             &decision) == KS_LIVE_CORRECT_NOW &&
         apply_decision(foreground, &decision, g_word_count, 0, 0)) {
         store_pending_word(foreground, g_word, g_word_count,
-                           decision.target_language);
+                           decision.target_slot);
         clear_word();
     }
 }
@@ -2840,8 +3617,9 @@ static int try_undo(int consume_delimiter) {
             /* The replacement was just counted as the user's word; it was
                not their word after all. */
             wchar_t noted[KS_MAX_WORD + 1];
+            wchar_t *cursor;
             safe_copy(noted, KS_MAX_WORD + 1, g_undo.replacement);
-            lower_first(noted);
+            for (cursor = noted; *cursor; ++cursor) *cursor = ks_to_lower(*cursor);
             if (wcscmp(noted, g_last_noted) == 0) ks_memory_unobserve_word(&g_memory, noted);
             g_last_noted[0] = 0;
         }
@@ -2850,7 +3628,7 @@ static int try_undo(int consume_delimiter) {
                word alone for the rest of the session. */
             wchar_t typo[KS_MAX_WORD + 1];
             safe_copy(typo, KS_MAX_WORD + 1, g_undo.original);
-            if (g_undo.source_language == KS_LANG_ENGLISH) lower_first(typo);
+            lower_for_slot(typo, g_undo.source_language);
             ks_memory_reject_fix(&g_memory, typo);
             ks_ignore_list_add(&g_spelling_ignore, g_undo.original);
             if (g_spelling_fixes > 0) InterlockedDecrement(&g_spelling_fixes);
@@ -2899,15 +3677,15 @@ static int helpers_suppressed(HWND foreground) {
 
 static void remember_last_word(HWND foreground) {
     if (g_has_context && g_word_count > 0 && !g_overflow_count && g_word_window == foreground &&
-        (g_word_language == KS_LANG_PERSIAN || g_word_language == KS_LANG_ENGLISH)) {
+        (g_word_language == KS_SLOT_B || g_word_language == KS_SLOT_A)) {
         g_last_word_language = g_word_language;
         g_last_word_window = foreground;
         g_last_word_at = GetTickCount();
     }
 }
 
-static void remember_corrected_word(HWND foreground, KS_LANGUAGE language) {
-    if (language != KS_LANG_PERSIAN && language != KS_LANG_ENGLISH) return;
+static void remember_corrected_word(HWND foreground, KS_SLOT language) {
+    if (language != KS_SLOT_B && language != KS_SLOT_A) return;
     g_last_word_language = language;
     g_last_word_window = foreground;
     g_last_word_at = GetTickCount();
@@ -2918,26 +3696,30 @@ static void remember_corrected_word(HWND foreground, KS_LANGUAGE language) {
    layout the key arrived in. A manual layout switch clears it (see
    forget_layout_request), so a user who switches to Persian to type "؟"
    after an English word is never overruled. */
-static KS_LANGUAGE punctuation_context(HWND foreground, KS_LANGUAGE layout) {
+static KS_SLOT punctuation_context(HWND foreground, KS_SLOT layout) {
     if (g_last_word_window == foreground && g_last_word_at &&
         GetTickCount() - g_last_word_at < 5000u &&
-        (g_last_word_language == KS_LANG_PERSIAN || g_last_word_language == KS_LANG_ENGLISH))
+        (g_last_word_language == KS_SLOT_B || g_last_word_language == KS_SLOT_A))
         return g_last_word_language;
     return layout;
 }
 
 /* Applies the typing-helper settings to one character about to reach the
    application. `capitalize` is the sentence-start request for letter keys. */
-static wchar_t shape_character(wchar_t character, KS_LANGUAGE layout, HWND foreground,
+static wchar_t shape_character(wchar_t character, KS_SLOT layout, HWND foreground,
                                int capitalize) {
     wchar_t shaped = character;
-    if (g_settings.persian_letters) shaped = ks_persian_form(shaped);
-    if (g_settings.digits != KS_DIGITS_OFF) shaped = ks_shape_digit(shaped, g_settings.digits, layout);
+    /* The Persian helpers belong to a pair with Persian: Arabic letters on
+       the Persian keyboard only (an Arabic keyboard keeps its own letters),
+       and digits only where Persian digits are an option at all. */
+    if (g_settings.persian_letters && slot_is(layout, KS_LANG_PERSIAN)) shaped = ks_persian_form(shaped);
+    if (g_settings.digits != KS_DIGITS_OFF && slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE)
+        shaped = ks_shape_digit(shaped, g_settings.digits, slot_model(layout));
     if (g_settings.punctuation && (shaped == L'?' || shaped == L',' || shaped == L';' ||
                                    shaped == 0x061F || shaped == 0x060C || shaped == 0x061B)) {
-        KS_LANGUAGE context = punctuation_context(foreground, layout);
-        if (context == KS_LANG_PERSIAN) shaped = ks_persian_punctuation(shaped);
-        else if (context == KS_LANG_ENGLISH) shaped = ks_latin_punctuation(shaped);
+        KS_SLOT context = punctuation_context(foreground, layout);
+        if (slot_is(context, KS_LANG_PERSIAN)) shaped = ks_persian_punctuation(shaped);
+        else if (slot_is(context, KS_LANG_ENGLISH)) shaped = ks_latin_punctuation(shaped);
     }
     if (capitalize && shaped >= L'a' && shaped <= L'z') shaped = (wchar_t)(shaped - L'a' + L'A');
     return shaped;
@@ -2948,10 +3730,10 @@ static wchar_t shape_character(wchar_t character, KS_LANGUAGE layout, HWND foreg
 static int arm_capitalization_after_word(void) {
     wchar_t word[KS_MAX_WORD + 1];
     if (!g_settings.auto_capitalize || !g_has_context || g_word_mixed || g_overflow_count ||
-        g_word_count < 2 || g_word_language != KS_LANG_ENGLISH || g_last_key_was_digit)
+        g_word_count < 2 || !slot_is(g_word_language, KS_LANG_ENGLISH) || g_last_key_was_digit)
         return 0;
-    tokens_to_language(g_word, g_word_count, KS_LANG_ENGLISH, word);
-    lowercase_ascii(word);
+    tokens_to_language(g_word, g_word_count, g_word_language, word);
+    lower_first(word);
     return !ks_is_abbreviation(word);
 }
 
@@ -2965,7 +3747,7 @@ static int expand_snippet_or_pronoun(HWND foreground, UINT boundary_key, int zwn
     wchar_t typed[KS_MAX_WORD + 1];
     const KS_SNIPPET *snippet;
     if (g_word_count < 1 || g_word_count > KS_MAX_WORD) return 0;
-    if (g_word_language != KS_LANG_ENGLISH && g_word_language != KS_LANG_PERSIAN) return 0;
+    if (g_word_language != KS_SLOT_A && g_word_language != KS_SLOT_B) return 0;
     tokens_to_language(g_word, g_word_count, g_word_language, typed);
     if (g_settings.snippets) {
         snippet = ks_snippet_find(&g_snippets, typed);
@@ -2998,9 +3780,9 @@ static int expand_snippet_or_pronoun(HWND foreground, UINT boundary_key, int zwn
        English word typed within five seconds, before a Space — never in
        "for i in", "i = 0", "j.i." or at the start of a field. */
     if (g_settings.auto_capitalize && pronoun_context && g_word_count == 1 &&
-        g_word_language == KS_LANG_ENGLISH && typed[0] == L'i' && boundary_key == VK_SPACE) {
-        if (send_replacement(foreground, 1, L"I", boundary_key, zwnj, KS_LANG_ENGLISH)) {
-            store_phrase_undo(foreground, KS_LANG_ENGLISH, boundary_key, zwnj, L"i", L"I");
+        slot_is(g_word_language, KS_LANG_ENGLISH) && typed[0] == L'i' && boundary_key == VK_SPACE) {
+        if (send_replacement(foreground, 1, L"I", boundary_key, zwnj, g_word_language)) {
+            store_phrase_undo(foreground, g_word_language, boundary_key, zwnj, L"i", L"I");
             return 1;
         }
     }
@@ -3009,15 +3791,38 @@ static int expand_snippet_or_pronoun(HWND foreground, UINT boundary_key, int zwn
 
 
 static void remember_prev_word(HWND foreground, const KS_TOKEN *tokens, int count,
-                               KS_LANGUAGE language) {
+                               KS_SLOT language) {
     if (count < 1 || count > KS_MAX_WORD ||
-        (language != KS_LANG_ENGLISH && language != KS_LANG_PERSIAN)) return;
+        (language != KS_SLOT_A && language != KS_SLOT_B)) return;
     memcpy(g_prev_word, tokens, (size_t)count * sizeof(tokens[0]));
     g_prev_word_count = count;
     g_prev_word_language = language;
     g_prev_word_window = foreground;
     g_prev_word_serial = g_key_serial;
     g_prev_word_at = GetTickCount();
+}
+
+/* A dictionary word of the slot's language: the spelling lexicon for
+   English and Persian (as before), the pack's dictionary otherwise. */
+static int slot_word_known(KS_SLOT slot, const wchar_t *word) {
+    if (slot_is(slot, KS_LANG_PERSIAN)) return ks_spell_known(word, &g_persian_spelling);
+    if (slot_is(slot, KS_LANG_ENGLISH)) return ks_spell_known(word, &g_english_spelling);
+    if (slot != KS_SLOT_A && slot != KS_SLOT_B) return 0;
+    return ks_text_known_in(g_lexicons.profile[slot], word, g_lexicons.words[slot], g_lexicons.common[slot]);
+}
+
+/* The capital of a letter, where ks_to_lower knows the pair. */
+static wchar_t upper_letter(wchar_t c) {
+    wchar_t candidate;
+    if (c >= L'a' && c <= L'z') return (wchar_t)(c - L'a' + L'A');
+    /* Latin-1, Greek, Cyrillic: capitals sit at fixed offsets. */
+    if ((c >= 0x00E0 && c <= 0x00FE && c != 0x00F7)) candidate = (wchar_t)(c - 0x20);
+    else if (c >= 0x03B1 && c <= 0x03C9 && c != 0x03C2) candidate = (wchar_t)(c - 0x20);
+    else if (c >= 0x0430 && c <= 0x044F) candidate = (wchar_t)(c - 0x20);
+    else if (c >= 0x0450 && c <= 0x045F) candidate = (wchar_t)(c - 0x50);
+    else if (c >= 0x0100 && c <= 0x017F) candidate = (wchar_t)(c - 1);
+    else return c;
+    return ks_to_lower(candidate) == c ? candidate : c;
 }
 
 /*
@@ -3032,15 +3837,13 @@ static void remember_prev_word(HWND foreground, const KS_TOKEN *tokens, int coun
 static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, int learn) {
     wchar_t typed[KS_MAX_WORD + 1];
     wchar_t key[KS_MAX_WORD + 1];
-    const KS_SPELL_LEXICON *lexicon;
     const wchar_t *fix;
     int typo_known;
-    if (g_word_language != KS_LANG_ENGLISH && g_word_language != KS_LANG_PERSIAN) return 0;
-    lexicon = g_word_language == KS_LANG_PERSIAN ? &g_persian_spelling : &g_english_spelling;
+    if (g_word_language != KS_SLOT_A && g_word_language != KS_SLOT_B) return 0;
     tokens_to_language(g_word, g_word_count, g_word_language, typed);
-    if (g_word_language == KS_LANG_ENGLISH && !ordinary_case(typed)) return 0;
+    if (!ordinary_case(typed)) return 0;
     safe_copy(key, KS_MAX_WORD + 1, typed);
-    if (g_word_language == KS_LANG_ENGLISH) lower_first(key);
+    lower_for_slot(key, g_word_language);
     if (!letters_only_word(key, g_word_language)) return 0;
 
     if (g_word_peak[0]) {
@@ -3048,14 +3851,12 @@ static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, 
         int pair;
         if (!learn) return 0;
         safe_copy(peak, KS_MAX_WORD + 1, g_word_peak);
-        if (g_word_language == KS_LANG_ENGLISH) {
-            if (!ordinary_case(peak)) return 0;
-            lower_first(peak);
-        }
+        if (!ordinary_case(peak)) return 0;
+        lower_for_slot(peak, g_word_language);
         pair = g_word_peak_complete ? ks_memory_is_fix_pair(peak, key)
                                     : ks_memory_is_fix_pair_midword(peak, key);
         if (pair && letters_only_word(peak, g_word_language) &&
-            (ks_spell_known(key, lexicon) ||
+            (slot_word_known(g_word_language, key) ||
              ks_memory_word_count(&g_memory, key) >= KS_MEMORY_KNOWN_COUNT)) {
             int seen = ks_memory_observe_fix(&g_memory, peak, key);
             if (seen == KS_MEMORY_FIX_COUNT)
@@ -3064,7 +3865,7 @@ static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, 
         return 0;
     }
 
-    typo_known = ks_spell_known(key, lexicon);
+    typo_known = slot_word_known(g_word_language, key);
     fix = ks_memory_lookup_fix(&g_memory, key, typo_known);
     /* A real word the user also types on purpose ("then" for "than"): the
        repair must have been made more often than the word was left alone. */
@@ -3076,9 +3877,8 @@ static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, 
         wchar_t replacement[KS_MAX_WORD + 1];
         safe_copy(replacement, KS_MAX_WORD + 1, fix);
         /* Keep a capital the user (or sentence capitalisation) typed. */
-        if (g_word_language == KS_LANG_ENGLISH && typed[0] >= L'A' && typed[0] <= L'Z' &&
-            replacement[0] >= L'a' && replacement[0] <= L'z')
-            replacement[0] = (wchar_t)(replacement[0] - L'a' + L'A');
+        if (typed[0] != ks_to_lower(typed[0]) && replacement[0] == ks_to_lower(replacement[0]))
+            replacement[0] = upper_letter(replacement[0]);
         if (!send_replacement(foreground, g_word_count, replacement, boundary_key, zwnj,
                               g_word_language))
             return 0;
@@ -3110,10 +3910,11 @@ static int translation_target_protected(HWND foreground) {
 static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
                            const KBDLLHOOKSTRUCT *data, int translate,
                            int shift, int caps, HWND foreground,
-                           KS_LANGUAGE language, int capitalize) {
-    INPUT inputs[2];
+                           KS_SLOT language, int capitalize) {
+    INPUT inputs[4];
     UINT count = 0;
     wchar_t wanted = 0;
+    wchar_t second = 0;   /* a key the requested layout types as two characters */
     wchar_t current = 0;
     wchar_t shaped;
     HKL current_layout;
@@ -3132,18 +3933,25 @@ static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
     if (!translated_layout_character(current_layout, data->scanCode, shift, caps, &current))
         current = 0;
     if (translate) {
-        if (!translated_layout_character(find_layout(g_layout_request_language),
-                                         data->scanCode, shift, caps, &wanted))
-            return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+        HKL requested = find_layout(g_layout_request_language);
+        if (!translated_layout_character(requested, data->scanCode, shift, caps, &wanted)) {
+            /* The Arabic lam-alef: one key, two characters. */
+            wchar_t pair[2];
+            if (translated_layout_pair(requested, data->scanCode, shift, caps, pair) != 2)
+                return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+            wanted = pair[0];
+            second = pair[1];
+        }
     } else {
         wanted = current;
     }
     if (!wanted) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     shaped = helpers ? shape_character(wanted, language, foreground, capitalize) : wanted;
-    if (shaped == current) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
+    if (shaped == current && !second) return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     if (translate && translation_target_protected(foreground))
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     add_unicode_input(inputs, &count, shaped);
+    if (second) add_unicode_input(inputs, &count, second);
     if (SendInput(count, inputs, sizeof(INPUT)) != count)
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     suppress_key_up(data->vkCode);
@@ -3155,7 +3963,7 @@ static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
         if (!g_layout_request_unhonoured &&
             GetTickCount() - g_layout_request_started >= 250u) {
             wchar_t name[MAX_PATH];
-            wchar_t message[MAX_PATH + 96];
+            wchar_t message[MAX_PATH + 160];
             g_layout_request_unhonoured = 1;
             InterlockedIncrement(&g_layout_requests_ignored);
             if (!query_process_basename(focused_window(foreground), name, MAX_PATH))
@@ -3174,6 +3982,13 @@ static LRESULT deliver_key(int code, WPARAM wparam, LPARAM lparam,
 }
 
 static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam);
+
+/* The X of Ctrl+Win+X still held (and auto-repeating) while the clean-up
+   it started runs: not a key the user typed into the field. */
+static int cleanup_hotkey_held(DWORD key) {
+    return g_cleanup_step != 0 && key == 'X' && (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+           ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000));
+}
 
 /* Excel's cell state (see g_cell_fresh) follows every physical key, even one
    that arrives while another operation runs. */
@@ -3211,13 +4026,16 @@ static LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lpara
         /* See g_engine_depth: never interpret a key in the middle of
            another key's operation. */
         g_last_hook_tick = g_last_keyboard_tick = GetTickCount();
-        if (key_down_event || foreign_key_down) {
+        if (data->vkCode < 256 && is_modifier(data->vkCode) && !(data->flags & LLKHF_INJECTED))
+            update_modifier_state(data->vkCode, key_down_event);
+        if ((key_down_event || foreign_key_down) && !is_modifier(data->vkCode)) {
             g_engine_interrupted = 1;
             g_engine_key_interrupted = 1;
-            ++g_key_serial;
+            /* Counted like the normal path: modifiers are not keys here. */
+            if (!cleanup_hotkey_held(data->vkCode)) ++g_key_serial;
             if (key_down_event) track_cell_state(data->vkCode);
-            if (data->vkCode < 256) g_suppressed_at[data->vkCode] = 0;
         }
+        if (key_down_event && data->vkCode < 256) g_suppressed_at[data->vkCode] = 0;
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     }
     engine_enter();
@@ -3244,13 +4062,13 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     KBDLLHOOKSTRUCT *data;
     int key_up;
     HWND foreground;
-    KS_LANGUAGE language;
+    KS_SLOT language;
     KS_TOKEN token;
     int shift;
     int caps;
     KS_DECISION decision;
     KS_LIVE_RESULT live_result;
-    KS_LANGUAGE intent;
+    KS_SLOT intent;
     int intent_strength;
     int mapped;
     int zwnj_key;
@@ -3299,7 +4117,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     if (wparam != WM_KEYDOWN && wparam != WM_SYSKEYDOWN)
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     /* Every physical key-down: "the key right after X" tests use it. */
-    ++g_key_serial;
+    if (!cleanup_hotkey_held(data->vkCode)) ++g_key_serial;
     resync_modifiers();
     if (data->vkCode == VK_BACK && g_control_down && g_windows_down) {
         clear_word();
@@ -3330,7 +4148,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
 
     foreground = GetForegroundWindow();
     language = foreground_language(foreground);
-    if (!foreground || language == KS_LANG_OTHER) {
+    if (!foreground || language == KS_SLOT_NONE) {
         clear_word();
         clear_history();
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
@@ -3382,6 +4200,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
 
     if (data->vkCode == VK_BACK) {
         int had_word = g_word_count > 0 || g_overflow_count > 0;
+        g_dead_key_word = 0;
         g_capitalize_armed = 0;
         g_capitalize_next = 0;
         g_last_key_was_digit = 0;
@@ -3413,7 +4232,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             {
                 wchar_t noted[KS_MAX_WORD + 1];
                 safe_copy(noted, KS_MAX_WORD + 1, g_word_peak);
-                if (g_word_language == KS_LANG_ENGLISH) lower_first(noted);
+                lower_for_slot(noted, g_word_language);
                 ks_memory_unobserve_word(&g_memory, noted);
             }
             g_prev_word_count = 0;
@@ -3449,6 +4268,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     }
     if (is_navigation(data->vkCode)) {
         clear_word();
+        g_dead_key_word = 0;
         reset_sentence(foreground);
         forget_layout_request();
         g_capitalize_armed = 0;
@@ -3468,16 +4288,37 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
      * boundary exactly like Shift+Space, not part of the word.
      */
     mapped = map_physical_key(data->scanCode, shift, caps, &token);
+    if (mapped < 0) {
+        /* A letter key of this pair that one of its layouts cannot type as
+           one character: the word is no longer followed, and the rest of
+           it is left alone (never corrected as a word of its own). */
+        clear_word();
+        clear_history();
+        g_dead_key_word = 2;   /* skipped, but a pending switch is still typed for */
+        g_capitalize_armed = 0;
+        g_capitalize_next = 0;
+        /* While an application has not switched yet, the key is typed for
+           the layout it was asked for, like every other key. */
+        return deliver_key(code, wparam, lparam, data, translate, shift, caps, foreground, language, 0);
+    }
+    /* A digit is never part of a word, even where the other layout types a
+       letter on its key (French é è ç à on the digit row): "10" and "0"
+       stay numbers. English/Persian never has digits among its word keys. */
+    if (mapped && !pair_is_english_persian() &&
+        ks_is_digit_any(language == KS_SLOT_A ? token.a : token.b))
+        mapped = 0;
     if (mapped && !translate && !active_layout_types_one_character(data->scanCode, shift, caps)) {
         /* A dead key (US-International ' and `) or a key the active layout
            leaves empty: the screen does not get one character for it, so
-           the word model would miscount. Stop tracking this word. */
+           the word model would miscount. Stop tracking this word, and leave
+           the word a dead key begins alone too. */
         clear_word();
         clear_history();
+        g_dead_key_word = active_layout_dead_key(data->scanCode, shift, caps);
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     }
-    zwnj_key = mapped && language == KS_LANG_PERSIAN &&
-               token.persian == (wchar_t)ZWNJ;
+    zwnj_key = mapped && slot_is(language, KS_LANG_PERSIAN) &&
+               (language == KS_SLOT_A ? token.a : token.b) == (wchar_t)ZWNJ;
     if (mapped && !zwnj_key) {
         /*
          * A live correction becomes a completed sentence word only after the
@@ -3522,9 +4363,15 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             g_word_window = foreground;
             g_word_language = language;
             g_skip_word = process_is_excluded(foreground);
-            g_word_skip_untrusted = !g_skip_word && g_word_untrusted;
+            g_word_skip_untrusted = !g_skip_word && (g_word_untrusted || g_dead_key_word == 2);
             if (g_word_skip_untrusted) g_skip_word = 1;
             g_word_untrusted = 0;
+            /* After a dead key the word is left alone and nothing is typed
+               for it (the key composes with the next one); after a letter
+               key the pair cannot read, the keys of a pending switch still
+               are typed (g_word_skip_untrusted). */
+            if (g_dead_key_word) g_skip_word = 1;
+            g_dead_key_word = 0;
             /* Retyping a word that was just deleted in full. */
             if (g_orphan_peak[0] && g_orphan_window == foreground &&
                 g_orphan_serial + 1 == g_key_serial) {
@@ -3538,14 +4385,16 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         /* First letter of a sentence: capitalise it (English only, no Shift
            or Caps Lock, never in code editors). Any letter disarms. */
         capitalize = g_settings.auto_capitalize && typing_helpers && g_capitalize_next &&
-                     language == KS_LANG_ENGLISH && g_word_count == 0 && !shift && !caps;
+                     slot_is(language, KS_LANG_ENGLISH) && g_word_count == 0 && !shift && !caps;
         g_capitalize_next = 0;
         g_capitalize_armed = 0;
         g_last_key_was_digit = 0;
         /* The word model must see the capital too; the spelling model is told
            so it can still repair "Teh" at a sentence start. */
-        if (capitalize && token.english >= L'a' && token.english <= L'z')
-            token.english = (wchar_t)(token.english - L'a' + L'A');
+        if (capitalize) {
+            wchar_t *letter = language == KS_SLOT_A ? &token.a : &token.b;
+            if (*letter >= L'a' && *letter <= L'z') *letter = (wchar_t)(*letter - L'a' + L'A');
+        }
         if (g_word_count == 0) {
             g_word_after_boundary = g_previous_key_boundary;
             g_word_auto_capitalized = capitalize;
@@ -3571,7 +4420,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             if (live_result == KS_LIVE_CORRECT_NOW) {
                 if (apply_decision(foreground, &decision, g_word_count - 1, 0, 0)) {
                     store_pending_word(foreground, g_word, g_word_count,
-                                       decision.target_language);
+                                       decision.target_slot);
                     suppress_key_up(data->vkCode);
                     clear_word();
                     return 1;
@@ -3594,7 +4443,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             if (live_result == KS_LIVE_CORRECT_NOW) {
                 if (apply_decision(foreground, &decision, g_word_count - 1, 0, 0)) {
                     store_pending_word(foreground, g_word, g_word_count,
-                                       decision.target_language);
+                                       decision.target_slot);
                     suppress_key_up(data->vkCode);
                     clear_word();
                     return 1;
@@ -3608,10 +4457,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     }
 
     if (zwnj_key || is_correction_boundary(data->vkCode)) {
-        int english_known = 0;
-        int persian_known = 0;
-        int english_frequent = 0;
-        int persian_frequent = 0;
+        int known[3] = {0, 0, 0};
+        int frequent[3] = {0, 0, 0};
         int had_word = g_word_count > 0 || g_overflow_count > 0;
         int retained_word = 0;
         int memory_learning;
@@ -3626,6 +4473,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         int zwnj = zwnj_key || (boundary_key == VK_SPACE && g_shift_down);
         int terminates_sentence = is_sentence_terminator(boundary_key);
         if (had_word) InterlockedIncrement(&g_words_checked);
+        g_dead_key_word = 0;
         /* Sentence capitalisation: a period after a real word (not an
            abbreviation, not a number) arms it; the Space or Enter that
            follows makes the next letter capital. */
@@ -3644,7 +4492,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         /* Was the word before this one an English word typed in prose? Read
            before this word replaces it: the lone-"i" rule needs it. */
         pronoun_context = g_word_after_boundary && g_last_word_window == foreground &&
-                          g_last_word_language == KS_LANG_ENGLISH && g_last_word_at &&
+                          slot_is(g_last_word_language, KS_LANG_ENGLISH) && g_last_word_at &&
                           GetTickCount() - g_last_word_at < 5000u;
         remember_last_word(foreground);
         g_previous_key_boundary = boundary_key == VK_SPACE || boundary_key == VK_RETURN ||
@@ -3697,9 +4545,9 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             KS_LIVE_RESULT mixed = evaluate_mixed_word(foreground, KS_PHASE_BOUNDARY, &decision);
             if (mixed == KS_LIVE_CORRECT_NOW &&
                 apply_decision(foreground, &decision, g_word_count, boundary_key, zwnj)) {
-                if (memory_learning) memory_note_word(decision.replacement, decision.target_language);
+                if (memory_learning) memory_note_word(decision.replacement, decision.target_slot);
                 history_push(foreground, g_word, g_word_count,
-                             decision.target_language, boundary_key, zwnj);
+                             decision.target_slot, boundary_key, zwnj);
                 suppress_key_up(data->vkCode);
                 if (terminates_sentence) start_new_sentence(foreground);
                 clear_word();
@@ -3741,26 +4589,20 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             note_word = 0;
             if (apply_decision(foreground, &decision, g_word_count,
                                boundary_key, zwnj)) {
-                if (memory_learning) memory_note_word(decision.replacement, decision.target_language);
+                if (memory_learning) memory_note_word(decision.replacement, decision.target_slot);
                 history_push(foreground, g_word, g_word_count,
-                             decision.target_language, boundary_key, zwnj);
+                             decision.target_slot, boundary_key, zwnj);
                 suppress_key_up(data->vkCode);
                 if (terminates_sentence) start_new_sentence(foreground);
                 clear_word();
                 return 1;
             }
-        } else if (!g_skip_word && !g_overflow_count &&
-                   ks_classify_word(g_word, g_word_count, &g_lexicons,
-                                    &english_known, &persian_known,
-                                    &english_frequent, &persian_frequent)) {
-            int active_known =
-                g_word_language == KS_LANG_ENGLISH ? english_known : persian_known;
-            int active_frequent =
-                g_word_language == KS_LANG_ENGLISH
-                    ? english_frequent : persian_frequent;
-            int ambiguous = english_known && persian_known;
-            int target_known =
-                g_word_language == KS_LANG_ENGLISH ? persian_known : english_known;
+        } else if (!g_skip_word && !g_overflow_count && slot_valid(g_word_language) &&
+                   ks_classify_word(g_word, g_word_count, &g_lexicons, known, frequent)) {
+            int active_known = known[g_word_language];
+            int active_frequent = frequent[g_word_language];
+            int ambiguous = known[KS_SLOT_A] && known[KS_SLOT_B];
+            int target_known = known[KS_OTHER_SLOT(g_word_language)];
             int consult_spelling = 0;
             if (active_known) {
                 remember_intent(foreground, g_word_language,
@@ -3782,8 +4624,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
              */
             if (!target_known) {
                 if (!active_known) consult_spelling = 1;
-                else if (g_word_language == KS_LANG_PERSIAN && !ambiguous) consult_spelling = 1;
-                else if (g_word_language == KS_LANG_ENGLISH && g_spelling_available &&
+                else if (slot_is(g_word_language, KS_LANG_PERSIAN) && !ambiguous) consult_spelling = 1;
+                else if (slot_is(g_word_language, KS_LANG_ENGLISH) && g_spelling_available &&
                          g_word_count >= 3) {
                     wchar_t typed[KS_MAX_WORD + 1];
                     tokens_to_language(g_word, g_word_count, g_word_language, typed);
@@ -3821,14 +4663,15 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         /* "!" and "?" end a sentence when a real English word precedes them
            ("Really?"), or when the period before them already armed it
            ("What?!"). A lone "?" in a formula does not. */
-        g_capitalize_armed = typing_helpers && language == KS_LANG_ENGLISH &&
+        g_capitalize_armed = typing_helpers && slot_is(language, KS_LANG_ENGLISH) &&
                              ((g_has_context && g_word_count >= 2 && !g_overflow_count &&
-                               !g_word_mixed && g_word_language == KS_LANG_ENGLISH) ||
+                               !g_word_mixed && g_word_language == language) ||
                               (g_capitalize_armed && !g_has_context));
         g_capitalize_next = 0;
         g_capitalize_window = foreground;
         g_last_key_was_digit = 0;
         g_previous_key_boundary = 0;
+        g_dead_key_word = active_layout_dead_key(data->scanCode, shift, caps);
         remember_last_word(foreground);
         start_new_sentence(foreground);
     } else {
@@ -3842,6 +4685,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         g_capitalize_next = 0;
         g_last_key_was_digit = data->vkCode >= '0' && data->vkCode <= '9';
         g_previous_key_boundary = 0;
+        g_dead_key_word = active_layout_dead_key(data->scanCode, shift, caps);
         /* "سلام؟": the punctuation follows the word being typed; remember
            its language before the word is dropped, so the mark is shaped
            for it. */
@@ -3861,7 +4705,9 @@ static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) 
            software, pen and touch): KeySwitchFix itself never injects mouse
            input, and any click can move the caret. */
         (void)data;
-        if (g_engine_depth > 0) g_engine_interrupted = 1;
+        /* Excel's cell state follows every click, even one that arrives
+           while an operation runs (a double-click opens the cell for
+           editing, and the next correction must not press Delete). */
         if (wparam == WM_LBUTTONDOWN) {
             DWORD now = GetTickCount();
             int double_click = g_last_click_at && now - g_last_click_at <= GetDoubleClickTime();
@@ -3869,7 +4715,14 @@ static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) 
             g_cell_edit_mode = double_click;
             g_last_click_at = double_click ? 0 : now;
         }
+        if (g_engine_depth > 0) {
+            /* Applied when the running operation ends (engine_leave). */
+            g_engine_interrupted = 1;
+            g_reset_pending = 1;
+            return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
+        }
         g_word_untrusted = 0;
+        g_dead_key_word = 0;   /* the caret moved: the next word is a new one */
         {
             clear_word();
             clear_history();
@@ -4011,19 +4864,31 @@ static void clipboard_snapshot_take(CLIPBOARD_SNAPSHOT *snapshot) {
     clipboard_snapshot_free(snapshot);
     if (!open_clipboard_retry()) return;
     snapshot->valid = 1;
-    while ((format = EnumClipboardFormats(format)) != 0 && snapshot->count < CLIPBOARD_SNAPSHOT_MAX) {
+    while ((format = EnumClipboardFormats(format)) != 0) {
         HANDLE handle;
         SIZE_T size;
         const void *source;
         void *copy;
         if (!clipboard_format_copyable(format)) continue;
+        if (snapshot->count >= CLIPBOARD_SNAPSHOT_MAX) {
+            snapshot->partial = 1;
+            break;
+        }
         handle = GetClipboardData(format);
         if (!handle) continue;
         size = GlobalSize(handle);
-        if (!size || total + size > 32u * 1024u * 1024u) continue;
+        if (!size) continue;
+        if (total + size > 32u * 1024u * 1024u) {
+            snapshot->partial = 1;
+            continue;
+        }
         source = GlobalLock(handle);
-        if (!source) continue;
+        if (!source) {
+            snapshot->partial = 1;
+            continue;
+        }
         copy = HeapAlloc(GetProcessHeap(), 0, size);
+        if (!copy) snapshot->partial = 1;
         if (copy) {
             memcpy(copy, source, size);
             snapshot->format[snapshot->count] = format;
@@ -4035,6 +4900,21 @@ static void clipboard_snapshot_take(CLIPBOARD_SNAPSHOT *snapshot) {
         GlobalUnlock(handle);
     }
     CloseClipboard();
+}
+
+/* With the clipboard open: ask Windows to keep the current content out of
+   Win+V history and cloud clipboard sync. */
+static void clipboard_mark_private(void) {
+    UINT exclude = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+    HGLOBAL marker = exclude ? GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD)) : NULL;
+    if (marker) {
+        DWORD *zero = (DWORD *)GlobalLock(marker);
+        if (zero) {
+            *zero = 0;
+            GlobalUnlock(marker);
+        }
+        if (!SetClipboardData(exclude, marker)) GlobalFree(marker);
+    }
 }
 
 static void clipboard_snapshot_restore(const CLIPBOARD_SNAPSHOT *snapshot, DWORD expected_sequence) {
@@ -4058,6 +4938,9 @@ static void clipboard_snapshot_restore(const CLIPBOARD_SNAPSHOT *snapshot, DWORD
         GlobalUnlock(memory);
         if (!SetClipboardData(snapshot->format[i], memory)) GlobalFree(memory);
     }
+    /* Putting the old content back is not a new copy: keep it out of the
+       clipboard history too. */
+    clipboard_mark_private();
     CloseClipboard();
 }
 
@@ -4104,20 +4987,9 @@ static int clipboard_set_text(const wchar_t *text) {
     if (open_clipboard_retry()) {
         EmptyClipboard();
         ok = SetClipboardData(CF_UNICODETEXT, memory) != NULL;
-        if (ok) {
-            /* A clean-up passes through the clipboard for a moment: keep it
-               out of Win+V history and cloud clipboard sync. */
-            UINT exclude = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
-            HGLOBAL marker = exclude ? GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD)) : NULL;
-            if (marker) {
-                DWORD *zero = (DWORD *)GlobalLock(marker);
-                if (zero) {
-                    *zero = 0;
-                    GlobalUnlock(marker);
-                }
-                if (!SetClipboardData(exclude, marker)) GlobalFree(marker);
-            }
-        }
+        /* A clean-up passes through the clipboard for a moment: keep it out
+           of Win+V history and cloud clipboard sync. */
+        if (ok) clipboard_mark_private();
         CloseClipboard();
     }
     if (!ok) GlobalFree(memory);
@@ -4185,15 +5057,23 @@ static void start_selection_cleanup(void) {
     g_cleanup_started_at = GetTickCount();
     g_cleanup_target = foreground;
     g_cleanup_focus_serial = g_focus_serial;
+    g_cleanup_key_serial = g_key_serial;
     SetTimer(g_window, ID_TIMER_CLEANUP, 30, NULL);
+}
+
+/* The target is still where the clean-up started: same window, same field,
+   no key typed (which would move the caret or replace the selection), no
+   key slipped past an operation. Checked again right before each injected
+   shortcut, because reading the clipboard can take a while. */
+static int cleanup_target_unchanged(void) {
+    return GetForegroundWindow() == g_cleanup_target && g_focus_serial == g_cleanup_focus_serial &&
+           g_key_serial == g_cleanup_key_serial && !g_engine_interrupted;
 }
 
 static void continue_selection_cleanup(void) {
     /* The user switched windows, moved to another field, or typed (moving
        the caret or the selection) meanwhile: never paste somewhere else. */
-    if ((g_cleanup_step == 1 || g_cleanup_step == 2) &&
-        (GetForegroundWindow() != g_cleanup_target || g_focus_serial != g_cleanup_focus_serial ||
-         (g_cleanup_step == 2 && g_key_serial != g_cleanup_key_serial))) {
+    if ((g_cleanup_step == 1 || g_cleanup_step == 2) && !cleanup_target_unchanged()) {
         set_activity(L"Clean-up cancelled: the window changed.");
         if (g_cleanup_step == 1) {
             finish_selection_cleanup();
@@ -4208,13 +5088,25 @@ static void continue_selection_cleanup(void) {
                 return;
             }
             clipboard_snapshot_take(&g_cleanup_saved_clipboard);
+            if (!g_cleanup_saved_clipboard.valid || g_cleanup_saved_clipboard.partial) {
+                /* What is on the clipboard now could not be saved: copying
+                   over it would lose it for good. */
+                set_activity(L"Clean-up skipped: the clipboard is busy or holds data too large to save and restore.");
+                finish_selection_cleanup();
+                return;
+            }
             g_cleanup_sequence = GetClipboardSequenceNumber();
+            /* Saving the clipboard can take a while: look again. */
+            if (!cleanup_target_unchanged() || any_modifier_down()) {
+                set_activity(L"Clean-up cancelled: the window changed.");
+                finish_selection_cleanup();
+                return;
+            }
             if (!send_shortcut('C')) {
                 set_activity(L"Clean-up is not possible here: the window runs as administrator.");
                 finish_selection_cleanup();
                 return;
             }
-            g_cleanup_key_serial = g_key_serial;
             g_cleanup_step = 2;
             SetTimer(g_window, ID_TIMER_CLEANUP, 120, NULL);
             return;
@@ -4261,7 +5153,11 @@ static void continue_selection_cleanup(void) {
                 SetTimer(g_window, ID_TIMER_CLEANUP, 50, NULL);
                 return;
             }
-            if (!ks_clean_text(text, g_settings.persian_letters, g_settings.digits, g_settings.punctuation)) {
+            /* The Persian clean-ups only where Persian is one of the two
+               languages: Arabic text keeps its ي ك, Russian text its digits. */
+            if (!ks_clean_text(text, g_settings.persian_letters && slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE,
+                               slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE ? g_settings.digits : KS_DIGITS_OFF,
+                               g_settings.punctuation && slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE)) {
                 set_activity(L"The selected text is already clean.");
                 HeapFree(GetProcessHeap(), 0, text);
                 g_cleanup_step = 4;
@@ -4271,12 +5167,22 @@ static void continue_selection_cleanup(void) {
             if (!clipboard_set_text(text)) {
                 set_activity(L"Could not write to the clipboard.");
                 HeapFree(GetProcessHeap(), 0, text);
+                /* It may have been emptied: restore over whatever is there. */
+                g_cleanup_sequence = GetClipboardSequenceNumber();
                 g_cleanup_step = 4;
                 SetTimer(g_window, ID_TIMER_CLEANUP, 50, NULL);
                 return;
             }
             HeapFree(GetProcessHeap(), 0, text);
             g_cleanup_sequence = GetClipboardSequenceNumber();
+            if (!cleanup_target_unchanged() || any_modifier_down()) {
+                /* Reading the clipboard pumped messages and the user moved
+                   on: never paste somewhere else. */
+                set_activity(L"Clean-up cancelled: the window changed.");
+                g_cleanup_step = 4;
+                SetTimer(g_window, ID_TIMER_CLEANUP, 50, NULL);
+                return;
+            }
             send_shortcut('V');
             set_activity(L"Selection cleaned up: Persian letters, digits and punctuation.");
             g_cleanup_step = 4;
@@ -4304,27 +5210,37 @@ static void show_tray_menu(int x, int y) {
     AppendMenuW(language_menu,
                 MF_STRING | (g_settings.language_mode == 0 ? MF_CHECKED : 0),
                 IDM_LANGUAGE_AUTO, L"Auto — use sentence context");
-    AppendMenuW(language_menu,
-                MF_STRING | (g_settings.language_mode == 1 ? MF_CHECKED : 0),
-                IDM_LANGUAGE_PERSIAN, L"Prefer Persian for collisions");
-    AppendMenuW(language_menu,
-                MF_STRING | (g_settings.language_mode == 2 ? MF_CHECKED : 0),
-                IDM_LANGUAGE_ENGLISH, L"Prefer English for collisions");
+    {
+        /* IDM_LANGUAGE_PERSIAN / _ENGLISH keep their ids from 3.x: they mean
+           the second and the first language of the pair. */
+        wchar_t text[96];
+        swprintf(text, 96, L"Prefer %ls for collisions", language_name(KS_SLOT_B));
+        AppendMenuW(language_menu,
+                    MF_STRING | (g_settings.language_mode == 1 ? MF_CHECKED : 0),
+                    IDM_LANGUAGE_PERSIAN, text);
+        swprintf(text, 96, L"Prefer %ls for collisions", language_name(KS_SLOT_A));
+        AppendMenuW(language_menu,
+                    MF_STRING | (g_settings.language_mode == 2 ? MF_CHECKED : 0),
+                    IDM_LANGUAGE_ENGLISH, text);
+    }
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)language_menu, L"Writing language");
     AppendMenuW(menu, MF_STRING |
                       (g_settings.spelling != KS_SPELL_OFF ? MF_CHECKED : 0) |
-                      (g_spelling_available ? 0 : MF_GRAYED),
+                      (g_spelling_available && pair_has_spelling() ? 0 : MF_GRAYED),
                 IDM_SPELLING, L"Fix spelling mistakes");
     {
         HMENU helpers_menu = CreatePopupMenu();
-        AppendMenuW(helpers_menu, MF_STRING | (g_settings.punctuation ? MF_CHECKED : 0),
+        AppendMenuW(helpers_menu, MF_STRING | (g_settings.punctuation ? MF_CHECKED : 0) |
+                                  (slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE ? 0 : MF_GRAYED),
                     IDM_PUNCTUATION, L"Persian punctuation after Persian words (؟\x200E ،\x200E ؛\x200E)");
-        AppendMenuW(helpers_menu, MF_STRING | (g_settings.auto_capitalize ? MF_CHECKED : 0),
+        AppendMenuW(helpers_menu, MF_STRING | (g_settings.auto_capitalize ? MF_CHECKED : 0) |
+                                  (slot_of_model(KS_LANG_ENGLISH) != KS_SLOT_NONE ? 0 : MF_GRAYED),
                     IDM_CAPITALIZE, L"Capitalise English sentences");
         AppendMenuW(helpers_menu, MF_STRING | (g_settings.snippets ? MF_CHECKED : 0),
                     IDM_SNIPPETS, L"Expand snippets");
         AppendMenuW(helpers_menu, MF_STRING, IDM_EDIT_SNIPPETS, L"Edit snippets…");
-        AppendMenuW(helpers_menu, MF_STRING | (g_settings.vocab_it ? MF_CHECKED : 0),
+        AppendMenuW(helpers_menu, MF_STRING | (g_settings.vocab_it ? MF_CHECKED : 0) |
+                                  (pair_has_spelling() ? 0 : MF_GRAYED),
                     IDM_VOCAB_IT, L"IT && computing vocabulary");
         AppendMenuW(helpers_menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(helpers_menu, MF_STRING | MF_GRAYED, IDM_CLEANUP,
@@ -4458,6 +5374,7 @@ static const wchar_t *const g_page_names[UI_PAGES] = {
 static HWND g_row_labels[24];
 static int g_row_label_count;
 static HWND g_spelling_label;
+static HWND g_digits_label;
 static LRESULT g_dropdown_selection = -1;   /* list item when the list opened */
 static UINT g_show_message;      /* a second instance asks the first to show itself */
 static int g_tray_retries;
@@ -4470,7 +5387,8 @@ static HICON g_icon_normal;
 static HICON g_icon_paused;
 static int g_icon_normal_owned;
 static int g_tray_dirty = 1;
-static int g_undo_timer_ticks;   /* loaded with LoadImage (not shared) */
+static int g_undo_timer_ticks;
+static int g_modal_active;   /* a confirmation box is open */   /* loaded with LoadImage (not shared) */
 
 static int scale(int value) {
     return MulDiv(value, g_dpi, 96);
@@ -4657,14 +5575,18 @@ static HICON make_grey_icon(HICON source) {
 
 /* 0 active, 1 paused, 2 not working (reason in *why). */
 static int app_state(const wchar_t **why) {
-    KS_LANGUAGE missing = missing_layout();
+    KS_SLOT missing = missing_layout();
     if (why) *why = L"";
     if (!g_keyboard_hook) {
         if (why) *why = L"keyboard hook blocked";
         return 2;
     }
-    if (missing != KS_LANG_OTHER) {
-        if (why) *why = missing == KS_LANG_PERSIAN ? L"Persian layout missing" : L"English layout missing";
+    if (missing != KS_SLOT_NONE) {
+        if (why) {
+            static wchar_t text[96];
+            swprintf(text, sizeof(text) / sizeof(text[0]), L"%ls layout missing", language_name(missing));
+            *why = text;
+        }
         return 2;
     }
     return g_settings.enabled ? 0 : 1;
@@ -4751,14 +5673,139 @@ static void show_balloon(const wchar_t *title, const wchar_t *text) {
 
 /* ---- Settings <-> controls ----------------------------------------------- */
 
+static const wchar_t *language_name_of_code(const wchar_t *code) {
+    const LANGUAGE_CHOICE *choice = find_language_choice(code);
+    return choice ? choice->english_name : code;
+}
+
+static int g_language_reload_pending;      /* WM_APP_LANGUAGES posted, not handled yet */
+
+/* A language as the lists show it: "German (Deutsch)". */
+static void language_display_name(const LANGUAGE_CHOICE *choice, wchar_t *text, size_t capacity) {
+    if (choice->native_name[0] && wcscmp(choice->native_name, choice->english_name) != 0)
+        swprintf(text, capacity, L"%ls (%ls\x200E)", choice->english_name, choice->native_name);
+    else
+        safe_copy(text, capacity, choice->english_name);
+}
+
+/* `loaded` is the language the engine really uses in this slot: when its
+   pack could not be loaded it differs from the setting, and the list says
+   so instead of pretending. */
+static void fill_language_list(HWND list, const wchar_t *selected, const wchar_t *loaded) {
+    int i;
+    int selection = -1;
+    if (!list) return;
+    SendMessageW(list, CB_RESETCONTENT, 0, 0);
+    for (i = 0; i < g_language_choice_count; ++i) {
+        wchar_t text[160];
+        LRESULT index;
+        language_display_name(&g_language_choices[i], text, 112);
+        if (wcscmp(g_language_choices[i].code, selected) == 0 && loaded && loaded[0] &&
+            wcscmp(loaded, selected) != 0) {
+            size_t used = wcslen(text);
+            swprintf(text + used, 160 - used, L" \u2014 not loaded, using %ls", language_name_of_code(loaded));
+        }
+        index = SendMessageW(list, CB_ADDSTRING, 0, (LPARAM)text);
+        if (index < 0) continue;
+        SendMessageW(list, CB_SETITEMDATA, (WPARAM)index, (LPARAM)i);
+        if (wcscmp(g_language_choices[i].code, selected) == 0) selection = (int)index;
+    }
+    if (selection < 0) {
+        /* The chosen pack is gone: show it, so the setting is not silently
+           replaced by whatever happens to be first. */
+        wchar_t text[64];
+        LRESULT index;
+        swprintf(text, 64, L"%ls (pack not found)", selected);
+        index = SendMessageW(list, CB_ADDSTRING, 0, (LPARAM)text);
+        if (index >= 0) {
+            SendMessageW(list, CB_SETITEMDATA, (WPARAM)index, (LPARAM)-1);
+            selection = (int)index;
+        }
+    }
+    SendMessageW(list, CB_SETCURSEL, (WPARAM)selection, 0);
+}
+
+/* "Auto", "Prefer <second>", "Prefer <first>", with the stored mode. */
+static void fill_writing_language_list(const wchar_t *first, const wchar_t *second) {
+    wchar_t text[96];
+    if (!g_language_mode) return;
+    SendMessageW(g_language_mode, CB_RESETCONTENT, 0, 0);
+    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)L"Auto \u2014 sentence context");
+    swprintf(text, 96, L"Prefer %ls for collisions", second);
+    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)text);
+    swprintf(text, 96, L"Prefer %ls for collisions", first);
+    SendMessageW(g_language_mode, CB_ADDSTRING, 0, (LPARAM)text);
+    SendMessageW(g_language_mode, CB_SETCURSEL, (WPARAM)g_settings.language_mode, 0);
+}
+
+/* The two language lists and the names in the writing-language list. */
+static void fill_language_controls(void) {
+    if (!g_language_first_combo || !g_language_mode) return;
+    /* A list the user has open keeps its contents (and what is being
+       chosen in it); it is refilled when it is opened next. */
+    if (!SendMessageW(g_language_first_combo, CB_GETDROPPEDSTATE, 0, 0))
+        fill_language_list(g_language_first_combo, g_settings.language_first,
+                           g_language_reload_pending ? NULL : g_slots[KS_SLOT_A].code);
+    if (!SendMessageW(g_language_second_combo, CB_GETDROPPEDSTATE, 0, 0))
+        fill_language_list(g_language_second_combo, g_settings.language_second,
+                           g_language_reload_pending ? NULL : g_slots[KS_SLOT_B].code);
+    fill_writing_language_list(language_name(KS_SLOT_A), language_name(KS_SLOT_B));
+}
+
+static int g_language_selection_pending;   /* a list was changed and not applied yet */
+
+/* Looks for packs added since the last scan and refills both lists. While
+   a new pair waits to be loaded, the engine's slots still hold the old one:
+   no "not loaded" mark then. */
+static void refresh_language_lists(void) {
+    scan_languages();
+    fill_language_list(g_language_first_combo, g_settings.language_first,
+                       g_language_reload_pending ? NULL : g_slots[KS_SLOT_A].code);
+    fill_language_list(g_language_second_combo, g_settings.language_second,
+                       g_language_reload_pending ? NULL : g_slots[KS_SLOT_B].code);
+}
+
+static int selected_language(HWND list, wchar_t *code);
+
+/* The lists show another pair than the settings hold. */
+static int language_lists_differ(void) {
+    wchar_t first[8];
+    wchar_t second[8];
+    safe_copy(first, 8, g_settings.language_first);
+    safe_copy(second, 8, g_settings.language_second);
+    selected_language(g_language_first_combo, first);
+    selected_language(g_language_second_combo, second);
+    return wcscmp(first, g_settings.language_first) != 0 || wcscmp(second, g_settings.language_second) != 0;
+}
+
+/* The code behind a language list's selection; 0 when nothing usable is
+   selected (the "pack not found" entry). */
+static int selected_language(HWND list, wchar_t *code) {
+    LRESULT index = SendMessageW(list, CB_GETCURSEL, 0, 0);
+    LRESULT choice;
+    if (index < 0) return 0;
+    choice = SendMessageW(list, CB_GETITEMDATA, (WPARAM)index, 0);
+    if (choice < 0 || choice >= g_language_choice_count) return 0;
+    safe_copy(code, 8, g_language_choices[choice].code);
+    return 1;
+}
+
 static void update_controls_from_settings(void) {
     SendMessageW(g_sensitivity, CB_SETCURSEL, (WPARAM)g_settings.sensitivity, 0);
+    fill_language_controls();
     SendMessageW(g_language_mode, CB_SETCURSEL, (WPARAM)g_settings.language_mode, 0);
     SendMessageW(g_spelling, CB_SETCURSEL, (WPARAM)g_settings.spelling, 0);
-    EnableWindow(g_spelling, g_spelling_available);
+    EnableWindow(g_spelling, g_spelling_available && pair_has_spelling());
     /* A disabled list's label would send Alt+P to the next control. */
-    EnableWindow(g_spelling_label, g_spelling_available);
-    EnableWindow(g_personal_dictionary, g_spelling_available);
+    EnableWindow(g_spelling_label, g_spelling_available && pair_has_spelling());
+    EnableWindow(g_personal_dictionary, g_spelling_available && pair_has_spelling());
+    /* Helpers for a language that is not in the pair stay visible but off. */
+    EnableWindow(g_punctuation, slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE);
+    EnableWindow(g_persian_letters, slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE);
+    EnableWindow(g_capitalize, slot_of_model(KS_LANG_ENGLISH) != KS_SLOT_NONE);
+    EnableWindow(g_digits, slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE);
+    EnableWindow(g_digits_label, slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE);
+    EnableWindow(g_vocab_it, pair_has_spelling());
     SendMessageW(g_personal_dictionary, BM_SETCHECK,
                  g_settings.personal_dictionary ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_startup, BM_SETCHECK, g_settings.start_with_windows ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -4779,12 +5826,38 @@ static void update_controls_from_settings(void) {
     update_tray_tip();
 }
 
+static int g_language_pair_changed;
+
 static void read_controls_to_settings(void) {
     LRESULT selection = SendMessageW(g_sensitivity, CB_GETCURSEL, 0, 0);
     int personal_before = g_settings.personal_dictionary;
     if (selection >= 0 && selection <= 2) g_settings.sensitivity = (int)selection;
     selection = SendMessageW(g_language_mode, CB_GETCURSEL, 0, 0);
     if (selection >= 0 && selection <= 2) g_settings.language_mode = (int)selection;
+    {
+        wchar_t first[8];
+        wchar_t second[8];
+        safe_copy(first, 8, g_settings.language_first);
+        safe_copy(second, 8, g_settings.language_second);
+        selected_language(g_language_first_combo, first);
+        selected_language(g_language_second_combo, second);
+        /* Choosing the other list's language swaps the two. */
+        if (wcscmp(first, second) == 0) {
+            if (wcscmp(first, g_settings.language_first) != 0) safe_copy(second, 8, g_settings.language_first);
+            else safe_copy(first, 8, g_settings.language_second);
+        }
+        normalize_language_pair(first, second);
+        /* "Prefer ..." is stored by position (1 = the second language): a
+           swap keeps the preferred language, not the position. */
+        if (wcscmp(first, g_settings.language_second) == 0 && wcscmp(second, g_settings.language_first) == 0 &&
+            g_settings.language_mode != 0)
+            g_settings.language_mode = 3 - g_settings.language_mode;
+        if (wcscmp(first, g_settings.language_first) != 0 || wcscmp(second, g_settings.language_second) != 0) {
+            safe_copy(g_settings.language_first, 8, first);
+            safe_copy(g_settings.language_second, 8, second);
+            g_language_pair_changed = 1;
+        }
+    }
     selection = SendMessageW(g_spelling, CB_GETCURSEL, 0, 0);
     if (selection >= KS_SPELL_OFF && selection <= KS_SPELL_AGGRESSIVE) {
         g_settings.spelling = (int)selection;
@@ -4821,14 +5894,33 @@ static void apply_controls(void) {
     /* While the controls are being destroyed (a DPI rebuild, exit) their
        values read as zero: never save those. */
     if (!g_ui_ready) return;
+    g_language_pair_changed = 0;
     read_controls_to_settings();
     memory_apply_setting();
     clear_word();
     clear_history();
     g_undo.valid = 0;
-    save_settings();
     update_tray_tip();
-    set_activity(L"Setting saved.");
+    if (!save_settings())
+        set_activity(g_paths_ok ? L"The setting is active but could not be saved (settings.ini is read-only or the disk is full)."
+                                : L"The setting is active but cannot be saved: the settings folder is not available.");
+    else if (g_startup_registry_failed)
+        set_activity(g_startup_failure ? g_startup_failure
+                                       : L"Setting saved, but Windows did not accept the Start with Windows entry.");
+    else
+        set_activity(L"Setting saved.");
+    /* A new pair is loaded from the message loop: a pack can take a moment
+       to read, and nothing may change under a hook call in progress. The
+       lists show the new pair at once (a swap changes both), so a late
+       notification of the same click finds nothing left to apply. */
+    if (g_language_pair_changed && g_window) {
+        g_language_reload_pending = 1;
+        fill_language_list(g_language_first_combo, g_settings.language_first, NULL);
+        fill_language_list(g_language_second_combo, g_settings.language_second, NULL);
+        fill_writing_language_list(language_name_of_code(g_settings.language_first),
+                                   language_name_of_code(g_settings.language_second));
+        PostMessageW(g_window, WM_APP_LANGUAGES, 0, 0);
+    }
 }
 
 /* SetWindowText repaints even when nothing changed; on a 500 ms timer that
@@ -4877,7 +5969,7 @@ static void update_diagnostics_ui(void) {
     wchar_t buffer[512];
     wchar_t process_name[MAX_PATH];
     HWND foreground = GetForegroundWindow();
-    KS_LANGUAGE language;
+    KS_SLOT language;
     const wchar_t *why;
     int state = app_state(&why);
 
@@ -4890,12 +5982,19 @@ static void update_diagnostics_ui(void) {
         swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"Not working: %ls", why);
         set_label_text(g_status_label, buffer);
         /* The line below the status says what to do about it. */
-        set_label_text(g_activity_label,
-                       !g_keyboard_hook
-                           ? L"Restart KeySwitchFix; if it persists, allow it in your security software."
-                           : L"Add English and Persian in Settings > Time & language > Language & region.");
+        if (!g_keyboard_hook)
+            set_label_text(g_activity_label,
+                           L"Restart KeySwitchFix; if it persists, allow it in your security software.");
+        else {
+            swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
+                     L"Add %ls and %ls in Settings > Time & language > Language & region.",
+                     language_name(KS_SLOT_A), language_name(KS_SLOT_B));
+            set_label_text(g_activity_label, buffer);
+        }
     } else {
-        set_label_text(g_status_label, state == 0 ? L"Protection is active" : L"Protection is paused");
+        set_label_text(g_status_label,
+                       state == 0 ? (g_paths_ok ? L"Protection is active" : L"Active — settings are not saved")
+                                  : L"Protection is paused");
         set_label_text(g_activity_label, g_last_activity);
     }
 
@@ -4999,8 +6098,10 @@ static void subclass_buttons(HWND window) {
 static void create_ui(HWND window) {
     static const wchar_t *const sensitivity[] = {
         L"Conservative", L"Balanced (recommended)", L"Sensitive" };
+    /* The two "prefer" items are renamed after the pair (see
+       fill_language_controls). */
     static const wchar_t *const writing[] = {
-        L"Auto — sentence context", L"Prefer Persian for collisions", L"Prefer English for collisions" };
+        L"Auto — sentence context", L"Prefer the second language", L"Prefer the first language" };
     static const wchar_t *const spelling[] = {
         L"Off", L"Conservative", L"Balanced (recommended)", L"Aggressive" };
     static const wchar_t *const digits[] = {
@@ -5045,31 +6146,46 @@ static void create_ui(HWND window) {
        switches beside them, then the excluded-apps box. */
     row_label(window, 0, 0, L"&Sensitivity");
     g_sensitivity = combo(window, 0, 0, IDC_SENSITIVITY, sensitivity, 3);
-    row_label(window, 0, 1, L"&Writing language");
-    g_language_mode = combo(window, 0, 1, IDC_LANGUAGE_MODE, writing, 3);
-    row_label(window, 0, 2, L"S&pelling");
+    /* The language pair: two lists side by side; the small "and" between
+       them names the second list for screen readers. */
+    row_label(window, 0, 1, L"&Languages");
+    g_language_first_combo = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0,
+                                          UI_CONTROL_LEFT, UI_ROW(1), 136, 300, window, IDC_LANGUAGE_FIRST);
+    page_add(0, g_language_first_combo);
+    page_add(0, muted(create_child(L"STATIC", L"and", SS_CENTER | SS_NOPREFIX, 0, UI_CONTROL_LEFT + 136,
+                                   UI_ROW(1) + 4, 32, 22, window, 0)));
+    g_language_second_combo = create_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0,
+                                           UI_CONTROL_LEFT + 168, UI_ROW(1), 136, 300, window,
+                                           IDC_LANGUAGE_SECOND);
+    page_add(0, g_language_second_combo);
+    /* The open lists are wide enough for "Portuguese (Português)". */
+    SendMessageW(g_language_first_combo, CB_SETDROPPEDWIDTH, (WPARAM)scale(250), 0);
+    SendMessageW(g_language_second_combo, CB_SETDROPPEDWIDTH, (WPARAM)scale(250), 0);
+    row_label(window, 0, 2, L"&Writing language");
+    g_language_mode = combo(window, 0, 2, IDC_LANGUAGE_MODE, writing, 3);
+    row_label(window, 0, 3, L"S&pelling");
     g_spelling_label = g_row_labels[g_row_label_count - 1];
-    g_spelling = combo(window, 0, 2, IDC_SPELLING, spelling, 4);
+    g_spelling = combo(window, 0, 3, IDC_SPELLING, spelling, 4);
     g_startup = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(0) + 2, UI_SIDE_WIDTH, L"Start with Wi&ndows",
                          IDC_APP_STARTUP);
-    g_personal_dictionary = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(2) + 2, UI_SIDE_WIDTH,
+    button(window, 0, L"Language pac&ks…", UI_SIDE_LEFT, UI_ROW(1) - 4, 180, IDC_LANGUAGE_PACKS);
+    g_personal_dictionary = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(3) + 2, UI_SIDE_WIDTH,
                                      L"&Remember undone words", IDC_PERSONAL_DICTIONARY);
-    row_label(window, 0, 3, L"E&xcluded apps");
+    row_label(window, 0, 4, L"E&xcluded apps");
     g_excluded = create_child(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
-                              UI_CONTROL_LEFT, UI_ROW(3), UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 26, window,
+                              UI_CONTROL_LEFT, UI_ROW(4), UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 26, window,
                               IDC_EXCLUDED);
     page_add(0, g_excluded);
     /* The setting holds 511 characters: stop there rather than cut silently. */
     SendMessageW(g_excluded, EM_SETLIMITTEXT, 511, 0);
-    hint(window, 0, UI_CONTROL_LEFT, UI_ROW(4) - 4, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 40,
-         L"Program file names separated by commas, for example KeePass.exe. The tray menu can "
-         L"exclude the app you last typed in with one click.", 0);
-    hint(window, 0, UI_LABEL_LEFT, UI_ROW(5) + 12, card_width - 48, 60,
-         L"Wrong-layout words are repaired as you type; ambiguous ones when the word ends. "
-         L"One Backspace right after a correction restores what you typed.", 0);
+    hint(window, 0, UI_CONTROL_LEFT, UI_ROW(5) - 4, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 64,
+         L"Program file names separated by commas, for example KeePass.exe; the tray menu can "
+         L"exclude the app you last typed in. One Backspace right after a correction restores "
+         L"what you typed.", 0);
 
     /* Page 1: Typing. */
     row_label(window, 1, 0, L"&Digits");
+    g_digits_label = g_row_labels[g_row_label_count - 1];
     g_digits = combo(window, 1, 0, IDC_DIGITS, digits, 4);
     row_label(window, 1, 1, L"Punctuation");
     g_punctuation = checkbox(window, 1, UI_CONTROL_LEFT, UI_ROW(1) + 2, 520,
@@ -5387,7 +6503,7 @@ static void draw_header(HDC dc, const RECT *client) {
     draw_text(dc, UI_MARGIN, 10, L"KeySwitchFix");
     SelectObject(dc, g_font_small);
     SetTextColor(dc, RGB(196, 208, 236));
-    draw_text(dc, UI_MARGIN + 2, 44, L"Persian ↔ English layout repair, spelling and typing helpers  •  v" APP_VERSION);
+    draw_text(dc, UI_MARGIN + 2, 44, L"Keyboard-layout repair for any two languages, spelling and typing helpers  •  v" APP_VERSION);
     {
         const wchar_t *text = state == 0 ? L"Active" : state == 1 ? L"Paused" : L"Problem";
         COLORREF dot = state == 0 ? RGB(80, 220, 150) : state == 1 ? UI_GREY : RGB(255, 170, 60);
@@ -5580,8 +6696,34 @@ static void toggle_enabled(int announce) {
     if (g_window) InvalidateRect(g_window, NULL, FALSE);
 }
 
+/* The folder for the user's own language packs; created on first use. A
+   pack copied there shows up the next time a language list is opened
+   (CBN_DROPDOWN rescans the folders). */
+static void open_languages_folder(void) {
+    wchar_t folder[MAX_PATH];
+    if (!g_paths_ok || !g_data_directory[0] ||
+        !path_join(folder, MAX_PATH, g_data_directory, L"\\", L"languages")) {
+        set_activity(L"There is no settings folder: it could not be created.");
+        return;
+    }
+    if (!CreateDirectoryW(folder, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        set_activity(L"The language-pack folder could not be created.");
+        return;
+    }
+    if ((INT_PTR)ShellExecuteW(NULL, L"open", folder, NULL, NULL, SW_SHOWNORMAL) <= 32) {
+        set_activity(L"The language-pack folder could not be opened.");
+        return;
+    }
+    set_activity(L"Copy .kslang files into this folder; they appear when you open a Languages list.");
+}
+
 static void open_data_folder(void) {
-    ShellExecuteW(NULL, L"open", g_data_directory, NULL, NULL, SW_SHOWNORMAL);
+    if (!g_data_directory[0]) {
+        set_activity(L"There is no settings folder: it could not be created.");
+        return;
+    }
+    if ((INT_PTR)ShellExecuteW(NULL, L"open", g_data_directory, NULL, NULL, SW_SHOWNORMAL) <= 32)
+        set_activity(L"The settings folder could not be opened.");
 }
 
 /* Keyboard navigation for the dashboard: Tab, Alt+letter, Enter and Esc via
@@ -5711,6 +6853,44 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
         case WM_COMMAND: {
             UINT id = LOWORD(wparam);
             UINT notification = HIWORD(wparam);
+            /* The two language lists. Loading a pair reads a pack from disk,
+               so arrowing through a closed list must not load (and swap)
+               every language on the way: the choice applies when the list
+               closes or loses the focus. Opening a list looks for packs
+               copied in since. */
+            if (id == IDC_LANGUAGE_FIRST || id == IDC_LANGUAGE_SECOND) {
+                static DWORD closed_at;
+                if (notification == CBN_DROPDOWN) {
+                    /* A choice made with the arrows on the closed list is
+                       applied before the lists are refilled. */
+                    if (g_language_selection_pending && language_lists_differ()) apply_controls();
+                    g_language_selection_pending = 0;
+                    refresh_language_lists();
+                    g_dropdown_selection = SendMessageW((HWND)lparam, CB_GETCURSEL, 0, 0);
+                    g_language_selection_pending = 0;
+                } else if (notification == CBN_CLOSEUP) {
+                    /* A click on an item may report the new selection just
+                       before or just after the list closes. */
+                    closed_at = GetTickCount();
+                    g_language_selection_pending = 0;
+                    if (language_lists_differ()) {
+                        apply_controls();
+                        closed_at = 0;   /* applied: a late SELCHANGE has nothing to add */
+                    }
+                } else if (notification == CBN_SELCHANGE) {
+                    if (!SendMessageW((HWND)lparam, CB_GETDROPPEDSTATE, 0, 0) &&
+                        closed_at && GetTickCount() - closed_at < 250u) {
+                        closed_at = 0;
+                        if (language_lists_differ()) apply_controls();
+                    } else {
+                        g_language_selection_pending = 1;   /* arrows on a closed list */
+                    }
+                } else if (notification == CBN_KILLFOCUS && g_language_selection_pending) {
+                    g_language_selection_pending = 0;
+                    if (language_lists_differ()) apply_controls();
+                }
+                return 0;
+            }
             /* Settings controls apply immediately. */
             if ((notification == CBN_SELCHANGE &&
                  (id == IDC_SENSITIVITY || id == IDC_LANGUAGE_MODE || id == IDC_SPELLING || id == IDC_DIGITS)) ||
@@ -5743,6 +6923,13 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 InvalidateRect(window, NULL, FALSE);
                 return 0;
             }
+            /* Owner-drawn buttons also send BN_DOUBLECLICKED: a double-click
+               must not open two windows or toggle twice. */
+            if (lparam && notification != BN_CLICKED) return 0;
+            /* While a confirmation box is open, the tray menu stays usable
+               (its loop dispatches our messages): nothing may run twice or
+               destroy the window under the box. */
+            if (g_modal_active && id != IDOK && id != IDCANCEL) return 0;
             switch (id) {
                 case IDOK: {
                     /* Enter: the dialog manager asks for the default button,
@@ -5755,6 +6942,11 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                         SendMessageW(focus, BM_CLICK, 0, 0);
                     else if (focus == g_excluded && excluded_edit_changed())
                         apply_controls();
+                    else if ((focus == g_language_first_combo || focus == g_language_second_combo) &&
+                             g_language_selection_pending) {
+                        g_language_selection_pending = 0;
+                        if (language_lists_differ()) apply_controls();
+                    }
                     return 0;
                 }
                 case IDCANCEL:
@@ -5784,12 +6976,17 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 case IDM_EXCLUDE_CURRENT:
                     if (g_last_typed_process[0]) {
                         wchar_t note[MAX_PATH + 64];
+                        /* An edit in progress in the box is kept first, then
+                           the box shows the new list (it is not refreshed
+                           while it has the focus). */
+                        if (excluded_edit_changed()) apply_controls();
                         excluded_list_toggle(g_last_typed_process);
                         clear_word();
                         clear_history();
                         g_undo.valid = 0;
                         save_settings();
                         update_controls_from_settings();
+                        if (g_excluded) SetWindowTextW(g_excluded, g_settings.excluded);
                         swprintf(note, sizeof(note) / sizeof(note[0]),
                                  excluded_list_contains(g_last_typed_process)
                                      ? L"Correction is now skipped in %ls."
@@ -5803,6 +7000,9 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     return 0;
                 case IDC_OPEN_DATA:
                     open_data_folder();
+                    return 0;
+                case IDC_LANGUAGE_PACKS:
+                    open_languages_folder();
                     return 0;
                 case IDC_EDIT_SNIPPETS:
                 case IDM_EDIT_SNIPPETS:
@@ -5823,14 +7023,24 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     return 0;
                 case IDC_FORGET_MEMORY:
                 case IDM_FORGET_MEMORY:
-                    if (MessageBoxW(window,
-                                    L"Forget every word and repair KeySwitchFix has learned from your typing?\n\n"
-                                    L"This deletes writing-memory.txt and cannot be undone.",
-                                    APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                {
+                    int visible = IsWindowVisible(window);
+                    int answer;
+                    g_modal_active = 1;
+                    /* From the tray the dashboard is hidden: the box must not
+                       open behind other windows. */
+                    answer = MessageBoxW(visible ? window : NULL,
+                                         L"Forget every word and repair KeySwitchFix has learned from your typing?\n\n"
+                                         L"This deletes writing-memory.txt and cannot be undone.",
+                                         APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 |
+                                         (visible ? 0 : MB_SETFOREGROUND | MB_TOPMOST));
+                    g_modal_active = 0;
+                    if (answer == IDYES && !g_exit_requested) {
                         memory_forget();
                         update_diagnostics_ui();
                     }
                     return 0;
+                }
                 case IDM_VOCAB_IT:
                     g_settings.vocab_it = !g_settings.vocab_it;
                     save_settings();
@@ -5871,8 +7081,8 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     set_activity(g_settings.language_mode == 0
                         ? L"Writing language: automatic sentence context."
                         : g_settings.language_mode == 1
-                            ? L"Writing language: Persian wins ambiguous collisions."
-                            : L"Writing language: English wins ambiguous collisions.");
+                            ? L"Writing language: the second language wins ambiguous collisions."
+                            : L"Writing language: the first language wins ambiguous collisions.");
                     return 0;
                 case IDM_EXIT:
                     g_exit_requested = 1;
@@ -5936,6 +7146,21 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 PostMessageW(window, WM_APP_FOCUS_QUERY, 0, 0);
                 return 0;
             }
+            if (wparam == ID_TIMER_LANGUAGES) {
+                KillTimer(window, ID_TIMER_LANGUAGES);
+                PostMessageW(window, WM_APP_LANGUAGES, 0, 0);
+                return 0;
+            }
+            if (wparam == ID_TIMER_STATE_QUERY) {
+                /* A state change of the focused field: ask again between
+                   words. The timer keeps ticking while a word is typed. */
+                if (g_engine_depth > 0) return 0;
+                if (g_has_context && GetTickCount() - g_state_query_since < 2000u) return 0;
+                KillTimer(window, ID_TIMER_STATE_QUERY);
+                g_state_query_since = 0;
+                if (g_focus_event_protected == 0) run_focus_query();
+                return 0;
+            }
             if (wparam == ID_TIMER_SMART_CORRECTION) {
                 try_smart_correction();
                 return 0;
@@ -5978,11 +7203,44 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             return 0;
         case WM_APP_SAVE_STATS:
             stats_save();
+            memory_save();
             return 0;
+        case WM_APP_LANGUAGES: {
+            int ok;
+            /* Never under a hook call that is waiting on another program
+               (a modal loop could dispatch this): try again shortly. */
+            if (g_engine_depth > 0) {
+                SetTimer(window, ID_TIMER_LANGUAGES, 50, NULL);
+                return 0;
+            }
+            ok = apply_language_pair();
+            g_language_reload_pending = 0;
+            update_controls_from_settings();
+            update_diagnostics_ui();
+            if (ok) {
+                wchar_t message[320];
+                KS_SLOT missing = missing_layout();
+                if (missing != KS_SLOT_NONE)
+                    swprintf(message, sizeof(message) / sizeof(message[0]),
+                             L"Languages: %ls and %ls. Add the %ls keyboard in Windows Settings > Time & language.",
+                             language_name(KS_SLOT_A), language_name(KS_SLOT_B), language_name(missing));
+                else
+                    swprintf(message, sizeof(message) / sizeof(message[0]), L"Languages: %ls and %ls.",
+                             language_name(KS_SLOT_A), language_name(KS_SLOT_B));
+                set_activity(message);
+            }
+            return 0;
+        }
         case WM_QUERYENDSESSION:
+            /* Settings are saved when they change; rewriting them here
+               would undo hand edits made while the app ran. */
+            if (g_engine_depth > 0) {
+                /* Sent while an operation pumps messages: save afterwards. */
+                PostMessageW(window, WM_APP_SAVE_STATS, 0, 0);
+                return TRUE;
+            }
             stats_save();
             memory_save();
-            save_settings();
             return TRUE;
         case WM_ENDSESSION:
             if (wparam) {
@@ -5991,6 +7249,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             }
             return 0;
         case WM_APP_TRAY:
+            if (g_modal_active) return 0;   /* answer the open box first */
             switch (LOWORD(lparam)) {
                 case NIN_SELECT:
                 case WM_LBUTTONDBLCLK:
@@ -6026,13 +7285,36 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             KillTimer(window, ID_TIMER_STATS);
             KillTimer(window, ID_TIMER_SNIPPETS);
             KillTimer(window, ID_TIMER_TRAY_RETRY);
+            KillTimer(window, ID_TIMER_FOCUS_QUERY);
+            KillTimer(window, ID_TIMER_STATE_QUERY);
+            KillTimer(window, ID_TIMER_LANGUAGES);
             stats_save();
             memory_save();
+            /* Exit right after a clean-up pasted: the user's own clipboard
+               goes back before the snapshot is dropped. */
+            if (g_cleanup_step == 4)
+                clipboard_snapshot_restore(&g_cleanup_saved_clipboard, g_cleanup_sequence);
+            else if (g_cleanup_step == 2 && GetClipboardSequenceNumber() != g_cleanup_sequence) {
+                /* Exit between Ctrl+C and the paste: the clipboard holds the
+                   copied selection; put the user's own content back when
+                   that copy came from the application being cleaned up. */
+                HWND owner = GetClipboardOwner();
+                DWORD owner_process = 0;
+                DWORD target_process = 0;
+                DWORD focus_process = 0;
+                if (owner) GetWindowThreadProcessId(owner, &owner_process);
+                GetWindowThreadProcessId(g_cleanup_target, &target_process);
+                /* Store apps: the frame and the app are different processes. */
+                GetWindowThreadProcessId(focused_window(g_cleanup_target), &focus_process);
+                if (owner && (owner_process == target_process || owner_process == focus_process))
+                    clipboard_snapshot_restore(&g_cleanup_saved_clipboard, GetClipboardSequenceNumber());
+            }
             clipboard_snapshot_free(&g_cleanup_saved_clipboard);
             if (g_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_UNDO);
             if (g_toggle_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_TOGGLE);
             if (g_cleanup_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_CLEANUP);
             if (g_focus_event_hook) UnhookWinEvent(g_focus_event_hook);
+            if (g_state_event_hook) UnhookWinEvent(g_state_event_hook);
             if (g_keyboard_hook) UnhookWindowsHookEx(g_keyboard_hook);
             if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
             g_tray.uFlags = 0;
@@ -6061,6 +7343,8 @@ static int command_line_has(const wchar_t *name) {
 }
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_ansi, int show_command) {
+    unsigned activity_before_load = 0;
+    int language_pair_ok = 1;
     HANDLE mutex;
     WNDCLASSEXW window_class;
     MSG message;
@@ -6071,6 +7355,20 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     (void)command_line_ansi;
 
     g_instance = instance;
+    {
+        /* Load system DLLs from System32 only, never from the folder the
+           program was started from (Downloads, for Setup). */
+        typedef BOOL (WINAPI *SET_DLL_DIRECTORIES)(DWORD);
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        SET_DLL_DIRECTORIES set_directories =
+            kernel ? (SET_DLL_DIRECTORIES)(void *)GetProcAddress(kernel, "SetDefaultDllDirectories") : NULL;
+        if (set_directories) set_directories(0x00000800 /* LOAD_LIBRARY_SEARCH_SYSTEM32 */);
+    }
+    {
+        LARGE_INTEGER counter;
+        QueryPerformanceCounter(&counter);
+        g_input_marker = (ULONG_PTR)(counter.QuadPart ^ ((LONGLONG)GetCurrentProcessId() << 20) ^ 0x4B534632) | 1u;
+    }
     /* MSAA queries in focus_event_proc need COM on this (the UI) thread.
        Without it the password check fails closed (see g_com_ready). */
     {
@@ -6122,16 +7420,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         CloseHandle(mutex);
         return 2;
     }
-    g_lexicons.english_words = &g_english_bloom;
-    g_lexicons.persian_words = &g_persian_bloom;
-    g_lexicons.english_common = &g_english_common_bloom;
-    g_lexicons.persian_common = &g_persian_common_bloom;
-    g_lexicons.english_frequent = &g_english_frequent_bloom;
-    g_lexicons.persian_frequent = &g_persian_frequent_bloom;
-    g_lexicons.english_prefixes = &g_english_prefix_bloom;
-    g_lexicons.persian_prefixes = &g_persian_prefix_bloom;
-    g_lexicons.english_common_prefixes = &g_english_common_prefix_bloom;
-    g_lexicons.persian_common_prefixes = &g_persian_common_prefix_bloom;
     g_extra_words.contains = extra_word_known;
     g_extra_words.has_prefix = extra_word_prefix;
     g_extra_words.context = NULL;
@@ -6165,10 +7453,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_context_reset(&g_intent_context);
+    activity_before_load = g_activity_count;
     load_settings();
+    language_pair_ok = apply_language_pair();
     load_personal_dictionary();
-    if (!g_paths_ok)
-        set_activity(L"The settings folder could not be created (path too long or no access); settings are not saved.");
     controls.dwSize = sizeof(controls);
     controls.dwICC = ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&controls);
@@ -6222,15 +7510,28 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_focus_event_hook = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, NULL,
                                          focus_event_proc, 0, 0,
                                          WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (!g_keyboard_hook) set_activity(L"Keyboard hook FAILED. Restart the app or check security software.");
-    else if (!g_mouse_hook) set_activity(L"Mouse hook FAILED; caret clicks cannot be observed. Check security software.");
-    else if (missing_layout() != KS_LANG_OTHER) {
-        set_activity(L"Both English and Persian keyboard layouts must be installed in Windows.");
-    } else set_activity(L"Ready. Type normally in any app; correction is automatic.");
+    g_state_event_hook = SetWinEventHook(EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE, NULL,
+                                         focus_event_proc, 0, 0,
+                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_UNDO,
                                           MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, VK_BACK);
-    if (!g_hotkey_registered)
+    /* The most important start-up problem is the one left on screen. */
+    if (!g_keyboard_hook) set_activity(L"Keyboard hook FAILED. Restart the app or check security software.");
+    else if (!g_paths_ok)
+        set_activity(L"The settings folder could not be created (path too long or no access); settings are not saved.");
+    else if (!g_mouse_hook) set_activity(L"Mouse hook FAILED; caret clicks cannot be observed. Check security software.");
+    else if (!language_pair_ok)
+        set_activity(g_language_notice);
+    else if (missing_layout() != KS_SLOT_NONE) {
+        wchar_t message[256];
+        swprintf(message, sizeof(message) / sizeof(message[0]),
+                 L"Both the %ls and the %ls keyboard layouts must be installed in Windows.",
+                 language_name(KS_SLOT_A), language_name(KS_SLOT_B));
+        set_activity(message);
+    } else if (!g_hotkey_registered)
         set_activity(L"Protection is running, but the Undo hotkey is already used by another app.");
+    else if (g_activity_count == activity_before_load)   /* keep a start-up notice */
+        set_activity(L"Ready. Type normally in any app; correction is automatic.");
     /* Ctrl + Win + K pauses and resumes correction without opening the tray. */
     g_toggle_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_TOGGLE,
                                                  MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, 'K');
@@ -6251,6 +7552,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    release_language_pair();
     if (g_com_ready) CoUninitialize();
     CloseHandle(mutex);
     return (int)message.wParam;

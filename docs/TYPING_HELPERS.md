@@ -3,8 +3,18 @@
 KeySwitchFix 3.0 grows from a layout-and-spelling corrector into a small
 typing assistant for Persian and English. Every helper is offline, runs inside
 the same keyboard hook, costs microseconds per key, and can be switched off
-individually on the dashboard (**Correction settings**) or from the tray
+individually on the dashboard (the **Typing** page) or from the tray
 menu (**Typing helpers**).
+
+The helpers belong to the built-in languages. Since 4.0 the user can choose
+another pair of languages (see [Language packs](LANGUAGE_PACKS.md)); then a
+helper whose language is not in the pair is switched off and shown greyed:
+the Persian punctuation and the Arabic-to-Persian letters need Persian in
+the pair (and act only on the Persian keyboard, so an Arabic keyboard keeps
+its own letters), English capitalisation needs English, and the digit
+setting needs Persian. Snippets work with every pair; the `Ctrl + Win + X`
+clean-up applies its Persian letters, digits and punctuation only when
+Persian is in the pair.
 
 None of the helpers touch code editors, terminals, remote-desktop clients,
 password fields, or applications on the **Excluded apps** list — the same

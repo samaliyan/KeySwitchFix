@@ -13,6 +13,7 @@
 #define IDR_FA_RANK_TABLE       212
 #define IDR_APP_BINARY          301
 #define IDR_UNINSTALL_BINARY    302
+#define IDR_LANGUAGE_BUNDLE     303
 #define IDD_INSTALLER           401
 #define IDC_INSTALL_TITLE       1001
 #define IDC_INSTALL_TEXT        1002

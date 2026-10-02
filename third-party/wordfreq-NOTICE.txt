@@ -35,6 +35,15 @@ physical-key collision priors. The common, frequent, common-prefix Bloom files
 and collision-prior table derived from wordfreq are distributed under CC
 BY-SA 4.0. Application source code remains under the project MIT license.
 
+Language packs (KeySwitchFix 4.0 and later): tools/build_language_pack.py
+reads the wordfreq 3.1.1 lists ("best" list) of Arabic, Bulgarian, Dutch,
+French, German, Greek, Hebrew, Italian, Polish, Portuguese, Russian,
+Spanish, Turkish and Ukrainian, keeps the most frequent words made only of
+letters (normalized to the application's lookup form), and stores them as Bloom membership bits, plus the language's most
+frequent one- and two-letter words as plain text. Each such language pack
+(languages\<code>.kslang) is a work derived from wordfreq data and is
+distributed under CC BY-SA 4.0, with the attribution above.
+
 Pinned wordfreq files:
 
 - wordfreq/data/large_en.msgpack.gz

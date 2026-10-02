@@ -621,7 +621,9 @@ int ks_snippets_migrate(const wchar_t *content, wchar_t *output, size_t capacity
     size_t used = 0;
     int comment = 0;
     int line_start = 1;
+    int faithful;
     if (!content || !output || capacity == 0) return 0;
+    faithful = wcsstr(content, OLD_ESCAPE_HEADER) != NULL;
     /* The 3.1 template header, or (header edited away) snippet lines with
        the old escapes and none of the new macros. */
     if (!wcsstr(content, OLD_ESCAPE_HEADER)) {
@@ -656,7 +658,11 @@ int ks_snippets_migrate(const wchar_t *content, wchar_t *output, size_t capacity
         if (comment && wcsncmp(cursor, OLD_ESCAPE_HEADER, wcslen(OLD_ESCAPE_HEADER)) == 0) {
             piece = L"{n} = new line";
             cursor += wcslen(OLD_ESCAPE_HEADER) - 1;
-        } else if (!comment && cursor[0] == L'\\' && (cursor[1] == L'n' || cursor[1] == L't')) {
+        } else if (!comment && cursor[0] == L'\\' && (cursor[1] == L'n' || cursor[1] == L't') &&
+                   (faithful || !iswalnum(cursor[2]))) {
+            /* A file with the 3.1 header meant every \\n and \\t as Enter
+               and Tab (3.1 typed them so): converted faithfully. Without the
+               header only clear escapes are, so C:\\temp\\new is kept. */
             piece = cursor[1] == L'n' ? L"{n}" : L"{t}";
             ++cursor;
         } else {

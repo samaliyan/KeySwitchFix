@@ -10,11 +10,18 @@
 #   powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 #
 # Output: dist\KeySwitchFix-Setup.exe, dist\KeySwitchFix.exe,
-#         dist\KeySwitchFix-Uninstall.exe, dist\SHA256SUMS.txt
+#         dist\KeySwitchFix-Uninstall.exe, dist\SHA256SUMS.txt,
+#         dist\languages\*.kslang (language packs, also inside Setup)
+#
+# The hook and Setup simulations (tests\app_sim.c, tests\installer_sim.c)
+# run on Linux only; GitHub runs them with build-native.sh.
 
 param(
     [string]$Zig = "",
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    # Fail when the language packs cannot be built (as the GitHub release
+    # does); also set by KSF_REQUIRE_LANGUAGE_PACKS=1.
+    [switch]$RequirePacks
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,6 +71,17 @@ Step "Metadata verification"
 Run $python @("tools\generate_domain_words.py")
 Run $python @("tests\verify_metadata.py")
 
+# --- language packs (wordfreq) ----------------------------------------------
+Step "Language packs"
+if (Test-Path dist\languages) { Remove-Item -Recurse -Force dist\languages }
+New-Item -ItemType Directory -Force -Path dist\languages | Out-Null
+if ($RequirePacks -or $env:KSF_REQUIRE_LANGUAGE_PACKS -eq "1") {
+    Run $python @("tools\build_language_pack.py", "--out", "dist\languages")
+} else {
+    Run $python @("tools\build_language_pack.py", "--out", "dist\languages", "--if-available")
+}
+Run $python @("tools\build_language_pack.py", "--bundle", "dist\languages", "--bundle-out", "dist\languages.bundle")
+
 $common = @("cc", "-target", "x86_64-windows-gnu", "-DUNICODE", "-D_UNICODE", "-std=c11", "-O2",
             "-Wall", "-Wextra", "-Werror", "-Isrc", "-Iresources")
 
@@ -84,6 +102,16 @@ if (-not $SkipTests) {
     Step "Layout corpus tests"
     Run $Zig ($common + @("src\core.c", "src\domain.c", "tests\corpus_tests.c", "-o", "dist\corpus_tests.exe"))
     Run "dist\corpus_tests.exe" @()
+    Step "Language pack tests"
+    Run $Zig ($common + @("src\core.c", "tests\language_pack_tests.c", "-o", "dist\language_pack_tests.exe"))
+    Run "dist\language_pack_tests.exe" @()
+    Step "Language packs load"
+    Run $Zig ($common + @("src\core.c", "tests\pack_check.c", "-o", "dist\pack_check.exe"))
+    $packs = @(Get-ChildItem dist\languages -Filter *.kslang | ForEach-Object { $_.FullName })
+    if ($packs.Count -gt 0) { Run "dist\pack_check.exe" $packs }
+    Step "Language rules (C and Python agree)"
+    Run $Zig ($common + @("src\core.c", "tests\language_rules.c", "-o", "dist\language_rules.exe"))
+    Run $python @("tests\verify_language_rules.py", "dist\language_rules.exe")
 }
 
 # --- application ----------------------------------------------------------
@@ -115,9 +143,13 @@ Step "PE verification"
 Run $python @("tests\verify_pe.py")
 
 Step "Checksums"
-$lines = foreach ($name in @("KeySwitchFix-Setup.exe", "KeySwitchFix-Uninstall.exe", "KeySwitchFix.exe")) {
+$lines = @(foreach ($name in @("KeySwitchFix-Setup.exe", "KeySwitchFix-Uninstall.exe", "KeySwitchFix.exe")) {
     $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
     "$hash  $name"
+})
+foreach ($pack in @(Get-ChildItem dist\languages -Filter *.kslang)) {
+    $hash = (Get-FileHash $pack.FullName -Algorithm SHA256).Hash.ToLower()
+    $lines += "$hash  languages/$($pack.Name)"
 }
 $lines | Set-Content -Encoding ascii dist\SHA256SUMS.txt
 $lines

@@ -4,6 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Known flags of both readings (the engine reports them per slot). */
+static int classify_ab(const KS_TOKEN *tokens, int count, const KS_LEXICONS *lexicons,
+                       int *a_known, int *b_known) {
+    int known[3];
+    int frequent[3];
+    if (!ks_classify_word(tokens, count, lexicons, known, frequent)) return 0;
+    *a_known = known[KS_SLOT_A];
+    *b_known = known[KS_SLOT_B];
+    return 1;
+}
+
 static unsigned char *load_file(const char *path, size_t *size) {
     FILE *file = fopen(path, "rb");
     unsigned char *data;
@@ -155,16 +166,16 @@ int main(void) {
                         fa_common_prefix_data, fa_common_prefix_size),
           "common Persian prefix Bloom validates");
     memset(&lexicons, 0, sizeof(lexicons));
-    lexicons.english_words = &en;
-    lexicons.persian_words = &fa;
-    lexicons.english_common = &en_common;
-    lexicons.persian_common = &fa_common;
-    lexicons.english_frequent = &en_frequent;
-    lexicons.persian_frequent = &fa_frequent;
-    lexicons.english_prefixes = &en_prefix;
-    lexicons.persian_prefixes = &fa_prefix;
-    lexicons.english_common_prefixes = &en_common_prefix;
-    lexicons.persian_common_prefixes = &fa_common_prefix;
+    lexicons.words[KS_SLOT_A] = &en;
+    lexicons.words[KS_SLOT_B] = &fa;
+    lexicons.common[KS_SLOT_A] = &en_common;
+    lexicons.common[KS_SLOT_B] = &fa_common;
+    lexicons.frequent[KS_SLOT_A] = &en_frequent;
+    lexicons.frequent[KS_SLOT_B] = &fa_frequent;
+    lexicons.prefixes[KS_SLOT_A] = &en_prefix;
+    lexicons.prefixes[KS_SLOT_B] = &fa_prefix;
+    lexicons.common_prefixes[KS_SLOT_A] = &en_common_prefix;
+    lexicons.common_prefixes[KS_SLOT_B] = &fa_common_prefix;
     CHECK(ks_bloom_contains(&en, L"password"), "English dictionary contains password");
     CHECK(ks_bloom_contains(&fa, L"سلام"), "Persian dictionary contains salam");
     CHECK(ks_bloom_contains(&fa_prefix, L"بهسا"), "Persian prefix guard contains behsa");
@@ -189,37 +200,37 @@ int main(void) {
           "runtime mapping preserves the alternate Windows Persian letter key");
 
     CHECK(make_tokens(password, 8, tokens), "password scan codes map");
-    ks_tokens_to_persian(tokens, 8, mapped);
+    ks_tokens_to_b(tokens, 8, mapped);
     CHECK(wcscmp(mapped, L"حشسسصخقی") == 0, "password maps to Persian mistype");
-    CHECK(ks_evaluate(tokens, 8, KS_LANG_PERSIAN, 4, &en, &fa, &decision), "Persian-to-English decision");
+    CHECK(ks_evaluate(tokens, 8, KS_SLOT_B, 4, &en, &fa, &decision), "Persian-to-English decision");
     CHECK(wcscmp(decision.replacement, L"password") == 0, "replacement is password");
-    CHECK(ks_evaluate_live(tokens, 8, KS_LANG_PERSIAN, 4, &en, &fa,
+    CHECK(ks_evaluate_live(tokens, 8, KS_SLOT_B, 4, &en, &fa,
                            &en_prefix, &fa_prefix, &decision) == KS_LIVE_CORRECT_NOW,
           "password mismatch corrects before a delimiter");
-    CHECK(!ks_evaluate(tokens, 8, KS_LANG_ENGLISH, 4, &en, &fa, &decision),
+    CHECK(!ks_evaluate(tokens, 8, KS_SLOT_A, 4, &en, &fa, &decision),
           "correct English word remains unchanged");
 
     CHECK(make_tokens(salam, 4, tokens), "salam scan codes map");
-    CHECK(ks_evaluate(tokens, 4, KS_LANG_ENGLISH, 4, &en, &fa, &decision), "English-to-Persian decision");
+    CHECK(ks_evaluate(tokens, 4, KS_SLOT_A, 4, &en, &fa, &decision), "English-to-Persian decision");
     CHECK(wcscmp(decision.replacement, L"سلام") == 0, "replacement is salam");
-    CHECK(ks_evaluate_live(tokens, 4, KS_LANG_ENGLISH, 4, &en, &fa,
+    CHECK(ks_evaluate_live(tokens, 4, KS_SLOT_A, 4, &en, &fa,
                            &en_prefix, &fa_prefix, &decision) == KS_LIVE_CORRECT_NOW,
           "salam mismatch corrects before a delimiter");
-    CHECK(!ks_evaluate(tokens, 4, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
+    CHECK(!ks_evaluate(tokens, 4, KS_SLOT_B, 4, &en, &fa, &decision),
           "correct Persian word remains unchanged");
 
     CHECK(make_tokens(ketab, 4, tokens), "ketab OEM scan codes map");
-    CHECK(ks_evaluate(tokens, 4, KS_LANG_ENGLISH, 4, &en, &fa, &decision), "OEM English-to-Persian decision");
+    CHECK(ks_evaluate(tokens, 4, KS_SLOT_A, 4, &en, &fa, &decision), "OEM English-to-Persian decision");
     CHECK(wcscmp(decision.replacement, L"کتاب") == 0, "replacement is ketab");
 
     CHECK(make_tokens(hello, 5, tokens), "hello scan codes map");
-    ks_tokens_to_persian(tokens, 5, mapped);
+    ks_tokens_to_b(tokens, 5, mapped);
     CHECK(wcscmp(mapped, L"اثممخ") == 0, "hello maps to Persian mistype");
-    CHECK(ks_evaluate(tokens, 5, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
+    CHECK(ks_evaluate(tokens, 5, KS_SLOT_B, 4, &en, &fa, &decision),
           "Persian-to-English hello decision");
     CHECK(wcscmp(decision.replacement, L"hello") == 0, "replacement is hello");
-    CHECK(ks_evaluate_contextual(tokens, 5, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_PERSIAN, 5, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_contextual(tokens, 5, KS_SLOT_B, 1,
+                                 KS_SLOT_B, 5, 0, KS_PHASE_LIVE,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "Prefer Persian never suppresses the unambiguous hello correction");
     CHECK(wcscmp(decision.replacement, L"hello") == 0,
@@ -228,27 +239,27 @@ int main(void) {
           "unambiguous hello has maximum confidence");
 
     CHECK(make_tokens(behsa, 4, tokens), "behsazi prefix scan codes map");
-    ks_tokens_to_persian(tokens, 4, mapped);
+    ks_tokens_to_b(tokens, 4, mapped);
     CHECK(wcscmp(mapped, L"بهسا") == 0, "behsazi prefix maps to behsa");
-    CHECK(ks_evaluate(tokens, 4, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
+    CHECK(ks_evaluate(tokens, 4, KS_SLOT_B, 4, &en, &fa, &decision),
           "incomplete Persian prefix demonstrates the fish false positive");
     CHECK(wcscmp(decision.replacement, L"fish") == 0, "incomplete prefix maps to fish");
-    CHECK(ks_evaluate_live(tokens, 4, KS_LANG_PERSIAN, 4, &en, &fa,
+    CHECK(ks_evaluate_live(tokens, 4, KS_SLOT_B, 4, &en, &fa,
                            &en_prefix, &fa_prefix, &decision) == KS_LIVE_WAIT_FOR_IDLE,
           "behsazi prefix is protected while typing continues");
 
     CHECK(make_tokens(behsazi, 6, tokens), "behsazi scan codes map");
-    ks_tokens_to_persian(tokens, 6, mapped);
+    ks_tokens_to_b(tokens, 6, mapped);
     CHECK(wcscmp(mapped, L"بهسازی") == 0, "completed word maps to behsazi");
-    CHECK(!ks_evaluate(tokens, 6, KS_LANG_PERSIAN, 4, &en, &fa, &decision),
+    CHECK(!ks_evaluate(tokens, 6, KS_SLOT_B, 4, &en, &fa, &decision),
           "completed Persian word remains unchanged at the word boundary");
-    CHECK(ks_evaluate_live(tokens, 6, KS_LANG_PERSIAN, 4, &en, &fa,
+    CHECK(ks_evaluate_live(tokens, 6, KS_SLOT_B, 4, &en, &fa,
                            &en_prefix, &fa_prefix, &decision) == KS_LIVE_NONE,
           "completed behsazi never triggers a live correction");
 
     CHECK(make_tokens(komak, 3, tokens), "komak scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 3, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 3, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "balanced mode corrects komak on the third key");
@@ -257,8 +268,8 @@ int main(void) {
     CHECK(decision.confidence >= 80, "komak confidence clears balanced threshold");
 
     CHECK(make_tokens(beyn, 3, tokens), "beyn scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 3, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 3, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "balanced mode corrects beyn on the third key");
@@ -266,19 +277,19 @@ int main(void) {
           "beyn replacement is Persian");
 
     CHECK(make_tokens(peyda, 4, tokens), "peyda scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 4, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 4, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "balanced mode corrects peyda without a delimiter");
     CHECK(wcscmp(decision.replacement, L"پیدا") == 0,
           "peyda replacement is Persian");
-    tokens[0].english = L'\\';
-    tokens[0].persian = L'پ';
+    tokens[0].a = L'\\';
+    tokens[0].b = L'پ';
     CHECK(make_ascii_tokens("dnh", tokens + 1) == 3,
           "legacy Windows Persian peyda suffix maps");
-    CHECK(ks_evaluate_contextual(tokens, 4, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_ENGLISH, 5, 0,
+    CHECK(ks_evaluate_contextual(tokens, 4, KS_SLOT_A, 1,
+                                 KS_SLOT_A, 5, 0,
                                  KS_PHASE_BOUNDARY, &lexicons,
                                  &decision) == KS_LIVE_CORRECT_NOW,
           "default Windows Persian layout recognizes backslash-dnh as peyda");
@@ -286,24 +297,24 @@ int main(void) {
           "default Windows Persian layout replacement is peyda");
 
     CHECK(make_tokens(aya, 3, tokens), "unshifted aya scan codes map");
-    ks_tokens_to_persian(tokens, 3, mapped);
+    ks_tokens_to_b(tokens, 3, mapped);
     CHECK(wcscmp(mapped, L"ایا") == 0, "unshifted aya keeps the user's spelling");
-    CHECK(ks_evaluate_smart(tokens, 3, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 3, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "canonical alef lookup recognizes unshifted aya immediately");
     CHECK(wcscmp(decision.replacement, L"ایا") == 0,
           "aya correction preserves unshifted spelling");
-    CHECK(ks_evaluate_smart(tokens, 3, KS_LANG_PERSIAN, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 3, KS_SLOT_B, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "correct Persian aya is never converted to English");
 
     CHECK(make_tokens(agha, 3, tokens), "unshifted agha scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 3, KS_LANG_ENGLISH, 1,
-                            KS_LANG_PERSIAN, 3, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 3, KS_SLOT_A, 1,
+                            KS_SLOT_B, 3, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "initial alef alias generalizes to agha with Persian context");
@@ -311,13 +322,13 @@ int main(void) {
           "agha correction preserves unshifted spelling");
 
     CHECK(make_tokens(ab, 2, tokens), "unshifted ab scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_IDLE,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_IDLE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "a two-key word is never repaired on a pause (fi is also first)");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "expanded short-word list recognizes unshifted ab");
@@ -325,26 +336,26 @@ int main(void) {
           "ab correction preserves unshifted spelling");
 
     CHECK(make_tokens(ta, 2, tokens), "ta scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "two-key ta waits for a natural pause (decided at the word boundary now)");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "two-key ta corrects after the adaptive pause");
     CHECK(wcscmp(decision.replacement, L"تا") == 0,
           "ta replacement is Persian");
-    CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "full contextual path recognizes ta at a word boundary");
 
     CHECK(make_tokens(kon, 2, tokens), "kon scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "two-key kon corrects after the adaptive pause");
@@ -352,38 +363,38 @@ int main(void) {
           "kon replacement is Persian");
 
     CHECK(make_tokens(khob, 2, tokens), "khob scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "standalone English of is protected when context is unknown");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_PERSIAN, 3, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_B, 3, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "contextual khob waits until the two-key word is complete (decided at the word boundary now)");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_PERSIAN, 3, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_B, 3, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_CORRECT_NOW,
           "Persian sentence context resolves of to khob");
     CHECK(wcscmp(decision.replacement, L"خب") == 0,
           "contextual khob replacement is Persian");
-    CHECK(ks_evaluate_smart(tokens, 2, KS_LANG_ENGLISH, 1,
-                            KS_LANG_ENGLISH, 3, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 2, KS_SLOT_A, 1,
+                            KS_SLOT_A, 3, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "English context keeps the genuine word of unchanged");
-    CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "sentence-start corpus prior does not guess between of and khob");
-    CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "correct sentence-start khob is protected from an of rewrite");
-    CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_PERSIAN, 5, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                 KS_SLOT_B, 5, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "Prefer Persian explicitly resolves sentence-start of to khob");
     CHECK(wcscmp(decision.replacement, L"خب") == 0,
@@ -395,66 +406,66 @@ int main(void) {
           "mesl collision membership evaluates");
     CHECK(english_known && persian_known,
           "both leg and mesl are recognized as real words");
-    CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart_common(tokens, 3, KS_SLOT_A, 1,
+                                   KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_NONE,
           "Auto mode does not destroy a standalone genuine English leg");
-    CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_PERSIAN, 3, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart_common(tokens, 3, KS_SLOT_A, 1,
+                                   KS_SLOT_B, 3, KS_PHASE_LIVE,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_NONE,
           "Auto mode cautiously pauses on the leg/mesl prefix collision (decided at the word boundary now)");
-    CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_PERSIAN, 3, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart_common(tokens, 3, KS_SLOT_A, 1,
+                                   KS_SLOT_B, 3, KS_PHASE_BOUNDARY,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_CORRECT_NOW,
           "Persian sentence context resolves leg/mesl after the adaptive pause");
     CHECK(wcscmp(decision.replacement, L"مثل") == 0,
           "mesl collision replacement is Persian");
-    CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_PERSIAN, 4, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart_common(tokens, 3, KS_SLOT_A, 1,
+                                   KS_SLOT_B, 4, KS_PHASE_BOUNDARY,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_CORRECT_NOW,
           "explicit Prefer Persian resolves leg/mesl when the word ends");
-    CHECK(ks_evaluate_smart_common(tokens, 3, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_ENGLISH, 3, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart_common(tokens, 3, KS_SLOT_A, 1,
+                                   KS_SLOT_A, 3, KS_PHASE_BOUNDARY,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_NONE,
           "English context preserves the genuine word leg");
     CHECK(ks_collision_prior_points(L"leg") >= 30,
           "frequency prior makes Persian mesl likelier than English leg");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_LIVE,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "sentence-start frequency resolves mesl but honors the leg prefix (decided at the word boundary now)");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "sentence-start mesl corrects after the adaptive pause");
     CHECK(wcscmp(decision.replacement, L"مثل") == 0,
           "sentence-start prior chooses Persian mesl");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "same prior preserves correctly typed Persian mesl");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_PERSIAN, 4, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_A, 1,
+                                 KS_SLOT_B, 4, 0, KS_PHASE_LIVE,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "no mid-word collision rewrite while leg can still become legal");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_ENGLISH, 5, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_A, 1,
+                                 KS_SLOT_A, 5, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "Prefer English overrides the sentence-start Persian prior");
 
     CHECK(make_tokens(really, 6, tokens), "really scan codes map");
-    CHECK(ks_evaluate_smart_common(tokens, 6, KS_LANG_PERSIAN, 1,
-                                   KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart_common(tokens, 6, KS_SLOT_B, 1,
+                                   KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_CORRECT_NOW,
@@ -463,8 +474,8 @@ int main(void) {
           "really replacement is English");
 
     CHECK(make_tokens(merci, 4, tokens), "merci scan codes map");
-    CHECK(ks_evaluate_smart_common(tokens, 4, KS_LANG_ENGLISH, 1,
-                                   KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart_common(tokens, 4, KS_SLOT_A, 1,
+                                   KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                                    &en, &fa, &en_common, &fa_common,
                                    &en_prefix, &fa_prefix,
                                    &decision) == KS_LIVE_CORRECT_NOW,
@@ -480,48 +491,47 @@ int main(void) {
      * the whole word, not the remainder, at the boundary.
      */
     CHECK(make_ascii_tokens("standard", tokens) == 8, "standard physical keys map");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 0, KS_PHASE_LIVE,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "sta typed on the Persian layout is repaired live after three keys");
     CHECK(wcscmp(decision.replacement, L"sta") == 0, "sta replacement is English");
-    CHECK(ks_evaluate_contextual(tokens, 8, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 8, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 0, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "the resumed word standard is left alone in the English layout");
-    CHECK(ks_evaluate_contextual(tokens + 3, 5, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens + 3, 5, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 0, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "dard on its own is not turned into Persian either");
     for (int k = 1; k < 8; ++k) {
-        CHECK(ks_evaluate_contextual(tokens, k, KS_LANG_ENGLISH, 1,
-                                     KS_LANG_PERSIAN, 4, 0, KS_PHASE_LIVE,
+        CHECK(ks_evaluate_contextual(tokens, k, KS_SLOT_A, 1,
+                                     KS_SLOT_B, 4, 0, KS_PHASE_LIVE,
                                      &lexicons, &decision) == KS_LIVE_NONE,
               "no prefix of standard typed in English is switched to Persian");
     }
 
     CHECK(make_ascii_tokens("how", tokens) == 3, "how physical keys map");
-    CHECK(ks_classify_word(tokens, 3, &lexicons,
-                           &english_known, &persian_known, NULL, NULL),
+    CHECK(classify_ab(tokens, 3, &lexicons, &english_known, &persian_known),
           "how collision classifies");
     CHECK(english_known && persian_known,
           "how and its Persian-layout output are both dictionary words");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "frequent tier resolves Persian-layout how to English");
     CHECK(wcscmp(decision.replacement, L"how") == 0,
           "how replacement is English");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_LIVE,
                                  &lexicons, &decision) != KS_LIVE_NONE,
           "how is recognized before the user presses a delimiter");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_IDLE,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_IDLE,
                                  &lexicons, &decision) == KS_LIVE_CORRECT_NOW,
           "how resolves no later than the adaptive pause");
-    CHECK(ks_evaluate_contextual(tokens, 3, KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_contextual(tokens, 3, KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) == KS_LIVE_NONE,
           "correct English how remains unchanged");
 
@@ -538,41 +548,41 @@ int main(void) {
           sequence[2].count == 2,
           "Persian phrase physical keys map");
     CHECK(ks_evaluate_contextual(sequence[0].tokens, sequence[0].count,
-                                 KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+                                 KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) ==
               KS_LIVE_CORRECT_NOW &&
           wcscmp(decision.replacement, L"در") == 0,
           "nv independently resolves to Persian dar");
     CHECK(ks_evaluate_contextual(sequence[1].tokens, sequence[1].count,
-                                 KS_LANG_ENGLISH, 1,
-                                 KS_LANG_OTHER, 0, 0, KS_PHASE_LIVE,
+                                 KS_SLOT_A, 1,
+                                 KS_SLOT_NONE, 0, 0, KS_PHASE_LIVE,
                                  &lexicons, &decision) ==
               KS_LIVE_CORRECT_NOW &&
           wcscmp(decision.replacement, L"زمانی") == 0,
           "clhkd independently resolves live to Persian zamani");
     CHECK(ks_evaluate_contextual(sequence[2].tokens, sequence[2].count,
-                                 KS_LANG_ENGLISH, 1,
-                                 KS_LANG_PERSIAN, 3, 0, KS_PHASE_BOUNDARY,
+                                 KS_SLOT_A, 1,
+                                 KS_SLOT_B, 3, 0, KS_PHASE_BOUNDARY,
                                  &lexicons, &decision) ==
               KS_LIVE_CORRECT_NOW &&
           wcscmp(decision.replacement, L"که") == 0,
           "semicolon-i resolves to Persian keh with phrase context");
-    CHECK(ks_evaluate_sequence(sequence, 3, 1, KS_LANG_OTHER, 0,
+    CHECK(ks_evaluate_sequence(sequence, 3, 1, KS_SLOT_NONE, 0,
                                &lexicons, &sequence_result),
           "sequence model recognizes a coherent Persian phrase");
-    CHECK(sequence_result.language == KS_LANG_PERSIAN &&
-          sequence_result.persian_known_words == 3,
+    CHECK(sequence_result.slot == KS_SLOT_B &&
+          sequence_result.known_words[KS_SLOT_B] == 3,
           "nv clhkd semicolon-i resolves to Persian");
 
     sequence[0].count = make_ascii_tokens("how", sequence_tokens[0]);
     sequence[1].count = make_ascii_tokens("are", sequence_tokens[1]);
     sequence[2].count = make_ascii_tokens("you", sequence_tokens[2]);
-    CHECK(ks_evaluate_sequence(sequence, 3, 1, KS_LANG_OTHER, 0,
+    CHECK(ks_evaluate_sequence(sequence, 3, 1, KS_SLOT_NONE, 0,
                                &lexicons, &sequence_result),
           "sequence model recognizes a coherent English phrase");
-    CHECK(sequence_result.language == KS_LANG_ENGLISH &&
-          sequence_result.english_known_words == 3,
+    CHECK(sequence_result.slot == KS_SLOT_A &&
+          sequence_result.known_words[KS_SLOT_A] == 3,
           "how are you resolves to English");
 
     sequence[0].count = make_ascii_tokens("this", sequence_tokens[0]);
@@ -581,16 +591,16 @@ int main(void) {
     sequence[3].count = make_ascii_tokens("very", sequence_tokens[3]);
     sequence[4].count = make_ascii_tokens("good", sequence_tokens[4]);
     sequence[5].count = make_ascii_tokens("test", sequence_tokens[5]);
-    CHECK(ks_evaluate_sequence(sequence, 6, 1, KS_LANG_OTHER, 0,
+    CHECK(ks_evaluate_sequence(sequence, 6, 1, KS_SLOT_NONE, 0,
                                &lexicons, &sequence_result),
           "sentence model is not limited to the previous four words");
-    CHECK(sequence_result.language == KS_LANG_ENGLISH &&
-          sequence_result.english_known_words == 6,
+    CHECK(sequence_result.slot == KS_SLOT_A &&
+          sequence_result.known_words[KS_SLOT_A] == 6,
           "six-word sentence resolves coherently from its beginning");
 
     sequence[0].count = make_ascii_tokens("sghl", sequence_tokens[0]);
     sequence[1].count = make_ascii_tokens("test", sequence_tokens[1]);
-    CHECK(!ks_evaluate_sequence(sequence, 2, 1, KS_LANG_OTHER, 0,
+    CHECK(!ks_evaluate_sequence(sequence, 2, 1, KS_SLOT_NONE, 0,
                                 &lexicons, &sequence_result),
           "mixed Persian-English text is not flattened into one language");
 
@@ -606,8 +616,8 @@ int main(void) {
         int token_count =
             make_ascii_tokens(common_english_suite[suite_index], tokens);
         CHECK(token_count >= 3, "common English suite maps to physical keys");
-        CHECK(ks_evaluate_contextual(tokens, token_count, KS_LANG_PERSIAN, 1,
-                                     KS_LANG_PERSIAN, 5, 0,
+        CHECK(ks_evaluate_contextual(tokens, token_count, KS_SLOT_B, 1,
+                                     KS_SLOT_B, 5, 0,
                                      KS_PHASE_BOUNDARY, &lexicons,
                                      &decision) == KS_LIVE_CORRECT_NOW,
               "Prefer Persian cannot suppress a common English correction");
@@ -615,8 +625,8 @@ int main(void) {
         mapped[KS_MAX_WORD] = 0;
         CHECK(wcscmp(decision.replacement, mapped) == 0,
               "common English suite produces the intended spelling");
-        CHECK(ks_evaluate_contextual(tokens, token_count, KS_LANG_ENGLISH, 1,
-                                     KS_LANG_PERSIAN, 5, 0,
+        CHECK(ks_evaluate_contextual(tokens, token_count, KS_SLOT_A, 1,
+                                     KS_SLOT_B, 5, 0,
                                      KS_PHASE_BOUNDARY, &lexicons,
                                      &decision) == KS_LIVE_NONE,
               "correct common English remains unchanged in Persian context");
@@ -628,34 +638,34 @@ int main(void) {
         int token_count =
             make_ascii_tokens(common_persian_suite[suite_index].keys, tokens);
         CHECK(token_count >= 3, "common Persian suite maps to physical keys");
-        CHECK(ks_evaluate_contextual(tokens, token_count, KS_LANG_ENGLISH, 1,
-                                     KS_LANG_ENGLISH, 5, 0,
+        CHECK(ks_evaluate_contextual(tokens, token_count, KS_SLOT_A, 1,
+                                     KS_SLOT_A, 5, 0,
                                      KS_PHASE_BOUNDARY, &lexicons,
                                      &decision) == KS_LIVE_CORRECT_NOW,
               "Prefer English cannot suppress a common Persian correction");
         CHECK(wcscmp(decision.replacement,
                      common_persian_suite[suite_index].expected) == 0,
               "common Persian suite produces the intended spelling");
-        CHECK(ks_evaluate_contextual(tokens, token_count, KS_LANG_PERSIAN, 1,
-                                     KS_LANG_ENGLISH, 5, 0,
+        CHECK(ks_evaluate_contextual(tokens, token_count, KS_SLOT_B, 1,
+                                     KS_SLOT_A, 5, 0,
                                      KS_PHASE_BOUNDARY, &lexicons,
                                      &decision) == KS_LIVE_NONE,
               "correct common Persian remains unchanged in English context");
     }
 
     CHECK(make_tokens(behsa, 4, tokens), "behsazi smart-prefix scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 4, KS_LANG_PERSIAN, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_LIVE,
+    CHECK(ks_evaluate_smart(tokens, 4, KS_SLOT_B, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_LIVE,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_WAIT_FOR_IDLE,
           "smart scoring still protects a valid active-language prefix");
-    CHECK(ks_evaluate_contextual(tokens, 4, KS_LANG_PERSIAN, 1,
-                                 KS_LANG_OTHER, 0, 0, KS_PHASE_IDLE,
+    CHECK(ks_evaluate_contextual(tokens, 4, KS_SLOT_B, 1,
+                                 KS_SLOT_NONE, 0, 0, KS_PHASE_IDLE,
                                  &lexicons, &decision) == KS_LIVE_WAIT_FOR_IDLE,
           "common Persian prefix is not changed to fish during a thinking pause");
     CHECK(make_tokens(behsazi, 6, tokens), "completed behsazi smart scan codes map");
-    CHECK(ks_evaluate_smart(tokens, 6, KS_LANG_PERSIAN, 1,
-                            KS_LANG_OTHER, 0, KS_PHASE_BOUNDARY,
+    CHECK(ks_evaluate_smart(tokens, 6, KS_SLOT_B, 1,
+                            KS_SLOT_NONE, 0, KS_PHASE_BOUNDARY,
                             &en, &fa, &en_prefix, &fa_prefix,
                             &decision) == KS_LIVE_NONE,
           "smart scoring keeps completed behsazi in Persian");
@@ -679,23 +689,21 @@ int main(void) {
             CHECK(make_ascii_tokens(english_token_suite[suite_index].keys,
                                     tokens) == 2,
                   "English two-key token maps");
-            CHECK(ks_classify_word(tokens, 2, &lexicons,
-                                   &english_known, &persian_known,
-                                   NULL, NULL) &&
+            CHECK(classify_ab(tokens, 2, &lexicons, &english_known, &persian_known) &&
                       english_known && persian_known,
                   "English two-key token is a collision on both sides");
-            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                         KS_LANG_OTHER, 0, 0,
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                         KS_SLOT_NONE, 0, 0,
                                          KS_PHASE_BOUNDARY, &lexicons,
                                          &decision) == KS_LIVE_NONE,
                   "English two-key token survives Space without context");
-            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                         KS_LANG_ENGLISH, 3, 0,
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                         KS_SLOT_A, 3, 0,
                                          KS_PHASE_IDLE, &lexicons,
                                          &decision) == KS_LIVE_NONE,
                   "English two-key token survives a pause in English text");
-            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                         KS_LANG_PERSIAN, 3, 0,
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                         KS_SLOT_B, 3, 0,
                                          KS_PHASE_BOUNDARY, &lexicons,
                                          &decision) == KS_LIVE_CORRECT_NOW &&
                       wcscmp(decision.replacement,
@@ -724,24 +732,24 @@ int main(void) {
             CHECK(make_ascii_tokens(zwnj_half_suite[suite_index].keys,
                                     tokens) == 2,
                   "ZWNJ half maps to physical keys");
-            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_ENGLISH, 1,
-                                         KS_LANG_OTHER, 0, 1,
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_A, 1,
+                                         KS_SLOT_NONE, 0, 1,
                                          KS_PHASE_BOUNDARY, &lexicons,
                                          &decision) == KS_LIVE_CORRECT_NOW &&
                       wcscmp(decision.replacement,
                              zwnj_half_suite[suite_index].expected) == 0,
                   "ZWNJ half is corrected to Persian at Shift+Space");
-            CHECK(ks_evaluate_contextual(tokens, 2, KS_LANG_PERSIAN, 1,
-                                         KS_LANG_OTHER, 0, 1,
+            CHECK(ks_evaluate_contextual(tokens, 2, KS_SLOT_B, 1,
+                                         KS_SLOT_NONE, 0, 1,
                                          KS_PHASE_BOUNDARY, &lexicons,
                                          &decision) == KS_LIVE_NONE,
                   "correctly typed ZWNJ half is left alone");
         }
         sequence[0].count = make_ascii_tokens("ld", sequence_tokens[0]);
         sequence[1].count = make_ascii_tokens("o,hil", sequence_tokens[1]);
-        CHECK(ks_evaluate_sequence(sequence, 2, 1, KS_LANG_OTHER, 0,
+        CHECK(ks_evaluate_sequence(sequence, 2, 1, KS_SLOT_NONE, 0,
                                    &lexicons, &sequence_result) &&
-                  sequence_result.language == KS_LANG_PERSIAN,
+                  sequence_result.slot == KS_SLOT_B,
               "mi-khaham resolves as a coherent Persian phrase");
     }
 
@@ -760,31 +768,29 @@ int main(void) {
         /* حتماً and مدرّس: correct Persian typed with a tanwin/shadda must stay
            Persian-known, or the English candidate would win by default. */
         CHECK(make_ascii_tokens("pjlh", tokens) == 4, "hatman keys map");
-        tokens[4].english = L'R';      /* Shift+R is fathatan on the Persian layout */
-        tokens[4].persian = 0x064B;
-        CHECK(ks_classify_word(tokens, 5, &lexicons,
-                               &english_known, &persian_known, NULL, NULL) &&
+        tokens[4].a = L'R';      /* Shift+R is fathatan on the Persian layout */
+        tokens[4].b = 0x064B;
+        CHECK(classify_ab(tokens, 5, &lexicons, &english_known, &persian_known) &&
                   persian_known && !english_known,
               "hatman with tanwin is recognized as Persian");
-        CHECK(ks_evaluate_contextual(tokens, 5, KS_LANG_PERSIAN, 1,
-                                     KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+        CHECK(ks_evaluate_contextual(tokens, 5, KS_SLOT_B, 1,
+                                     KS_SLOT_NONE, 0, 0, KS_PHASE_BOUNDARY,
                                      &lexicons, &decision) == KS_LIVE_NONE,
               "hatman with tanwin is never rewritten");
         CHECK(make_ascii_tokens("lnvs", tokens) == 4, "modarres keys map");
         tokens[4] = tokens[3];
-        tokens[3].english = L'I';      /* Shift+I is shadda on the Persian layout */
-        tokens[3].persian = 0x0651;
-        CHECK(ks_classify_word(tokens, 5, &lexicons,
-                               &english_known, &persian_known, NULL, NULL) &&
+        tokens[3].a = L'I';      /* Shift+I is shadda on the Persian layout */
+        tokens[3].b = 0x0651;
+        CHECK(classify_ab(tokens, 5, &lexicons, &english_known, &persian_known) &&
                   persian_known,
               "modarres with shadda is recognized as Persian");
         /* The reverse direction still works: a capitalized English word
            mistyped on the Persian layout produces a diacritic token. */
         CHECK(make_ascii_tokens("xcel", tokens + 1) == 4, "Excel keys map");
-        tokens[0].english = L'E';
-        tokens[0].persian = 0x064D;    /* Shift+E is kasratan */
-        CHECK(ks_evaluate_contextual(tokens, 5, KS_LANG_PERSIAN, 1,
-                                     KS_LANG_OTHER, 0, 1, KS_PHASE_BOUNDARY,
+        tokens[0].a = L'E';
+        tokens[0].b = 0x064D;    /* Shift+E is kasratan */
+        CHECK(ks_evaluate_contextual(tokens, 5, KS_SLOT_B, 1,
+                                     KS_SLOT_NONE, 0, 1, KS_PHASE_BOUNDARY,
                                      &lexicons, &decision) == KS_LIVE_CORRECT_NOW &&
                   wcscmp(decision.replacement, L"Excel") == 0,
               "capitalized Excel mistyped on the Persian layout is corrected");
@@ -794,14 +800,14 @@ int main(void) {
         int index;
         CHECK(make_ascii_tokens("mdnh", tokens) == 4, "legacy peyda keys map");
         /* Simulate a layout that emits Arabic yeh, then canonicalize. */
-        tokens[1].persian = 0x064A;
-        ks_tokens_to_persian(tokens, 4, legacy);
+        tokens[1].b = 0x064A;
+        ks_tokens_to_b(tokens, 4, legacy);
         CHECK(!ks_bloom_contains(&fa, legacy),
               "Arabic-yeh spelling is unknown to the normalized dictionary");
         for (index = 0; index < 4; ++index)
-            tokens[index].persian = ks_canonical_persian(tokens[index].persian);
-        CHECK(ks_evaluate_contextual(tokens, 4, KS_LANG_PERSIAN, 1,
-                                     KS_LANG_OTHER, 0, 0, KS_PHASE_BOUNDARY,
+            tokens[index].b = ks_canonical_persian(tokens[index].b);
+        CHECK(ks_evaluate_contextual(tokens, 4, KS_SLOT_B, 1,
+                                     KS_SLOT_NONE, 0, 0, KS_PHASE_BOUNDARY,
                                      &lexicons, &decision) == KS_LIVE_NONE,
               "canonicalized legacy Persian peyda is not rewritten");
     }
@@ -821,22 +827,22 @@ int main(void) {
           "invalid cadence state returns to a safe baseline");
 
     ks_context_reset(&context);
-    CHECK(ks_context_current(&context, NULL) == KS_LANG_OTHER,
+    CHECK(ks_context_current(&context, NULL) == KS_SLOT_NONE,
           "new sentence context starts neutral");
-    ks_context_observe(&context, KS_LANG_PERSIAN, 3);
-    CHECK(ks_context_current(&context, &english_known) == KS_LANG_PERSIAN &&
+    ks_context_observe(&context, KS_SLOT_B, 3);
+    CHECK(ks_context_current(&context, &english_known) == KS_SLOT_B &&
           english_known == 3,
           "first strong Persian word establishes Persian context");
-    ks_context_observe(&context, KS_LANG_PERSIAN, 3);
-    CHECK(ks_context_current(&context, &english_known) == KS_LANG_PERSIAN &&
+    ks_context_observe(&context, KS_SLOT_B, 3);
+    CHECK(ks_context_current(&context, &english_known) == KS_SLOT_B &&
           english_known == 4,
           "repeated Persian evidence strengthens sentence context");
-    ks_context_observe(&context, KS_LANG_ENGLISH, 2);
-    CHECK(ks_context_current(&context, &english_known) == KS_LANG_PERSIAN &&
+    ks_context_observe(&context, KS_SLOT_A, 2);
+    CHECK(ks_context_current(&context, &english_known) == KS_SLOT_B &&
           english_known == 2,
           "one English term does not flip an established Persian sentence");
-    ks_context_observe(&context, KS_LANG_ENGLISH, 3);
-    CHECK(ks_context_current(&context, &english_known) == KS_LANG_ENGLISH &&
+    ks_context_observe(&context, KS_SLOT_A, 3);
+    CHECK(ks_context_current(&context, &english_known) == KS_SLOT_A &&
           english_known == 1,
           "strong contrary evidence can change sentence language gradually");
 

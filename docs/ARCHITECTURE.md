@@ -122,19 +122,63 @@ the caret model can no longer be trusted, and limits each candidate word to
 `KS_MAX_WORD` tokens, each sentence to `KS_MAX_SEQUENCE_WORDS`, and
 reconstructed text to `KS_MAX_SEQUENCE_CHARS`.
 
+## Language pairs (4.0)
+
+The engine works on a pair of keyboard layouts, slot A (the first language)
+and slot B (the second). Every physical key is one token with a reading in
+each layout (`KS_TOKEN {a, b}`), and every decision names the slot the keys
+were typed in and the slot they were meant for. What a language is to the
+engine is a profile (`KS_LANG_PROFILE`): its lookup rules (case folding,
+apostrophes, Arabic or Hebrew marks, the Persian `ایا` alias), its one- and
+two-letter words, and five Bloom dictionaries (words, common words, frequent
+words, prefixes, common prefixes). English and Persian are built in; other
+languages are language packs (`.kslang`, see [Language packs](LANGUAGE_PACKS.md))
+that the app loads from `languages\` next to the program and from
+`%LOCALAPPDATA%\KeySwitchFix\languages`.
+
+A keyboard layout belongs to a slot when Windows files it under that slot's
+language and it types that language's alphabet; for English and Persian the
+rules of 3.x are kept exactly (a Latin keyboard under English or Persian is
+English, an Arabic-script keyboard under Persian or English is Persian); a
+non-Latin keyboard filed under English belongs to the one pack language of
+the pair that writes its alphabet. The keys that form words are the fixed
+3.x set for English and Persian, and for other pairs every key on which
+either layout types a letter (or an apostrophe, for languages that write one
+inside words: English, French, Italian). A key whose reading in the active
+layout is a digit is never part of a word, so numbers stay numbers where the
+other keyboard has letters on the digit row (French AZERTY).
+The built-in key table stands in for a missing layout only for English and
+Persian.
+
+What the models of English and Persian add stays theirs: spelling
+correction, the IT vocabulary, Persian digits, punctuation and letters,
+ZWNJ handling and English capitalisation apply to the slot whose model is
+English or Persian, whichever slot that is. The collision priors (`leg` /
+`مثل`) apply only to the English–Persian pair.
+
+With English and Persian chosen (in either order) the program behaves
+exactly as 3.2.1: the core was checked over 6.6 million decisions against
+the previous engine, and the application by typing 3,000 random mixed
+sentences through the hook of both versions in the simulation
+(`tests/app_sim.c` holds the scenarios that are kept).
+
 ## Components
 
 | Component | Responsibility |
 | --- | --- |
-| `src/core.c` | fallback scan-code mapping, membership, word/sequence scoring, decisions |
+| `src/core.c` | language profiles and packs, fallback scan-code mapping, membership, word/sequence scoring, decisions |
 | `src/spell.c` | KSRT rank table, keyboard geometry, candidate generation, noisy-channel spelling decision |
 | `src/app.c` | hooks, bounded phrase history, Undo, correction, settings, tray, dashboard |
 | `src/installer.c` | per-user install, shortcuts, startup, registration, uninstall |
 | `resources/*.bloom` | compact offline base, common-word, and proper-prefix membership resources |
 | `tools/generate_blooms.py` | reproducible dictionary normalization and Bloom-resource generation |
 | `tools/generate_rank_tables.py` | wordfreq-derived KSRT frequency tables for spelling correction |
+| `tools/build_language_pack.py` | language packs (`.kslang`) from wordfreq or a word list, and Setup's bundle |
 | `tests/core_tests.c` | native positive and negative detection tests |
 | `tests/spell_tests.c` | spelling decisions against fixture rank tables built by the generator |
+| `tests/language_pack_tests.c` | pack parsing (truncation and corruption fuzzing) and Russian/German decisions |
+| `tests/verify_language_rules.py` | the pack builder and the C core normalise words identically |
+| `tests/app_sim.c`, `tests/installer_sim.c` | the hook and Setup run on Linux against `tests/win32sim` with simulated keyboards and files |
 | `tests/verify_pe.py` | x64 GUI PE and embedded-payload verification |
 
 ## Installer model
@@ -145,7 +189,9 @@ The standalone Uninstaller and Installed Apps entry use the same uninstall imple
 
 ## Constraints
 
-- The application supports Windows x64 and the standard English and Persian layouts.
+- The application supports Windows x64; the language pair is English and Persian by default, or any two of the available languages.
+- After a dead key (`^` `´` on German or French keyboards, `'` on US-International) the word is not tracked, and the word the dead key begins is left alone; a key of words that one layout of the pair cannot type as one character (the Arabic lam-alef) makes the word it is in untracked, and the rest of that word is left alone too. In both cases the hook cannot know how many characters reached the screen.
+- In a pair where the full-stop key types a letter in the other language (Russian `ю`, Ukrainian `ю`, Bulgarian), that key belongs to words, so English sentence capitalisation does not start after a full stop there.
 - Custom browser password controls cannot always be identified through standard Win32 edit styles.
 - `SendInput` follows Windows integrity-level restrictions.
 - Bloom dictionaries have a small probabilistic false-positive rate, mitigated by requiring an opposite candidate match and active candidate miss.
