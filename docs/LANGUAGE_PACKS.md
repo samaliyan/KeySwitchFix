@@ -72,9 +72,10 @@ corrected while it is active.
 
 - `languages\` next to `KeySwitchFix.exe`: Setup installs the packs there,
   and the release zip has the same folder for a copy run without Setup.
-- `%LOCALAPPDATA%\KeySwitchFix\languages`: your own packs.
-  **Language packs…** on the **Correction** page creates and opens this
-  folder; a pack copied there appears the next time you open one of the
+- `%LOCALAPPDATA%\KeySwitchFix\languages`: your own packs (an advanced
+  option; most people never need it). Create the folder if it does not
+  exist (type `%LOCALAPPDATA%\KeySwitchFix` in the File Explorer address
+  bar); a pack copied there appears the next time you open one of the
   lists. A pack must be named after its code (`ka.kslang`); copies under
   other names are ignored.
 
@@ -113,7 +114,8 @@ python3 tools/build_language_pack.py --code ka --word-list georgian.txt \
 | `0x0020` | Hebrew points (niqqud) are ignored |
 | `0x0040` | Latin alphabet (abbreviations such as `cfg` are recognised) |
 
-Copy the `.kslang` file into the folder that **Language packs…** opens.
+Copy the `.kslang` file into `%LOCALAPPDATA%\KeySwitchFix\languages`
+(create the folder if needed).
 To ship a language with the program, add it to `LANGUAGES` in
 `tools/build_language_pack.py`; `build-native.sh` builds every listed
 language and Setup installs them.

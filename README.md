@@ -128,10 +128,10 @@ once; the status card names a keyboard that is missing.
   is not in your pair is switched off (greyed); layout repair, Undo,
   snippets and the writing memory work for every language.
 - The other languages are files in the `languages` folder next to
-  `KeySwitchFix.exe` (Setup installs them). **Language packs…** opens a
-  folder where you can add your own: a pack you copy there appears the next
-  time you open a list. [Language packs](docs/LANGUAGE_PACKS.md) explains
-  how to build one.
+  `KeySwitchFix.exe` (Setup installs them). Advanced: a pack you build
+  yourself goes in `%LOCALAPPDATA%\KeySwitchFix\languages` and appears the
+  next time you open a list; [Language packs](docs/LANGUAGE_PACKS.md)
+  explains how to build one.
 - A keyboard counts for a language when Windows files it under that
   language (a German keyboard under German) and it types that alphabet, or,
   for a non-Latin alphabet, when it is filed under English and only one

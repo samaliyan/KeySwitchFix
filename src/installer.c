@@ -12,7 +12,7 @@
 #include "paths.h"
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.0.0"
+#define APP_VERSION L"4.0.1"
 #define APP_WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 #define WM_APP_EXIT (WM_APP + 9)
 
@@ -691,7 +691,7 @@ static void purge_data_folder(const wchar_t *folder) {
     if (!folder || !*folder) return;
     for (i = 0; i < sizeof(data_files) / sizeof(data_files[0]); ++i)
         if (ks_path_join(path, MAX_PATH, folder, L"\\", data_files[i])) DeleteFileW(path);
-    /* The folder "Language packs…" opens, with the packs the user added. */
+    /* languages\ in the data folder: the packs the user added. */
     if (ks_path_join(path, MAX_PATH, folder, L"\\", L"languages")) remove_packs_in(path, NULL, 0);
     RemoveDirectoryW(folder);
 }

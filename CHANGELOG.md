@@ -2,6 +2,16 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [4.0.1] - 2026-10-02
+
+### Changed
+
+- The **Language packs…** button is gone from the **Correction** page: the
+  14 packs Setup installs need no action, and the button opened an empty
+  folder that only matters to someone who builds a pack of their own. Such
+  packs still work: copy them into `%LOCALAPPDATA%\KeySwitchFix\languages`
+  (see [Language packs](docs/LANGUAGE_PACKS.md)).
+
 ## [4.0.0] - 2026-10-02
 
 Any two languages, and a full independent review of the whole program.

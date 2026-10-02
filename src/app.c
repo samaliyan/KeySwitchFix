@@ -22,7 +22,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.0.0"
+#define APP_VERSION L"4.0.1"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -81,7 +81,6 @@
 #define IDC_VOCAB_IT 141
 #define IDC_LANGUAGE_FIRST 142
 #define IDC_LANGUAGE_SECOND 143
-#define IDC_LANGUAGE_PACKS 144
 #define IDC_TILE_VALUE 120      /* 120..123 */
 #define IDC_TILE_CAPTION 130    /* 130..133 */
 #define UI_TILE_COUNT 4
@@ -6168,7 +6167,6 @@ static void create_ui(HWND window) {
     g_spelling = combo(window, 0, 3, IDC_SPELLING, spelling, 4);
     g_startup = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(0) + 2, UI_SIDE_WIDTH, L"Start with Wi&ndows",
                          IDC_APP_STARTUP);
-    button(window, 0, L"Language pac&ks…", UI_SIDE_LEFT, UI_ROW(1) - 4, 180, IDC_LANGUAGE_PACKS);
     g_personal_dictionary = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(3) + 2, UI_SIDE_WIDTH,
                                      L"&Remember undone words", IDC_PERSONAL_DICTIONARY);
     row_label(window, 0, 4, L"E&xcluded apps");
@@ -6696,27 +6694,6 @@ static void toggle_enabled(int announce) {
     if (g_window) InvalidateRect(g_window, NULL, FALSE);
 }
 
-/* The folder for the user's own language packs; created on first use. A
-   pack copied there shows up the next time a language list is opened
-   (CBN_DROPDOWN rescans the folders). */
-static void open_languages_folder(void) {
-    wchar_t folder[MAX_PATH];
-    if (!g_paths_ok || !g_data_directory[0] ||
-        !path_join(folder, MAX_PATH, g_data_directory, L"\\", L"languages")) {
-        set_activity(L"There is no settings folder: it could not be created.");
-        return;
-    }
-    if (!CreateDirectoryW(folder, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        set_activity(L"The language-pack folder could not be created.");
-        return;
-    }
-    if ((INT_PTR)ShellExecuteW(NULL, L"open", folder, NULL, NULL, SW_SHOWNORMAL) <= 32) {
-        set_activity(L"The language-pack folder could not be opened.");
-        return;
-    }
-    set_activity(L"Copy .kslang files into this folder; they appear when you open a Languages list.");
-}
-
 static void open_data_folder(void) {
     if (!g_data_directory[0]) {
         set_activity(L"There is no settings folder: it could not be created.");
@@ -7000,9 +6977,6 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     return 0;
                 case IDC_OPEN_DATA:
                     open_data_folder();
-                    return 0;
-                case IDC_LANGUAGE_PACKS:
-                    open_languages_folder();
                     return 0;
                 case IDC_EDIT_SNIPPETS:
                 case IDM_EDIT_SNIPPETS:
