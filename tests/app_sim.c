@@ -269,9 +269,11 @@ LRESULT SendMessageTimeoutW(HWND window, UINT message, WPARAM wparam, LPARAM lpa
     return 1;
 }
 
+static int sim_keep_posted;
 BOOL PostMessageW(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     (void)window; (void)wparam;
     if (message == WM_INPUTLANGCHANGEREQUEST) sim_switch(lparam);
+    if (message == WM_APP_KEEP_WORD) ++sim_keep_posted;
     return TRUE;
 }
 
@@ -373,6 +375,10 @@ static struct { int id; const char *file; unsigned char *data; size_t size; } si
     {IDR_FA_FREQUENT_BLOOM, "resources/fa-frequent.bloom", NULL, 0},
     {IDR_EN_COMMON_PREFIX, "resources/en-common-prefix.bloom", NULL, 0},
     {IDR_FA_COMMON_PREFIX, "resources/fa-common-prefix.bloom", NULL, 0},
+    {IDR_EN_RANK_TABLE, "resources/en-rank.bin", NULL, 0},
+    {IDR_FA_RANK_TABLE, "resources/fa-rank.bin", NULL, 0},
+    {IDR_EN_FORMS_BLOOM, "resources/en-forms.bloom", NULL, 0},
+    {IDR_FA_FORMS_BLOOM, "resources/fa-forms.bloom", NULL, 0},
 };
 
 HRSRC FindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type) {
@@ -425,12 +431,19 @@ BOOL FindNextFileW(HANDLE search, WIN32_FIND_DATAW *found) {
 }
 BOOL FindClose(HANDLE search) { (void)search; return TRUE; }
 
+static const char *sim_dictionary_file = "/tmp/keyswitchfix-sim-personal-dictionary.txt";
+
 HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *security,
                    DWORD disposition, DWORD flags, HANDLE templ) {
     char real[512];
     const wchar_t *prefix = L"C:\\Sim\\languages\\";
     FILE *file;
     (void)access; (void)share; (void)security; (void)disposition; (void)flags; (void)templ;
+    /* The personal dictionary: a real temporary file. */
+    if (wcscmp(path, L"C:\\Sim\\data\\personal-dictionary.txt") == 0) {
+        file = fopen(sim_dictionary_file, "a+b");
+        return file ? (HANDLE)file : INVALID_HANDLE_VALUE;
+    }
     if (wcsncmp(path, prefix, wcslen(prefix)) != 0) return INVALID_HANDLE_VALUE;
     /* languages\\ru.kslang is the fixture tests/fixtures/ru-mini.kslang. */
     {
@@ -458,6 +471,40 @@ BOOL ReadFile(HANDLE handle, LPVOID buffer, DWORD wanted, LPDWORD read, void *ov
     (void)overlapped;
     *read = (DWORD)fread(buffer, 1, wanted, (FILE *)handle);
     return TRUE;
+}
+/* UTF-8 only (CP_UTF8), as the program uses it: -1 counts the terminator. */
+int WideCharToMultiByte(UINT page, DWORD flags, LPCWSTR text, int count, char *out, int capacity,
+                        const char *fallback, BOOL *used_fallback) {
+    int i, used = 0;
+    (void)page; (void)flags; (void)fallback;
+    if (used_fallback) *used_fallback = FALSE;
+    if (count < 0) count = (int)wcslen(text) + 1;
+    for (i = 0; i < count; ++i) {
+        unsigned c = (unsigned)text[i];
+        char bytes[4];
+        int n = c < 0x80 ? 1 : c < 0x800 ? 2 : 3, k;
+        if (n == 1) bytes[0] = (char)c;
+        else if (n == 2) { bytes[0] = (char)(0xC0 | (c >> 6)); bytes[1] = (char)(0x80 | (c & 0x3F)); }
+        else { bytes[0] = (char)(0xE0 | (c >> 12)); bytes[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+               bytes[2] = (char)(0x80 | (c & 0x3F)); }
+        if (out) {
+            if (used + n > capacity) return 0;
+            for (k = 0; k < n; ++k) out[used + k] = bytes[k];
+        }
+        used += n;
+    }
+    return used;
+}
+BOOL WriteFile(HANDLE handle, LPCVOID bytes, DWORD size, LPDWORD written, void *overlapped) {
+    (void)overlapped;
+    *written = (DWORD)fwrite(bytes, 1, size, (FILE *)handle);
+    return *written == size;
+}
+DWORD SetFilePointer(HANDLE handle, LONG distance, LONG *high, DWORD method) {
+    (void)high;
+    if (fseek((FILE *)handle, distance, method == FILE_END ? SEEK_END : method == 1 ? SEEK_CUR : SEEK_SET))
+        return INVALID_SET_FILE_POINTER;
+    return (DWORD)ftell((FILE *)handle);
 }
 BOOL CloseHandle(HANDLE handle) {
     if (handle && handle != INVALID_HANDLE_VALUE && handle != (HANDLE)&sim_find) fclose((FILE *)handle);
@@ -754,6 +801,153 @@ static void missing_pack(void) {
     }
 }
 
+/* Spelling through the hook with the real tables (4.1): the slips users
+   reported, colloquial words left alone, one Backspace that keeps a word,
+   and a hand repair that unteaches a typo. */
+static void spelling(void) {
+    printf("Spelling with the real tables\n");
+    install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
+    sim_start(L"en", L"fa");
+    g_spelling_available =
+        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
+        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
+        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
+        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
+    expect(g_spelling_available, "the spelling tables load");
+    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
+    g_english_spelling.language = KS_LANG_ENGLISH;
+    g_english_spelling.ranks = &g_english_rank_table;
+    g_english_spelling.words = &g_english_bloom;
+    g_english_spelling.common = &g_english_common_bloom;
+    g_english_spelling.forms = &g_english_forms_bloom;
+    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
+    g_persian_spelling.language = KS_LANG_PERSIAN;
+    g_persian_spelling.ranks = &g_persian_rank_table;
+    g_persian_spelling.words = &g_persian_bloom;
+    g_persian_spelling.common = &g_persian_common_bloom;
+    g_persian_spelling.forms = &g_persian_forms_bloom;
+    g_english_spelling.vocabulary = g_persian_spelling.vocabulary = &g_session_vocabulary;
+    g_english_spelling.personal = g_persian_spelling.personal = &g_personal_vocabulary;
+    g_english_spelling.rank_adjust = g_persian_spelling.rank_adjust = spell_rank_adjust;
+    g_english_spelling.rank_adjust_context = &g_rank_language_en;
+    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    ks_vocab_reset(&g_personal_vocabulary);
+    sim_active = (HKL)0x04290429u;
+
+    us_keys("hqgh ");
+    expect_screen(L"\u0627\u0635\u0644\u0627 ", "\u0627\u0636\u0644\u0627 is fixed (a homophone)");
+    screen_reset();
+    us_keys("dyjd ");
+    expect_screen(L"\u06CC\u0639\u0646\u06CC ", "two neighbouring keys are fixed");
+    screen_reset();
+    us_keys("ovti ");
+    expect_screen(L"\u062D\u0631\u0641\u0647 ", "a rare word one key from a frequent one is fixed");
+    screen_reset();
+    us_keys("kldn,ki ");
+    expect_screen(L"\u0646\u0645\u06CC\u062F\u0648\u0646\u0647 ", "colloquial Persian stays as written");
+    screen_reset();
+    us_keys("hordes ");
+    expect_screen(L"hordes ", "an inflected English word stays");
+    user_switch((uintptr_t)0x04290429u);
+
+    /* One Backspace gives the word back; typing on keeps it for good. */
+    g_settings.personal_dictionary = 1;
+    remove(sim_dictionary_file);
+    wcscpy(g_personal_dictionary_path, L"C:\\Sim\\data\\personal-dictionary.txt");
+    g_window = (HWND)(uintptr_t)0x2000;
+    sim_keep_posted = 0;
+    screen_reset();
+    us_keys("dyjd \b");
+    expect_screen(L"\u06CC\u063A\u062A\u06CC", "Backspace restores the typed word");
+    expect(g_pending_keep[0] && !sim_keep_posted, "the word waits for the next key");
+    us_keys(" ");
+    expect(sim_keep_posted == 1, "typing on keeps the word");
+    save_kept_word();
+    expect(ks_vocab_trusted(&g_personal_vocabulary, L"\u06CC\u063A\u062A\u06CC"), "the kept word is the user's");
+    {
+        char saved[64] = {0};
+        FILE *check = fopen(sim_dictionary_file, "rb");
+        size_t got = check ? fread(saved, 1, sizeof(saved) - 1, check) : 0;
+        if (check) fclose(check);
+        expect(got > 0 && strstr(saved, "\xDB\x8C\xD8\xBA\xD8\xAA\xDB\x8C\r\n") != NULL,
+               "and it is written to personal-dictionary.txt");
+    }
+    screen_reset();
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("dyjd ");
+    expect_screen(L"\u06CC\u063A\u062A\u06CC ", "a kept word is not corrected in a later session");
+
+    /* A second undo before the first word's message was handled: the first
+       word is still saved. */
+    ks_vocab_reset(&g_personal_vocabulary);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    sim_keep_posted = 0;
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("dyjd \b ");
+    expect(sim_keep_posted == 1 && g_pending_keep_ready, "the first word's message is queued");
+    us_keys("hqgh \b");
+    expect(ks_vocab_trusted(&g_personal_vocabulary, L"\u06CC\u063A\u062A\u06CC"),
+           "a newer undo does not lose the word waiting to be saved");
+    expect(g_pending_keep[0] && !g_pending_keep_ready, "the newer word waits for its own next key");
+    g_pending_keep[0] = 0;
+    /* The setting turned off while a word waits: nothing is saved. */
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    us_keys("hqgh \b ");
+    g_settings.personal_dictionary = 0;
+    save_kept_word();
+    expect(!ks_vocab_trusted(&g_personal_vocabulary, L"\u0627\u0636\u0644\u0627") && !g_pending_keep[0],
+           "with the setting off a waiting word is dropped");
+    g_settings.personal_dictionary = 1;
+
+    /* A Backspace that goes on deleting keeps nothing. */
+    sim_keep_posted = 0;
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("hqgh \b\b");
+    expect(!g_pending_keep[0] && !sim_keep_posted, "deleting on after an undo keeps nothing");
+    expect(!ks_vocab_trusted(&g_personal_vocabulary, L"\u0627\u0636\u0644\u0627"), "the undone typo is not saved");
+    /* A write that fails leaves the word untrusted, so it is tried again. */
+    g_personal_dictionary_path[0] = 0;
+    ks_vocab_reset(&g_personal_vocabulary);
+    personal_dictionary_lines = 0;
+    expect(!append_personal_dictionary(L"\u0627\u0636\u0644\u0627") &&
+               !ks_vocab_trusted(&g_personal_vocabulary, L"\u0627\u0636\u0644\u0627"),
+           "a word that could not be written is not marked as kept");
+    remove(sim_dictionary_file);
+    g_settings.personal_dictionary = 0;
+    g_window = NULL;
+
+    /* The writing memory: a typo that slipped through three times is
+       unlearned by one repair by hand. مثلل is ambiguous (مثل / مثلا), so
+       spelling leaves it alone. */
+    g_settings.learn_writing = 1;
+    ks_memory_reset(&g_memory);
+    g_memory_active = 1;
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("legg legg legg ");
+    expect(ks_memory_word_count(&g_memory, L"\u0645\u062B\u0644\u0644") == 3, "the typo was counted three times");
+    screen_reset();
+    us_keys("legg \b\bh ");
+    expect_screen(L"\u0645\u062B\u0644\u0627 ", "the word is repaired by hand");
+    expect(ks_memory_word_count(&g_memory, L"\u0645\u062B\u0644\u0644") == 0, "the hand repair unteaches the typo");
+    expect(ks_memory_fix_count(&g_memory, L"\u0645\u062B\u0644\u0644") == 1, "and records the repair");
+    g_memory_active = 0;
+    g_settings.learn_writing = 0;
+    g_spelling_available = 0;
+}
+
 static void late_switch(void) {
     printf("Applications that switch late (en / fa)\n");
     install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
@@ -926,6 +1120,7 @@ int main(void) {
     german_english();
     missing_pack();
     late_switch();
+    spelling();
     sim_packs[3] = L"ar.kslang";
     sim_packs[4] = L"fr.kslang";
     sim_pack_count = 5;   /* pack_added_later() starts from the first three */

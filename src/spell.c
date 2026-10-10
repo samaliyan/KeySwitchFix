@@ -125,8 +125,9 @@ int ks_keys_adjacent(wchar_t first, wchar_t second) {
     return 0;
 }
 
+/* Letters confused by sound, or by shape (ک/گ: خوشکل for خوشگل). */
 static const wchar_t *const CONFUSION_SETS[] = {
-    L"حه", L"تط", L"سصث", L"زذضظ", L"قغ", L"اآأإع", L"یئ", L"وؤ"
+    L"حه", L"تط", L"سصث", L"زذضظ", L"قغ", L"اآأإع", L"یئ", L"وؤ", L"کگ"
 };
 
 int ks_persian_confusable(wchar_t first, wchar_t second) {
@@ -222,6 +223,86 @@ static const wchar_t ENGLISH_ALPHABET[] = L"abcdefghijklmnopqrstuvwxyz";
 static const wchar_t PERSIAN_ALPHABET[] =
     L"ابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیآئؤأإء";
 
+/*
+ * Error-model weights on the zipf * 10 scale of the ranks: a bonus of 10
+ * means "this slip is ten times likelier than an arbitrary one". Measured on
+ * typos generated from the 4,000 most frequent words of each language
+ * (tests/spell_eval, see docs/SPELLING.md); every value can be overridden at
+ * compile time for that evaluation.
+ */
+#ifndef KS_BONUS_TRANSPOSE
+#define KS_BONUS_TRANSPOSE 24
+#endif
+#ifndef KS_BONUS_HOMOPHONE
+#define KS_BONUS_HOMOPHONE 30
+#endif
+#ifndef KS_BONUS_ADJACENT
+#define KS_BONUS_ADJACENT 24
+#endif
+#ifndef KS_BONUS_OTHER_LETTER
+#define KS_BONUS_OTHER_LETTER 6
+#endif
+#ifndef KS_BONUS_EXTRA_DOUBLED
+#define KS_BONUS_EXTRA_DOUBLED 22
+#endif
+#ifndef KS_BONUS_EXTRA_ADJACENT
+#define KS_BONUS_EXTRA_ADJACENT 18
+#endif
+#ifndef KS_BONUS_EXTRA_OTHER
+#define KS_BONUS_EXTRA_OTHER 8
+#endif
+#ifndef KS_BONUS_MISSING_DOUBLED
+#define KS_BONUS_MISSING_DOUBLED 24
+#endif
+#ifndef KS_BONUS_MISSING_VOWEL
+#define KS_BONUS_MISSING_VOWEL 14
+#endif
+#ifndef KS_BONUS_MISSING_OTHER
+#define KS_BONUS_MISSING_OTHER 12
+#endif
+/* Two slips are rarer than one. */
+#ifndef KS_TWO_SLIP_PENALTY
+#define KS_TWO_SLIP_PENALTY 28
+#endif
+/* A two-slip repair must reach this rank (zipf * 10) at Balanced... */
+#ifndef KS_TWO_SLIP_MIN_RANK
+#define KS_TWO_SLIP_MIN_RANK 40
+#endif
+/* ...beat the runner-up by this much more than a one-slip repair must... */
+#ifndef KS_TWO_SLIP_EXTRA_MARGIN
+#define KS_TWO_SLIP_EXTRA_MARGIN 6
+#endif
+#ifndef KS_EDGE_SLIP
+#define KS_EDGE_SLIP 1
+#endif
+#ifndef KS_BALANCED_MARGIN
+#define KS_BALANCED_MARGIN 12
+#endif
+/* ...and the typed word must have at least this many letters, and at most
+   KS_TWO_SLIP_MAX_LENGTH: the search grows with the square of the length
+   (up to about 5 ms at 12 letters), and a long word with two slips is rare. */
+#ifndef KS_TWO_SLIP_MIN_LENGTH
+#define KS_TWO_SLIP_MIN_LENGTH 4
+#endif
+#ifndef KS_TWO_SLIP_INSERT_ANY
+#define KS_TWO_SLIP_INSERT_ANY 0
+#endif
+#ifndef KS_TWO_SLIP_MAX_LENGTH
+#define KS_TWO_SLIP_MAX_LENGTH 12
+#endif
+/* A weakly known word yields only to a word this frequent... */
+#ifndef KS_REAL_WORD_MIN_RANK
+#define KS_REAL_WORD_MIN_RANK 45
+#endif
+/* ...whose score beats leaving the word as typed (worth this much). */
+#ifndef KS_REAL_WORD_KEEP
+#define KS_REAL_WORD_KEEP 60
+#endif
+/* The writing memory ranks a word it knows (seen three times) at 30 plus a
+   lift of 2 per doubling of its count: 32 at three uses, 34 at four to
+   seven, 36 from eight. Up to this rank (fewer than eight uses) it is weak. */
+#define KS_MEMORY_WEAK_RANK 34
+
 typedef struct KS_LEVEL_POLICY {
     int minimum_rank;      /* zipf * 10 the winner must reach */
     int margin;            /* winner must beat the runner-up by this */
@@ -243,7 +324,7 @@ static KS_LEVEL_POLICY level_policy(int level) {
         policy.short_word_bonus = 18;
     } else {
         policy.minimum_rank = 30;
-        policy.margin = 12;
+        policy.margin = KS_BALANCED_MARGIN;
         policy.minimum_length = 3;
         policy.short_word_bonus = 18;
     }
@@ -256,6 +337,7 @@ typedef struct KS_CANDIDATE {
     int bonus;
     int score;
     int valid;
+    int slips;
     KS_SPELL_KIND kind;
 } KS_CANDIDATE;
 
@@ -268,6 +350,13 @@ typedef struct KS_SEARCH {
     KS_CANDIDATE best;
     KS_CANDIDATE second;
     int distinct;
+    /* Two-slip search: each slip from a short list of likely ones. */
+    int slips;               /* slips in the candidate being scored (1 or 2) */
+    int bonus_floor;         /* real-word search: only slips worth this much */
+    const wchar_t *alphabet;
+    /* Keyboard neighbours and homophones of each alphabet letter, found
+       once per call. */
+    wchar_t near[48][12];
 } KS_SEARCH;
 
 int ks_spell_rank(const KS_SPELL_LEXICON *lexicon, const wchar_t *word) {
@@ -291,6 +380,7 @@ static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
             search->best.score = score;
             search->best.bonus = bonus;
             search->best.kind = kind;
+            search->best.slips = search->slips;
         }
         return;
     }
@@ -299,6 +389,7 @@ static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
             search->second.score = score;
             search->second.bonus = bonus;
             search->second.kind = kind;
+            search->second.slips = search->slips;
         }
         if (search->second.score > search->best.score) {
             KS_CANDIDATE swap = search->best;
@@ -315,6 +406,7 @@ static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
         search->best.bonus = bonus;
         search->best.score = score;
         search->best.kind = kind;
+        search->best.slips = search->slips;
         search->best.valid = 1;
         return;
     }
@@ -324,11 +416,13 @@ static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
         search->second.bonus = bonus;
         search->second.score = score;
         search->second.kind = kind;
+        search->second.slips = search->slips;
         search->second.valid = 1;
     }
 }
 
 static void consider(KS_SEARCH *search, const wchar_t *text, int bonus) {
+    if (bonus < search->bonus_floor) return;
     consider_ranked(search, text, ks_spell_rank(search->lexicon, text),
                     bonus, KS_SPELL_KIND_EDIT);
 }
@@ -379,13 +473,14 @@ static void enumerate_joins(KS_SEARCH *search) {
                (کلاستر is not کلاس‌تر). The possessive and personal endings
                (مان تان شان ام ات اش) also end ordinary nouns, so they join
                only a word the dictionary does not know: ساختمان is not
-               ساخت‌مان. The plural and comparative endings (ها، تر) join
+               ساخت‌مان, and کتابهایشان is not کتابهای‌شان. The plural and comparative endings (ها، تر) join
                dictionary words too, whose stored form lacks the joiner. */
             if (is_suffix && ks_spell_rank(search->lexicon, typed) >= 0) is_suffix = 0;
             if (is_suffix && wcscmp(right, L"ها") != 0 && wcscmp(right, L"های") != 0 &&
                 wcscmp(right, L"هایی") != 0 && wcscmp(right, L"تر") != 0 &&
                 wcscmp(right, L"ترین") != 0 &&
-                ks_text_known(typed, language, search->lexicon->words, NULL))
+                (ks_text_known(typed, language, search->lexicon->words, NULL) ||
+                 ks_text_known(typed, language, search->lexicon->forms, NULL)))
                 is_suffix = 0;
             /*
              * After می/نمی the stem must look like a verb: Persian verb
@@ -441,9 +536,15 @@ static void enumerate_joins(KS_SEARCH *search) {
  * such ties alone).
  */
 static int substitution_bonus(KS_LANGUAGE language, wchar_t typed, wchar_t intended) {
-    if (language == KS_LANG_PERSIAN && ks_persian_confusable(typed, intended)) return 30;
-    if (ks_keys_adjacent(typed, intended)) return 24;
-    return 6;
+    if (language == KS_LANG_PERSIAN && ks_persian_confusable(typed, intended)) return KS_BONUS_HOMOPHONE;
+    if (ks_keys_adjacent(typed, intended)) return KS_BONUS_ADJACENT;
+    return KS_BONUS_OTHER_LETTER;
+}
+
+/* The letters a writer leaves out most: vowel letters. */
+static int vowel_letter(KS_LANGUAGE language, wchar_t letter) {
+    return language == KS_LANG_PERSIAN ? wcschr(L"اویه", letter) != NULL
+                                       : wcschr(L"aeiou", letter) != NULL;
 }
 
 static void enumerate_candidates(KS_SEARCH *search) {
@@ -462,21 +563,21 @@ static void enumerate_candidates(KS_SEARCH *search) {
         wcscpy(candidate, typed);
         candidate[i] = typed[i + 1];
         candidate[i + 1] = typed[i];
-        consider(search, candidate, 24);
+        consider(search, candidate, KS_BONUS_TRANSPOSE);
     }
 
     /* One letter too many: helllo -> hello, thje -> the. */
     if (length >= 3) {
         for (i = 0; i < length; ++i) {
-            int bonus = 8;
+            int bonus = KS_BONUS_EXTRA_OTHER;
             wchar_t removed = typed[i];
             int doubled = (i > 0 && typed[i - 1] == removed) ||
                           (i + 1 < length && typed[i + 1] == removed);
             if (doubled)
-                bonus = 22;
+                bonus = KS_BONUS_EXTRA_DOUBLED;
             else if ((i > 0 && ks_keys_adjacent(typed[i - 1], removed)) ||
                      (i + 1 < length && ks_keys_adjacent(typed[i + 1], removed)))
-                bonus = 18;
+                bonus = KS_BONUS_EXTRA_ADJACENT;
             if (i > 0 && typed[i - 1] == removed) continue; /* same string as i-1 */
             /*
              * Dropping the last letter is how a valid inflection or a name
@@ -488,8 +589,24 @@ static void enumerate_candidates(KS_SEARCH *search) {
              * doubled edge letter was handled by the run start above.)
              */
             if ((i == length - 1 || i == 0) && !doubled) {
-                if (search->level < KS_SPELL_AGGRESSIVE) continue;
-                bonus = 0;
+                /* A real word losing its first or last letter is a different
+                   word, often the opposite one (نخرید -> خرید): never in the
+                   rare-word search. */
+                if (search->bonus_floor > 0) continue;
+#if KS_EDGE_SLIP
+                /* A neighbouring key struck with the first or last letter
+                   (پاکح, طورز) is a slip, not an ending: valid endings are in
+                   the word-form Bloom and never reach this search. */
+                int edge_slip = i == 0 ? ks_keys_adjacent(typed[1], removed)
+                                       : ks_keys_adjacent(typed[length - 2], removed);
+                if (edge_slip && search->lexicon->forms) {
+                    bonus = KS_BONUS_EXTRA_ADJACENT;
+                } else
+#endif
+                {
+                    if (search->level < KS_SPELL_AGGRESSIVE) continue;
+                    bonus = 0;
+                }
             }
             memcpy(candidate, typed, (size_t)i * sizeof(wchar_t));
             memcpy(candidate + i, typed + i + 1, (size_t)(length - i - 1) * sizeof(wchar_t));
@@ -515,14 +632,155 @@ static void enumerate_candidates(KS_SEARCH *search) {
             memcpy(candidate + i + 1, typed + i, (size_t)(length - i) * sizeof(wchar_t));
             candidate[length + 1] = 0;
             for (letter = alphabet; *letter; ++letter) {
-                int bonus = 10;
+                int bonus = vowel_letter(language, *letter) ? KS_BONUS_MISSING_VOWEL
+                                                            : KS_BONUS_MISSING_OTHER;
                 /* Inserting before an identical letter equals inserting after
                    it; skip the duplicate string. */
                 if (i < length && typed[i] == *letter) continue;
-                if (i > 0 && typed[i - 1] == *letter) bonus = 24;
+                if (i > 0 && typed[i - 1] == *letter) bonus = KS_BONUS_MISSING_DOUBLED;
                 candidate[i] = *letter;
                 consider(search, candidate, bonus);
             }
+        }
+    }
+}
+
+/* ---- Two slips ----------------------------------------------------------- */
+
+static void find_near_letters(KS_SEARCH *search) {
+    KS_LANGUAGE language = search->lexicon->language;
+    const wchar_t *a;
+    const wchar_t *b;
+    int index = 0;
+    for (a = search->alphabet; *a && index < 48; ++a, ++index) {
+        int count = 0;
+        for (b = search->alphabet; *b && count < 11; ++b) {
+            if (*a != *b && (ks_keys_adjacent(*a, *b) ||
+                             (language == KS_LANG_PERSIAN && ks_persian_confusable(*a, *b))))
+                search->near[index][count++] = *b;
+        }
+        search->near[index][count] = 0;
+    }
+}
+
+static const wchar_t *near_letters(const KS_SEARCH *search, wchar_t letter) {
+    const wchar_t *found = wcschr(search->alphabet, letter);
+    return found && found - search->alphabet < 48 ? search->near[found - search->alphabet] : L"";
+}
+
+static void slip_step(KS_SEARCH *search, const wchar_t *text, int bonus, int depth);
+
+/* 1 when a and b are at most one edit apart (Damerau: one swap of neighbours,
+   one letter changed, added or removed). */
+static int within_one_edit(const wchar_t *a, const wchar_t *b) {
+    size_t la = wcslen(a), lb = wcslen(b), i = 0;
+    if (la == lb) {
+        while (i < la && a[i] == b[i]) ++i;
+        if (i == la) return 1;
+        if (wcscmp(a + i + 1, b + i + 1) == 0) return 1;   /* one letter changed */
+        return i + 1 < la && a[i] == b[i + 1] && a[i + 1] == b[i] &&
+               wcscmp(a + i + 2, b + i + 2) == 0;          /* one swap */
+    }
+    if (la + 1 == lb) { const wchar_t *t = a; a = b; b = t; la = lb; }
+    else if (lb + 1 != la) return 0;
+    /* a is one letter longer than b. */
+    while (i < la - 1 && a[i] == b[i]) ++i;
+    return wcscmp(a + i + 1, b + i) == 0;
+}
+
+/* One more slip undone: score the result after the second, or undo another. */
+static void slip_found(KS_SEARCH *search, const wchar_t *text, int bonus, int depth) {
+    if (depth == 1) {
+        slip_step(search, text, bonus, 2);
+    } else {
+        /* Never the typed word without its first or last letter by a
+           detour (webs -> wesb -> web): cutting an ending or a prefix is
+           grammar, not repair (see enumerate_candidates). */
+        int typed_length = search->typed_length;
+        int rank;
+        if ((int)wcslen(text) == typed_length - 1 &&
+            (wcsncmp(text, search->typed, (size_t)typed_length - 1) == 0 ||
+             wcscmp(text, search->typed + 1) == 0))
+            return;
+        rank = ks_spell_rank(search->lexicon, text);
+        /* A word one edit away was scored by the one-slip search with the
+           right bonus; two hops at one place (a -> b -> c) must not give it
+           a better one. */
+        if (rank < 0 || within_one_edit(text, search->typed)) return;
+        search->slips = 2;
+        consider_ranked(search, text, rank, bonus - KS_TWO_SLIP_PENALTY, KS_SPELL_KIND_EDIT);
+    }
+}
+
+/*
+ * Undoes one likely slip in every possible place: two neighbouring letters
+ * swapped, a neighbouring key or a homophone for the right letter, a doubled
+ * or neighbouring extra letter, a letter not doubled. The first step may also
+ * restore any missing letter (missing letters are common; their position and
+ * the second slip's are independent, so one order covers both).
+ */
+static void slip_step(KS_SEARCH *search, const wchar_t *text, int bonus, int depth) {
+    KS_LANGUAGE language = search->lexicon->language;
+    int length = (int)wcslen(text);
+    wchar_t candidate[KS_MAX_WORD + 2];
+    const wchar_t *letter;
+    int i;
+
+    if (length < 2) return;
+    for (i = 0; i + 1 < length; ++i) {
+        if (text[i] == text[i + 1]) continue;
+        wcscpy(candidate, text);
+        candidate[i] = text[i + 1];
+        candidate[i + 1] = text[i];
+        slip_found(search, candidate, bonus + KS_BONUS_TRANSPOSE, depth);
+    }
+    for (i = 0; i < length; ++i) {
+        wcscpy(candidate, text);
+        for (letter = near_letters(search, text[i]); *letter; ++letter) {
+            candidate[i] = *letter;
+            slip_found(search, candidate, bonus + substitution_bonus(language, text[i], *letter), depth);
+        }
+    }
+    if (length >= 4) {
+        for (i = 1; i < length; ++i) {
+            int doubled = text[i - 1] == text[i];
+            int near = ks_keys_adjacent(text[i - 1], text[i]) ||
+                       (i + 1 < length && ks_keys_adjacent(text[i + 1], text[i]));
+            /* The last letter only when doubled: dropping an ending is
+               grammar, not repair (see enumerate_candidates). */
+            if ((!doubled && !near) || (i == length - 1 && !doubled)) continue;
+            memcpy(candidate, text, (size_t)i * sizeof(wchar_t));
+            wcscpy(candidate + i, text + i + 1);
+            slip_found(search, candidate,
+                       bonus + (doubled ? KS_BONUS_EXTRA_DOUBLED : KS_BONUS_EXTRA_ADJACENT), depth);
+        }
+    }
+    if (length + 1 > KS_MAX_WORD) return;
+    for (i = 0; i < length; ++i) {
+        /* A letter typed once that should be doubled. */
+        memcpy(candidate, text, (size_t)(i + 1) * sizeof(wchar_t));
+        wcscpy(candidate + i + 1, text + i);
+        slip_found(search, candidate, bonus + KS_BONUS_MISSING_DOUBLED, depth);
+    }
+    if (depth != 1) return;
+    for (i = 0; i <= length; ++i) {
+        memcpy(candidate, text, (size_t)i * sizeof(wchar_t));
+        wcscpy(candidate + i + 1, text + i);
+        for (letter = search->alphabet; *letter; ++letter) {
+            if ((i < length && text[i] == *letter) || (i > 0 && text[i - 1] == *letter)) continue;
+#if !KS_TWO_SLIP_INSERT_ANY
+            /* Only the letters most often left out: vowel letters, and keys
+               next to the letters around the gap (a key pressed too
+               lightly beside its neighbour). */
+            if (!vowel_letter(language, *letter) &&
+                !(i < length && ks_keys_adjacent(text[i], *letter)) &&
+                !(i > 0 && ks_keys_adjacent(text[i - 1], *letter)))
+                continue;
+#endif
+            candidate[i] = *letter;
+            slip_found(search, candidate,
+                       bonus + (vowel_letter(language, *letter) ? KS_BONUS_MISSING_VOWEL
+                                                                : KS_BONUS_MISSING_OTHER), depth);
         }
     }
 }
@@ -552,9 +810,45 @@ int ks_spell_known(const wchar_t *word, const KS_SPELL_LEXICON *lexicon) {
      * Deliberately not the common-word Bloom: it is raw corpus frequency and
      * contains joined typos such as "alot" and "thankyou". The rank table
      * already admits everyday casual vocabulary through a filter that rejects
-     * those; here only the curated dictionary is trusted.
+     * those; here only the curated dictionary is trusted, stems and the forms
+     * its affix rules allow.
      */
-    return ks_text_known(word, lexicon->language, lexicon->words, NULL);
+    return ks_text_known(word, lexicon->language, lexicon->words, NULL) ||
+           ks_text_known(word, lexicon->language, lexicon->forms, NULL);
+}
+
+int ks_spell_weakly_known(const wchar_t *word, const KS_SPELL_LEXICON *lexicon) {
+    int rank;
+    if (!word || !*word || !lexicon) return 0;
+    if (ks_vocab_trusted(lexicon->vocabulary, word) ||
+        ks_vocab_trusted(lexicon->personal, word)) return 0;
+    if (ks_rank_lookup(lexicon->ranks, word) >= 0) return 0;
+    rank = ks_spell_rank(lexicon, word);
+    if (rank > KS_MEMORY_WEAK_RANK) return 0;
+    return rank >= 0 || ks_spell_known(word, lexicon);
+}
+
+static void finish(KS_SPELL_RESULT *result, const KS_SEARCH *search, int runner_up_score) {
+    result->should_correct = 1;
+    result->kind = search->best.kind;
+    result->best_rank = search->best.rank;
+    result->edits = search->best.slips > 1 ? 2 : 1;
+    result->confidence = search->best.score - runner_up_score;
+    if (result->confidence > 100) result->confidence = 100;
+    wcscpy(result->replacement, search->best.text);
+}
+
+/* Whether the search found a winner the level accepts. */
+static int convincing(const KS_SEARCH *search, const KS_LEVEL_POLICY *policy, size_t length,
+                      int *runner_up_score) {
+    const KS_CANDIDATE *best = &search->best;
+    *runner_up_score = search->second.valid ? search->second.score : -1000;
+
+    if (!best->valid || best->rank < policy->minimum_rank) return 0;
+    if (best->slips > 1 && best->rank < KS_TWO_SLIP_MIN_RANK) return 0;
+    if (length <= 3 && best->bonus < policy->short_word_bonus) return 0;
+    return best->score - *runner_up_score >=
+           policy->margin + (best->slips > 1 ? KS_TWO_SLIP_EXTRA_MARGIN : 0);
 }
 
 int ks_spell_correct(const wchar_t *word, int level,
@@ -616,29 +910,49 @@ int ks_spell_correct(const wchar_t *word, int level,
             return 1;
         }
     }
-    if (ks_spell_known(word, lexicon)) return 0;
-
     memset(&search, 0, sizeof(search));
     search.lexicon = lexicon;
     search.typed = word;
     search.typed_length = (int)length;
     search.level = level;
+    search.slips = 1;
+    search.alphabet = lexicon->language == KS_LANG_PERSIAN ? PERSIAN_ALPHABET : ENGLISH_ALPHABET;
+    wcscpy(result->original, word);
+
+    if (ks_spell_known(word, lexicon)) {
+        /*
+         * A real word, but perhaps only a rare one that a keyboard slip
+         * produced: خرفه (purslane) for حرفه (profession), or a typo the
+         * writing memory has seen a few times. It yields only to a very
+         * frequent word one strong slip away (a neighbouring key, a
+         * homophone, swapped or doubled letters) that clearly beats leaving
+         * it as typed. Never at Conservative, never for short words.
+         */
+        if (level < KS_SPELL_BALANCED || length < 4 || !ks_spell_weakly_known(word, lexicon))
+            return 0;
+        search.bonus_floor = KS_BONUS_EXTRA_ADJACENT;
+        enumerate_candidates(&search);
+        result->candidate_count = search.distinct;
+        if (!search.best.valid || search.best.rank < KS_REAL_WORD_MIN_RANK) return 0;
+        runner_up_score = search.second.valid && search.second.score > KS_REAL_WORD_KEEP
+                              ? search.second.score : KS_REAL_WORD_KEEP;
+        if (search.best.score - runner_up_score < policy.margin) return 0;
+        finish(result, &search, runner_up_score);
+        result->real_word = 1;
+        return 1;
+    }
+
     enumerate_candidates(&search);
     enumerate_joins(&search);
-
+    if (!convincing(&search, &policy, length, &runner_up_score) &&
+        level >= KS_SPELL_BALANCED && length >= KS_TWO_SLIP_MIN_LENGTH &&
+        length <= KS_TWO_SLIP_MAX_LENGTH) {
+        /* No single slip explains the word: try two. */
+        find_near_letters(&search);
+        slip_step(&search, word, 0, 1);
+    }
     result->candidate_count = search.distinct;
-    wcscpy(result->original, word);
-    if (!search.best.valid) return 0;
-    if (search.best.rank < policy.minimum_rank) return 0;
-    if (length <= 3 && search.best.bonus < policy.short_word_bonus) return 0;
-    runner_up_score = search.second.valid ? search.second.score : -1000;
-    if (search.best.score - runner_up_score < policy.margin) return 0;
-
-    result->should_correct = 1;
-    result->kind = search.best.kind;
-    result->best_rank = search.best.rank;
-    result->confidence = search.best.score - runner_up_score;
-    if (result->confidence > 100) result->confidence = 100;
-    wcscpy(result->replacement, search.best.text);
+    if (!convincing(&search, &policy, length, &runner_up_score)) return 0;
+    finish(result, &search, runner_up_score);
     return 1;
 }

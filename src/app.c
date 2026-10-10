@@ -22,7 +22,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.0.1"
+#define APP_VERSION L"4.1.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -34,6 +34,8 @@
 #define WM_APP_FOCUS_QUERY (WM_APP + 4)
 /* Load the language pair chosen in the settings (never inside a hook call). */
 #define WM_APP_LANGUAGES (WM_APP + 5)
+/* Save the word the user kept (undid a correction of, then moved on). */
+#define WM_APP_KEEP_WORD (WM_APP + 6)
 
 #define ID_TRAY 1
 #define ID_TIMER_STATUS 10
@@ -106,6 +108,7 @@
 #define IDM_OPEN_MEMORY 215
 #define IDM_FORGET_MEMORY 216
 #define IDM_VOCAB_IT 217
+#define IDM_OPEN_MY_WORDS 218
 
 /* Marks the input KeySwitchFix injects. Chosen at start-up, so another
    program cannot make its keys look like ours. */
@@ -421,6 +424,9 @@ static KS_BLOOM g_english_bloom;
 static KS_BLOOM g_persian_bloom;
 static KS_BLOOM g_english_common_bloom;
 static KS_BLOOM g_persian_common_bloom;
+/* Every inflected form the dictionaries allow (spelling only). */
+static KS_BLOOM g_english_forms_bloom;
+static KS_BLOOM g_persian_forms_bloom;
 static KS_BLOOM g_english_frequent_bloom;
 static KS_BLOOM g_persian_frequent_bloom;
 static KS_BLOOM g_english_prefix_bloom;
@@ -635,8 +641,10 @@ static void load_settings(void) {
         g_settings.spelling_last_level > KS_SPELL_AGGRESSIVE)
         g_settings.spelling_last_level = KS_SPELL_BALANCED;
     if (g_settings.spelling) g_settings.spelling_last_level = g_settings.spelling;
+    /* On by default since 4.1: undoing a correction is how the user says
+       "I meant this" (an earlier settings.ini keeps its own choice). */
     g_settings.personal_dictionary =
-        GetPrivateProfileIntW(L"Spelling", L"PersonalDictionary", 0, g_settings_path) != 0;
+        GetPrivateProfileIntW(L"Spelling", L"PersonalDictionary", 1, g_settings_path) != 0;
     g_settings.digits = GetPrivateProfileIntW(L"Typing", L"Digits", KS_DIGITS_BY_LAYOUT, g_settings_path);
     if (g_settings.digits < KS_DIGITS_OFF || g_settings.digits > KS_DIGITS_LATIN)
         g_settings.digits = KS_DIGITS_BY_LAYOUT;
@@ -2855,18 +2863,40 @@ static int try_sequence_correction(HWND foreground,
  * spelling fix is undone while the option is on.
  */
 static int personal_dictionary_lines;
+/* Last-write time of personal-dictionary.txt as this process last read it. */
+static FILETIME g_personal_dictionary_time;
 
-static void save_personal_dictionary(void) {
+/*
+ * "Remember undone words": a correction undone with Backspace gives the word
+ * back. The word is saved for good once the user moves on (types anything
+ * but Backspace or Delete, or leaves it for ten seconds); a Backspace that
+ * goes on deleting the restored word was not a choice, and keeps nothing.
+ * Undone twice in one session, it is saved at once. The hook only notes
+ * the word; the file is written from the message loop (WM_APP_KEEP_WORD).
+ */
+static wchar_t g_pending_keep[KS_MAX_WORD + 1];
+static DWORD g_pending_keep_at;
+static int g_pending_keep_ready;
+
+static void keep_word_soon(void) {
+    if (!g_pending_keep[0] || g_pending_keep_ready) return;
+    g_pending_keep_ready = 1;
+    if (g_window) PostMessageW(g_window, WM_APP_KEEP_WORD, 0, 0);
+}
+
+/* 1 when the file now holds the in-memory dictionary. */
+static int save_personal_dictionary(void) {
     /* Written whole and swapped in (write_text_file), so a failed write
        never destroys the existing dictionary. */
     size_t capacity = 1;
     wchar_t *text;
     size_t used = 0;
+    int ok;
     int i;
     for (i = 0; i < g_personal_vocabulary.count; ++i)
         capacity += wcslen(g_personal_vocabulary.entries[i].text) + 2;
     text = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, capacity * sizeof(wchar_t));
-    if (!text) return;
+    if (!text) return 0;
     for (i = 0; i < g_personal_vocabulary.count; ++i) {
         size_t length = wcslen(g_personal_vocabulary.entries[i].text);
         if (!length) continue;
@@ -2876,11 +2906,13 @@ static void save_personal_dictionary(void) {
         text[used++] = L'\n';
     }
     text[used] = 0;
-    if (write_text_file(g_personal_dictionary_path, text))
+    ok = write_text_file(g_personal_dictionary_path, text);
+    if (ok)
         personal_dictionary_lines = g_personal_vocabulary.count;
     else
         set_activity(L"The personal dictionary could not be saved.");
     HeapFree(GetProcessHeap(), 0, text);
+    return ok;
 }
 
 static void load_personal_dictionary(void) {
@@ -2969,31 +3001,32 @@ static void load_personal_dictionary(void) {
         save_personal_dictionary();
 }
 
-static void append_personal_dictionary(const wchar_t *word) {
+/* 1 when the word is in the dictionary afterwards (also: it already was). */
+static int append_personal_dictionary(const wchar_t *word) {
     HANDLE file;
     char utf8[KS_MAX_WORD * 4 + 6];
     int length;
     DWORD written = 0;
     LARGE_INTEGER size;
+    int ok = 0;
 
-    if (!g_settings.personal_dictionary || !word || !*word) return;
-    if (ks_vocab_trusted(&g_personal_vocabulary, word)) return;
-    ks_vocab_trust(&g_personal_vocabulary, word);
+    if (!g_settings.personal_dictionary || !word || !*word) return 0;
+    if (ks_vocab_trusted(&g_personal_vocabulary, word)) return 1;
     if (personal_dictionary_lines >= KS_VOCAB_CAPACITY) {
-        /* The ring has recycled its oldest entry; compact the file to match. */
-        save_personal_dictionary();
-        return;
+        /* The ring recycles its oldest entry; compact the file to match. */
+        ks_vocab_trust(&g_personal_vocabulary, word);
+        return save_personal_dictionary();
     }
     /* utf8[0..1] are reserved for a line break before the word. */
     length = WideCharToMultiByte(CP_UTF8, 0, word, -1, utf8 + 2, (int)sizeof(utf8) - 5, NULL, NULL);
-    if (length <= 1) return;
+    if (length <= 1) return 0;
     utf8[2 + length - 1] = '\r';
     utf8[2 + length] = '\n';
     file = CreateFileW(g_personal_dictionary_path, GENERIC_READ | FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) {
         set_activity(L"The personal dictionary could not be written.");
-        return;
+        return 0;
     }
     {
         /* A hand-edited file may end without a line break: start a new
@@ -3012,11 +3045,79 @@ static void append_personal_dictionary(const wchar_t *word) {
         memmove(utf8, utf8 + offset, (size_t)(length + 1 + 2 - offset));
         length += 2 - offset;
     }
-    if (WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL) && written == (DWORD)(length + 1))
+    if (WriteFile(file, utf8, (DWORD)(length + 1), &written, NULL) && written == (DWORD)(length + 1)) {
+        /* Trusted only once it is on disk: a failed write is retried the
+           next time the word is kept (this session trusts it anyway). */
+        ks_vocab_trust(&g_personal_vocabulary, word);
         ++personal_dictionary_lines;
-    else
+        ok = 1;
+    } else {
         set_activity(L"The personal dictionary could not be written.");
+    }
     CloseHandle(file);
+    return ok;
+}
+
+static int personal_dictionary_file_time(FILETIME *time) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    if (!GetFileAttributesExW(g_personal_dictionary_path, GetFileExInfoStandard, &attributes)) return 0;
+    *time = attributes.ftLastWriteTime;
+    return 1;
+}
+
+/* Message loop: the word the user kept goes into the personal dictionary. */
+static void save_kept_word(void) {
+    wchar_t word[KS_MAX_WORD + 1];
+    if (!g_pending_keep_ready || !g_pending_keep[0]) return;
+    safe_copy(word, KS_MAX_WORD + 1, g_pending_keep);
+    g_pending_keep[0] = 0;
+    g_pending_keep_ready = 0;
+    if (!g_settings.personal_dictionary || ks_vocab_trusted(&g_personal_vocabulary, word)) return;
+    /* A failed write leaves its own message on the dashboard. */
+    if (!append_personal_dictionary(word)) return;
+    personal_dictionary_file_time(&g_personal_dictionary_time);
+    if (typed_text_private()) {
+        set_activity(L"Kept the word as you wrote it.");
+    } else {
+        wchar_t message[KS_MAX_WORD + 80];
+        swprintf(message, sizeof(message) / sizeof(message[0]),
+                 L"Kept \u201c%ls\u201d as you write it; it is not corrected again.", word);
+        set_activity(message);
+    }
+}
+
+/* A hand edit of personal-dictionary.txt (Open my words…) applies within
+   two seconds: a word deleted there is corrected again. */
+static void personal_dictionary_poll(void) {
+    FILETIME now;
+    if (!g_settings.personal_dictionary || !personal_dictionary_file_time(&now)) return;
+    if (CompareFileTime(&now, &g_personal_dictionary_time) == 0) return;
+    {
+        /* An editor or a sync tool may still be writing it: reading then
+           would find nothing and forget every kept word. Try again in two
+           seconds. */
+        HANDLE probe = CreateFileW(g_personal_dictionary_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (probe == INVALID_HANDLE_VALUE) return;
+        CloseHandle(probe);
+    }
+    g_personal_dictionary_time = now;
+    load_personal_dictionary();
+    personal_dictionary_file_time(&g_personal_dictionary_time);
+}
+
+static void open_my_words(void) {
+    if (!g_settings.personal_dictionary) {
+        set_activity(L"Turn on \u201cRemember undone words\u201d first (Correction page).");
+        return;
+    }
+    if (GetFileAttributesW(g_personal_dictionary_path) == INVALID_FILE_ATTRIBUTES &&
+        !write_text_file(g_personal_dictionary_path, L"")) {
+        set_activity(L"Could not create personal-dictionary.txt in the KeySwitchFix data folder.");
+        return;
+    }
+    if (open_in_notepad(g_personal_dictionary_path))
+        set_activity(L"Your kept words, one per line. Delete a line and save: that word is corrected again.");
 }
 
 /*
@@ -3640,7 +3741,15 @@ static int try_undo(int consume_delimiter) {
             int seen_before = ks_vocab_observe(&g_session_vocabulary, g_undo.original) >= 2;
             ks_ignore_list_add(&g_spelling_ignore, g_undo.original);
             ks_vocab_trust(&g_session_vocabulary, g_undo.original);
-            if (seen_before) append_personal_dictionary(g_undo.original);
+            /* A word already kept but not yet saved (its message is still
+               queued) is saved now, before this one takes its place. */
+            if (g_pending_keep_ready) save_kept_word();
+            if (g_settings.personal_dictionary && wcslen(g_undo.original) <= KS_MAX_WORD) {
+                safe_copy(g_pending_keep, KS_MAX_WORD + 1, g_undo.original);
+                g_pending_keep_at = GetTickCount();
+                g_pending_keep_ready = 0;
+                if (seen_before) keep_word_soon();
+            }
             /* "Teh" undone at a sentence start must also protect "teh". */
             if (g_undo.original[0] >= L'A' && g_undo.original[0] <= L'Z' &&
                 wcslen(g_undo.original) <= KS_MAX_WORD) {
@@ -3803,6 +3912,18 @@ static void remember_prev_word(HWND foreground, const KS_TOKEN *tokens, int coun
 
 /* A dictionary word of the slot's language: the spelling lexicon for
    English and Persian (as before), the pack's dictionary otherwise. */
+/* A word of the dictionaries themselves, whatever the writing memory says. */
+static int slot_dictionary_word(KS_SLOT slot, const wchar_t *word) {
+    const KS_SPELL_LEXICON *lexicon = slot_is(slot, KS_LANG_PERSIAN) ? &g_persian_spelling
+                                    : slot_is(slot, KS_LANG_ENGLISH) ? &g_english_spelling : NULL;
+    if (lexicon)
+        return ks_rank_lookup(lexicon->ranks, word) >= 0 ||
+               ks_text_known(word, lexicon->language, lexicon->words, NULL) ||
+               ks_text_known(word, lexicon->language, lexicon->forms, NULL);
+    if (slot != KS_SLOT_A && slot != KS_SLOT_B) return 0;
+    return ks_text_known_in(g_lexicons.profile[slot], word, g_lexicons.words[slot], g_lexicons.common[slot]);
+}
+
 static int slot_word_known(KS_SLOT slot, const wchar_t *word) {
     if (slot_is(slot, KS_LANG_PERSIAN)) return ks_spell_known(word, &g_persian_spelling);
     if (slot_is(slot, KS_LANG_ENGLISH)) return ks_spell_known(word, &g_english_spelling);
@@ -3858,6 +3979,14 @@ static int memory_learn_or_repair(HWND foreground, UINT boundary_key, int zwnj, 
             (slot_word_known(g_word_language, key) ||
              ks_memory_word_count(&g_memory, key) >= KS_MEMORY_KNOWN_COUNT)) {
             int seen = ks_memory_observe_fix(&g_memory, peak, key);
+            /* A word the user repairs by hand was a typo: it is no longer one
+               of their words (unless the dictionary has it, then/than, or
+               they have written it eight times or more: two words of
+               their own one edit apart, and they changed one into the
+               other). */
+            if (!slot_dictionary_word(g_word_language, peak) &&
+                ks_memory_word_count(&g_memory, peak) < KS_MEMORY_OWN_WORD_COUNT)
+                ks_memory_forget_word(&g_memory, peak);
             if (seen == KS_MEMORY_FIX_COUNT)
                 set_activity_pair(L"Learned your repair", peak, key);
         }
@@ -4139,6 +4268,18 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     }
 
     g_undo.valid = 0;
+    /* The key after an undo decides about the restored word (see
+       keep_word_soon): deleting on drops it, anything else keeps it. */
+    if (g_pending_keep[0] && !g_pending_keep_ready && !is_modifier(data->vkCode)) {
+        /* A shortcut (Ctrl+Z puts the correction back in most editors) is
+           not typing on either. */
+        /* (AltGr is Ctrl+Alt and types characters: that is typing on.) */
+        if (data->vkCode == VK_BACK || data->vkCode == VK_DELETE || g_windows_down ||
+            g_control_down != g_alt_down)
+            g_pending_keep[0] = 0;
+        else
+            keep_word_soon();
+    }
     if (!g_settings.enabled || shortcut_modifier_down()) {
         clear_word();
         clear_history();
@@ -4619,7 +4760,11 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
              *    standard form is می‌پرسیدند; only the joiner is restored;
              *  - English, "known" only through the raw corpus tier (alot,
              *    thankyou): the layout logic rightly trusts that tier, the
-             *    spelling lexicon deliberately does not.
+             *    spelling lexicon deliberately does not;
+             *  - English known only weakly (a rare dictionary form, a word
+             *    the writing memory has seen a few times): it may be a slip
+             *    for a very frequent word (4.1; Persian reaches that check
+             *    through the case above).
              */
             if (!target_known) {
                 if (!active_known) consult_spelling = 1;
@@ -4628,7 +4773,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
                          g_word_count >= 3) {
                     wchar_t typed[KS_MAX_WORD + 1];
                     tokens_to_language(g_word, g_word_count, g_word_language, typed);
-                    if (!ks_spell_known(typed, &g_english_spelling)) consult_spelling = 1;
+                    if (!ks_spell_known(typed, &g_english_spelling) ||
+                        ks_spell_weakly_known(typed, &g_english_spelling)) consult_spelling = 1;
                 }
             }
             if (consult_spelling) {
@@ -5253,6 +5399,9 @@ static void show_tray_menu(int x, int y) {
                     IDM_LEARN_WRITING, L"Learn my writing");
         AppendMenuW(memory_menu, MF_STRING, IDM_OPEN_MEMORY, L"Open writing memory…");
         AppendMenuW(memory_menu, MF_STRING, IDM_FORGET_MEMORY, L"Forget everything learned…");
+        AppendMenuW(memory_menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(memory_menu, MF_STRING | (g_settings.personal_dictionary ? 0 : MF_GRAYED),
+                    IDM_OPEN_MY_WORDS, L"Open my kept words…");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)memory_menu, L"Writing memory");
     }
     if (g_last_typed_process[0]) {
@@ -5865,7 +6014,11 @@ static void read_controls_to_settings(void) {
     g_settings.personal_dictionary =
         SendMessageW(g_personal_dictionary, BM_GETCHECK, 0, 0) == BST_CHECKED;
     if (g_settings.personal_dictionary && !personal_before) load_personal_dictionary();
-    if (!g_settings.personal_dictionary) ks_vocab_reset(&g_personal_vocabulary);
+    if (!g_settings.personal_dictionary) {
+        ks_vocab_reset(&g_personal_vocabulary);
+        g_pending_keep[0] = 0;
+        g_pending_keep_ready = 0;
+    }
     g_settings.start_with_windows = SendMessageW(g_startup, BM_GETCHECK, 0, 0) == BST_CHECKED;
     selection = SendMessageW(g_digits, CB_GETCURSEL, 0, 0);
     if (selection >= KS_DIGITS_OFF && selection <= KS_DIGITS_LATIN) g_settings.digits = (int)selection;
@@ -6179,7 +6332,7 @@ static void create_ui(HWND window) {
     hint(window, 0, UI_CONTROL_LEFT, UI_ROW(5) - 4, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 64,
          L"Program file names separated by commas, for example KeePass.exe; the tray menu can "
          L"exclude the app you last typed in. One Backspace right after a correction restores "
-         L"what you typed.", 0);
+         L"what you typed (Remember undone words keeps it).", 0);
 
     /* Page 1: Typing. */
     row_label(window, 1, 0, L"&Digits");
@@ -6995,6 +7148,9 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 case IDM_OPEN_MEMORY:
                     open_memory_file();
                     return 0;
+                case IDM_OPEN_MY_WORDS:
+                    open_my_words();
+                    return 0;
                 case IDC_FORGET_MEMORY:
                 case IDM_FORGET_MEMORY:
                 {
@@ -7153,6 +7309,8 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             }
             if (wparam == ID_TIMER_SNIPPETS) {
                 if (g_settings.snippets) snippets_reload(0);
+                if (g_pending_keep[0] && GetTickCount() - g_pending_keep_at > 10000u) keep_word_soon();
+                personal_dictionary_poll();
                 /* Hand edits of the file are picked up within two seconds;
                    learned words reach the disk at most once a minute. */
                 if (g_memory_active && memory_file_edited()) memory_save();
@@ -7164,6 +7322,9 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             break;
         case WM_APP_DIAGNOSTIC:
             if (IsWindowVisible(window)) update_diagnostics_ui();
+            return 0;
+        case WM_APP_KEEP_WORD:
+            save_kept_word();
             return 0;
         case WM_APP_FOCUS_QUERY:
             g_focus_query_posted = 0;
@@ -7405,17 +7566,21 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
      */
     g_spelling_available =
         load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
-        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table);
+        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
+        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
+        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
     memset(&g_english_spelling, 0, sizeof(g_english_spelling));
     g_english_spelling.language = KS_LANG_ENGLISH;
     g_english_spelling.ranks = &g_english_rank_table;
     g_english_spelling.words = &g_english_bloom;
     g_english_spelling.common = &g_english_common_bloom;
+    g_english_spelling.forms = &g_english_forms_bloom;
     memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
     g_persian_spelling.language = KS_LANG_PERSIAN;
     g_persian_spelling.ranks = &g_persian_rank_table;
     g_persian_spelling.words = &g_persian_bloom;
     g_persian_spelling.common = &g_persian_common_bloom;
+    g_persian_spelling.forms = &g_persian_forms_bloom;
     g_english_spelling.vocabulary = &g_session_vocabulary;
     g_persian_spelling.vocabulary = &g_session_vocabulary;
     g_english_spelling.personal = &g_personal_vocabulary;

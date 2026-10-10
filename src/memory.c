@@ -137,6 +137,15 @@ void ks_memory_unobserve_word(KS_WRITING_MEMORY *memory, const wchar_t *word) {
     memory->dirty = 1;
 }
 
+void ks_memory_forget_word(KS_WRITING_MEMORY *memory, const wchar_t *word) {
+    int index;
+    if (!memory || !word || !*word) return;
+    index = find_word(memory, word, NULL);
+    if (index < 0 || memory->words[index].count == 0) return;
+    memory->words[index].count = 0;
+    memory->dirty = 1;
+}
+
 int ks_memory_rank_adjust(const KS_WRITING_MEMORY *memory, const wchar_t *word, int table_rank) {
     unsigned count;
     unsigned scaled;

@@ -40,6 +40,17 @@ jobs:
           python3 tools/generate_domain_words.py
           git diff --exit-code -- src/domain_words.inc
 
+      - name: Word-form Blooms reproduce from the pinned dictionaries
+        run: |
+          set -euo pipefail
+          npm install --silent --cache "$RUNNER_TEMP/npm-cache" --prefix "$RUNNER_TEMP/dictionaries" \
+            dictionary-en@4.0.0 dictionary-fa@2.0.0
+          mkdir -p "$RUNNER_TEMP/forms"
+          python3 tools/generate_form_blooms.py \
+            --dictionary-root "$RUNNER_TEMP/dictionaries/node_modules" --output-dir "$RUNNER_TEMP/forms"
+          cmp "$RUNNER_TEMP/forms/en-forms.bloom" resources/en-forms.bloom
+          cmp "$RUNNER_TEMP/forms/fa-forms.bloom" resources/fa-forms.bloom
+
       - name: Install Zig cross-compiler
         run: >-
           npm install

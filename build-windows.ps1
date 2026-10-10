@@ -60,11 +60,21 @@ $env:ZIG_LOCAL_CACHE_DIR  = "$env:TEMP\keyswitchfix-zig-local"
 New-Item -ItemType Directory -Force -Path dist | Out-Null
 
 # --- spelling rank tables (wordfreq) ---------------------------------------
-if (-not (Test-Path resources\en-rank.bin) -or -not (Test-Path resources\fa-rank.bin)) {
+# Rebuilt when missing, or older than an input (the generator, the Blooms).
+$rankStale = -not (Test-Path resources\en-rank.bin) -or -not (Test-Path resources\fa-rank.bin)
+if (-not $rankStale) {
+    $oldest = @((Get-Item resources\en-rank.bin).LastWriteTimeUtc, (Get-Item resources\fa-rank.bin).LastWriteTimeUtc) |
+        Sort-Object | Select-Object -First 1
+    foreach ($rankInput in @("tools\generate_rank_tables.py", "resources\en-forms.bloom", "resources\fa-forms.bloom",
+                         "resources\en.bloom", "resources\fa.bloom")) {
+        if ((Get-Item $rankInput).LastWriteTimeUtc -gt $oldest) { $rankStale = $true }
+    }
+}
+if ($rankStale) {
     Step "Installing wordfreq 3.1.1 (only needed once) and generating rank tables"
     & $python -m pip install --quiet wordfreq==3.1.1
     if ($LASTEXITCODE -ne 0) { Fail "pip install wordfreq==3.1.1" }
-    Run $python @("tools\generate_rank_tables.py", "--if-missing")
+    Run $python @("tools\generate_rank_tables.py")
 }
 
 Step "Metadata verification"
@@ -93,6 +103,8 @@ if (-not $SkipTests) {
     Step "Spelling tests"
     Run $Zig ($common + @("src\core.c", "src\spell.c", "tests\spell_tests.c", "-o", "dist\spell_tests.exe"))
     Run "dist\spell_tests.exe" @()
+    Run $Zig ($common + @("src\core.c", "src\spell.c", "tests\spell_real_tests.c", "-o", "dist\spell_real_tests.exe"))
+    Run "dist\spell_real_tests.exe" @()
     Step "Typing helper tests"
     Run $Zig ($common + @("src\core.c", "src\typing.c", "tests\typing_tests.c", "-o", "dist\typing_tests.exe"))
     Run "dist\typing_tests.exe" @()

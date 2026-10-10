@@ -17,8 +17,19 @@ mkdir -p dist "$TMP"
 # Spelling correction needs the wordfreq-derived rank tables. They are not
 # committed (they are a build product of wordfreq 3.1.1); generate them when
 # absent. `pip install wordfreq==3.1.1` is required for that step.
+# They are also rebuilt when an input changed since (the generator or the
+# word-form Blooms), so an old table is never embedded by mistake.
 if [ ! -f resources/en-rank.bin ] || [ ! -f resources/fa-rank.bin ]; then
   python3 tools/generate_rank_tables.py --if-missing
+else
+  for input in tools/generate_rank_tables.py resources/en-forms.bloom resources/fa-forms.bloom \
+               resources/en.bloom resources/fa.bloom; do
+    if [ "$input" -nt resources/en-rank.bin ] || [ "$input" -nt resources/fa-rank.bin ]; then
+      echo "Rank tables are older than $input: regenerating them."
+      python3 tools/generate_rank_tables.py
+      break
+    fi
+  done
 fi
 
 python3 tools/generate_domain_words.py
@@ -74,6 +85,8 @@ run_suite() {
 
 run_suite core src/core.c tests/core_tests.c
 run_suite spell src/core.c src/spell.c tests/spell_tests.c
+# The real tables: reported words, colloquial Persian, and the evaluation set.
+run_suite spell-real src/core.c src/spell.c tests/spell_real_tests.c
 run_suite typing src/core.c src/typing.c tests/typing_tests.c
 run_suite memory src/core.c src/spell.c src/domain.c src/memory.c tests/memory_tests.c
 run_suite corpus src/core.c src/domain.c tests/corpus_tests.c

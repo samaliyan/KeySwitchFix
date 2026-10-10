@@ -64,6 +64,11 @@ layout switch in Store/UWP applications and in applications that ignore or
 delay the switch (`staدیشقی` → `standard`). See
 [Typing helpers](docs/TYPING_HELPERS.md).
 
+Version 4.1 rebuilds spelling correction and measures it: two slips in a word
+(`یغتی` → `یعنی`), a rare word one key from a frequent one (`خرفه` → `حرفه`),
+every inflected dictionary form and colloquial Persian left alone (`نمیدونه`,
+`خونت`), and one Backspace, then typing on, keeps your own spelling for good.
+
 Version 2.9 adds offline spelling correction for both languages: `نسحه` →
 `نسخه`, `teh` → `the`. A noisy-channel model scores every candidate within
 one edit by corpus frequency and by how people actually mistype (transposed
@@ -89,7 +94,8 @@ inferred from the available keys or context alone.
 - Any two languages: English and Persian built in, 14 more as language packs (Arabic, Bulgarian, Dutch, French, German, Greek, Hebrew, Italian, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian), and a tool to build packs for others
 - Offline spelling correction for Persian and English with Off / Conservative / Balanced / Aggressive levels
 - Half-space (`می‌پرسیدند`) and missing-space (`in the`, `در خانه`) repair
-- Learns your own vocabulary: a word typed twice is never "corrected"; an optional personal dictionary keeps undone words across restarts
+- Measured spelling: 4,000 generated typos per language and 5,300 valid words are checked at every build (Balanced: Persian 64 % fixed, English 82 %)
+- Learns your own vocabulary: undo a fix with Backspace and keep typing, and the word is yours across restarts; a word you repair by hand is unlearned as a typo
 - Effective union of 159,852 offline English and Persian spellings
 - 20,000 common and 2,000 frequent entries per language from wordfreq 3.1.1
 - Works across desktop applications using physical scan-code mapping

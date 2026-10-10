@@ -182,6 +182,22 @@ int main(void) {
     ks_memory_unobserve_word(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634");
     CHECK(ks_memory_word_count(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634") == 2, "unobserve takes one back");
     ks_memory_observe_word(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634");
+    /* A word repaired by hand is forgotten whatever its count (4.1). */
+    {
+        int i;
+        for (i = 0; i < 9; ++i) ks_memory_observe_word(&g_memory, L"tpyo");
+        CHECK(ks_memory_word_count(&g_memory, L"tpyo") == 9 &&
+                  ks_memory_rank_adjust(&g_memory, L"tpyo", -1) > 34, "a word typed nine times is strongly known");
+        g_memory.dirty = 0;
+        ks_memory_forget_word(&g_memory, L"tpyo");
+        CHECK(ks_memory_word_count(&g_memory, L"tpyo") == 0 && ks_memory_rank_adjust(&g_memory, L"tpyo", -1) == -1 &&
+                  g_memory.dirty, "forget drops the word and marks the memory for saving");
+        ks_memory_forget_word(&g_memory, L"never-seen");
+        ks_memory_forget_word(&g_memory, NULL);
+        ks_memory_forget_word(NULL, L"tpyo");
+        CHECK(ks_memory_word_count(&g_memory, L"\x0633\x06CC\x0627\x0648\x0634") == 3,
+              "forgetting an unknown word (or nothing) touches nothing else");
+    }
     /* Eviction is by count, then recency: not by alphabet. */
     {
         static KS_WRITING_MEMORY fair;

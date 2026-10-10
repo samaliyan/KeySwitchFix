@@ -55,11 +55,13 @@ KeySwitchFix is a single-process native Win32 application plus a per-user Setup/
     core strips Arabic combining marks before every dictionary lookup, so
     `حتماً` and `مدرّس` stay Persian-known while the exact keys the user
     typed are preserved for the replacement text.
-13. If the layout logic declines and the word is unknown in both layouts, the
-    spelling module scores every edit-distance-one candidate from the KSRT
-    frequency table with a noisy-channel model and, above a per-level margin,
-    replaces the word. See [Spelling](SPELLING.md). Undoing it adds the typed
-    spelling to an in-memory ignore list.
+13. If the layout logic declines (the other-layout reading is no word), the
+    spelling module scores the candidates one slip away — two slips when
+    none convinces, and a very frequent word one strong slip from a rare
+    one — from the KSRT frequency table with a noisy-channel model and,
+    above a per-level margin, replaces the word. See [Spelling](SPELLING.md).
+    Undoing it adds the typed spelling to an in-memory ignore list, and to the
+    personal dictionary once the user types on.
 14. Late or ignored layout switches. Some applications honour the switch
     only after the next keys were translated (a busy browser or Electron
     app), and some never honour it (they never route the message to
@@ -173,9 +175,12 @@ sentences through the hook of both versions in the simulation
 | `resources/*.bloom` | compact offline base, common-word, and proper-prefix membership resources |
 | `tools/generate_blooms.py` | reproducible dictionary normalization and Bloom-resource generation |
 | `tools/generate_rank_tables.py` | wordfreq-derived KSRT frequency tables for spelling correction |
+| `tools/generate_form_blooms.py` | Hunspell affix expansion into the word-form Blooms (`en-forms.bloom`, `fa-forms.bloom`) |
+| `tools/make_spell_eval.py` | the fixed spelling evaluation set `tests/fixtures/spell-eval.tsv` |
 | `tools/build_language_pack.py` | language packs (`.kslang`) from wordfreq or a word list, and Setup's bundle |
 | `tests/core_tests.c` | native positive and negative detection tests |
 | `tests/spell_tests.c` | spelling decisions against fixture rank tables built by the generator |
+| `tests/spell_real_tests.c` | spelling with the shipped tables: reported words, colloquial Persian, the evaluation set's quality limits, speed |
 | `tests/language_pack_tests.c` | pack parsing (truncation and corruption fuzzing) and Russian/German decisions |
 | `tests/verify_language_rules.py` | the pack builder and the C core normalise words identically |
 | `tests/app_sim.c`, `tests/installer_sim.c` | the hook and Setup run on Linux against `tests/win32sim` with simulated keyboards and files |

@@ -5,7 +5,7 @@
  * Offline spelling correction for Persian and English.
  *
  * Model: a noisy channel. Every candidate within Damerau-Levenshtein distance
- * one of the typed word is scored as
+ * one of the typed word (two, for keyboard-plausible slips) is scored as
  *
  *     score = 10 * zipf(candidate) + error_model(typed -> candidate)
  *
@@ -15,8 +15,15 @@
  * physical keyboard, a doubled or dropped repeated letter, and the Persian
  * homophone confusions (ح/ه, ت/ط, س/ص/ث, ز/ذ/ض/ظ, ق/غ, ا/آ/ع). The best
  * candidate must clear a frequency floor and beat the runner-up by a margin
- * that depends on the chosen level. Everything runs in microseconds inside
- * the keyboard hook: a few hundred hash probes, no allocation.
+ * that depends on the chosen level.
+ *
+ * When no single repair is convincing, two slips are tried: each one a
+ * neighbouring key, a homophone, swapped or doubled letters, or a missing
+ * letter (یغتی -> یعنی). A rare dictionary word one keyboard slip away from
+ * a very frequent one is treated as that slip (خرفه -> حرفه), unless the
+ * user has kept it. Everything runs inside the keyboard hook without
+ * allocation: microseconds for a word one slip explains, up to about 5 ms
+ * (some 40,000 hash probes) for a 12-letter word nothing explains.
  */
 
 #include "core.h"
@@ -70,6 +77,9 @@ typedef struct KS_SPELL_LEXICON {
     const KS_RANK_TABLE *ranks;
     const KS_BLOOM *words;
     const KS_BLOOM *common;
+    /* Optional: every inflected form the dictionary's affix rules allow
+       (hordes, certifies, مخالفم): valid words that are not stems. */
+    const KS_BLOOM *forms;
     const KS_VOCAB *vocabulary;   /* optional: words seen this session */
     const KS_VOCAB *personal;     /* optional: the user's saved dictionary */
     /*
@@ -96,6 +106,8 @@ typedef struct KS_SPELL_RESULT {
     int confidence;          /* winning margin, capped at 100 */
     int candidate_count;     /* distinct real-word candidates examined */
     int best_rank;           /* zipf * 10 of the winner */
+    int edits;               /* 1 or 2 slips repaired */
+    int real_word;           /* the typed word was a (rare) word itself */
     KS_SPELL_KIND kind;
     wchar_t original[KS_MAX_WORD + 1];
     wchar_t replacement[KS_MAX_WORD + 2];
@@ -120,6 +132,11 @@ int ks_persian_confusable(wchar_t first, wchar_t second);
 
 /* 1 when the exact typed text is an accepted word for the language. */
 int ks_spell_known(const wchar_t *word, const KS_SPELL_LEXICON *lexicon);
+/* 1 when the word is accepted only weakly: a rare dictionary form, or a word
+   the writing memory has seen a few times. Such a word yields to a very
+   frequent word one keyboard slip away; a word in the frequency table, a
+   vocabulary-pack term, or a word the user kept never does. */
+int ks_spell_weakly_known(const wchar_t *word, const KS_SPELL_LEXICON *lexicon);
 
 int ks_spell_correct(const wchar_t *word, int level,
                      const KS_SPELL_LEXICON *lexicon,

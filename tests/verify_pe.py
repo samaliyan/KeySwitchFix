@@ -90,7 +90,7 @@ def main():
         201: "en.bloom", 202: "fa.bloom", 203: "en-prefix.bloom", 204: "fa-prefix.bloom",
         205: "en-common.bloom", 206: "fa-common.bloom", 207: "en-frequent.bloom",
         208: "fa-frequent.bloom", 209: "en-common-prefix.bloom", 210: "fa-common-prefix.bloom",
-        211: "en-rank.bin", 212: "fa-rank.bin",
+        211: "en-rank.bin", 212: "fa-rank.bin", 213: "en-forms.bloom", 214: "fa-forms.bloom",
     }
     for resource_id, name in embedded.items():
         check(digest(app.resource(10, resource_id)) == digest((ROOT / "resources" / name).read_bytes()),

@@ -30,6 +30,9 @@ extern "C" {
 #define KS_MEMORY_SLOTS 8192          /* hash slots, power of two */
 #define KS_MEMORY_FIXES 512
 #define KS_MEMORY_KNOWN_COUNT 3       /* a word typed this often is known */
+/* ...and from this many uses it is the user's own: spelling never touches
+   it, and one hand edit does not make the memory forget it. */
+#define KS_MEMORY_OWN_WORD_COUNT 8
 #define KS_MEMORY_FIX_COUNT 2         /* repairs needed before auto-applying */
 #define KS_MEMORY_FIX_COUNT_KNOWN 3   /* ... when the typo is a real word */
 
@@ -63,6 +66,9 @@ unsigned ks_memory_word_count(const KS_WRITING_MEMORY *memory, const wchar_t *wo
 void ks_memory_observe_word(KS_WRITING_MEMORY *memory, const wchar_t *word);
 /* Takes one use back (the word was undone or reopened for editing). */
 void ks_memory_unobserve_word(KS_WRITING_MEMORY *memory, const wchar_t *word);
+/* The user repaired this word by hand: it was a typo, not one of their
+   words. Its count drops to zero (it is no longer "known"). */
+void ks_memory_forget_word(KS_WRITING_MEMORY *memory, const wchar_t *word);
 /*
  * Spelling rank for a word given its dictionary rank (-1 = not in the
  * dictionary): a word the user types often ranks by how often (from

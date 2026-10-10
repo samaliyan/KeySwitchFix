@@ -11,15 +11,23 @@ decides what counts as a "real word"; being too strict rewrites valid words,
 being too loose keeps typos. A frequent word is accepted when any of these
 holds, in order:
 
-1. it is in the base dictionary Bloom (or the short-word lists); a token that
-   is two everyday words run together (alot, thankyou, درخانه) is rejected
-   before any other rule so that the split repair can fire;
+1. it is in the base dictionary Bloom, the word-form Bloom (every inflection
+   the Hunspell affix rules allow: hordes, certifies, مخالفم, اسیران) or the
+   short-word lists; a token that is two everyday words run together (alot,
+   thankyou, درخانه) is rejected before any other rule so that the split
+   repair can fire;
 2. it is common enough (zipf >= 4.0) to be everyday vocabulary even when a
    formal dictionary omits it (thx, lol, pls, میخوام, چطوری);
 3. no already-accepted word within edit distance one is at least 1.0 zipf
    (10x) more frequent. A rare token that sits next to a very frequent word
    (teh/the, recieve/receive) is a misspelling in the corpus and must stay
-   out; a rare token with no dominant neighbour is simply a rare word;
+   out; a rare token with no dominant neighbour is simply a rare word.
+   Persian counts only a *spelling-type* neighbour as dominant: a letter
+   of the same sound or shape (برگذار/برگزار, خوشکل/خوشگل), a missing madda
+   (اتش/آتش) or a vowel letter or hamza dropped inside the word
+   (تلوزیون/تلویزیون). Colloquial Persian differs from the written form by
+   its endings (نمیدونه/نمیدونم, خونت/خونه, قدیما/قدیمی, شدین/شدن), and
+   those are words, not typos;
 4. it is dominated only by its own stem(s): the Hunspell resources store
    stems, so kayaks, hiked, spreadsheets, گوشیش, کتابهایم are recovered by
    stripping up to two common suffixes — while runing (dominated by running)
@@ -161,12 +169,39 @@ def distance_one_neighbours(word: str, alphabet: str):
             yield word[:i] + letter + word[i:]
 
 
-def dominant_neighbours(word: str, zipf: float, accepted: dict, alphabet: str) -> set:
+# Letters Persian writers confuse by sound or shape. A corpus token one such
+# letter away from a far more frequent word is a misspelling.
+PERSIAN_SPELLING_SETS = ("حه", "تط", "سصث", "زذضظ", "قغ", "اآعءأإ", "یئ", "وؤ", "کگ")
+PERSIAN_INNER_VOWELS = set("اآیوهءئ")
+
+
+def persian_spelling_variant(word: str, other: str) -> bool:
+    """other differs from word the way a misspelling does: one letter of the
+    same sound or shape, or a vowel letter or hamza added or dropped at
+    least three letters before the end (the endings are grammar)."""
+    if len(word) == len(other):
+        differ = [i for i in range(len(word)) if word[i] != other[i]]
+        return len(differ) == 1 and any(
+            word[differ[0]] in group and other[differ[0]] in group
+            for group in PERSIAN_SPELLING_SETS)
+    shorter, longer = (word, other) if len(word) < len(other) else (other, word)
+    if len(longer) - len(shorter) != 1:
+        return False
+    for i in range(len(longer)):
+        if longer[:i] + longer[i + 1:] == shorter:
+            return 0 < i < len(longer) - 3 and longer[i] in PERSIAN_INNER_VOWELS
+    return False
+
+
+def dominant_neighbours(word: str, zipf: float, accepted: dict, alphabet: str,
+                        language: str = "en") -> set:
     """Accepted words within one edit that are far more frequent than word."""
     found = set()
     for neighbour in distance_one_neighbours(word, alphabet):
         other = accepted.get(neighbour)
         if other is not None and other - zipf >= DOMINANT_NEIGHBOUR_GAP:
+            if language == "fa" and not persian_spelling_variant(word, neighbour):
+                continue
             found.add(neighbour)
     return found
 
@@ -174,7 +209,16 @@ def dominant_neighbours(word: str, zipf: float, accepted: dict, alphabet: str) -
 JOINED_PAIR_GAP = 2.5
 
 
-def joined_pair(word: str, zipf: float, accepted: dict) -> bool:
+# Colloquial Persian endings: زندگیتو is زندگی + تو (your life, object), not
+# "زندگی تو"; بازیا is بازی + ا (games). A token ending in one of these is a
+# word, not two words run together.
+PERSIAN_COLLOQUIAL_ENDINGS = (
+    "و", "ا", "ه", "م", "ت", "ش", "ی", "ن", "تو", "شو", "مو", "رو",
+    "ین", "ید", "یم", "مون", "تون", "شون", "ام", "ات", "اش", "ای", "هام", "هات", "هاش",
+)
+
+
+def joined_pair(word: str, zipf: float, accepted: dict, language: str = "en") -> bool:
     """alot, ofthe, thankyou, درخانه: two everyday words missing their space.
 
     Closed compounds (backend, signup, hotspot) are routinely 1.5-2.5 zipf
@@ -185,8 +229,16 @@ def joined_pair(word: str, zipf: float, accepted: dict) -> bool:
     """
     if zipf >= CASUAL_ZIPF_FLOOR:
         return False
+    # A known word plus a colloquial ending is one word, wherever a split
+    # into two other words might fall (بازیا is بازی + ا, not باز + یا).
+    if language == "fa" and any(
+            word.endswith(ending) and len(word) - len(ending) >= 2 and word[: -len(ending)] in accepted
+            for ending in PERSIAN_COLLOQUIAL_ENDINGS):
+        return False
     for split in range(1, len(word) - 1):
         left, right = word[:split], word[split:]
+        if language == "fa" and right in PERSIAN_COLLOQUIAL_ENDINGS:
+            continue
         left_floor = 6.0 if split == 1 else CASUAL_ZIPF_FLOOR
         left_zipf = accepted.get(left, 0.0)
         right_zipf = accepted.get(right, 0.0)
@@ -201,11 +253,11 @@ def accept_word(word: str, zipf: float, language: str, known, accepted: dict, al
         return True
     # Corpus tokens that are really two words (alot, thankyou) are frequent
     # but must not become "words", or the split repair could never fire.
-    if joined_pair(word, zipf, accepted):
+    if joined_pair(word, zipf, accepted, language):
         return False
     if zipf >= CASUAL_ZIPF_FLOOR:
         return True
-    dominators = dominant_neighbours(word, zipf, accepted, alphabet)
+    dominators = dominant_neighbours(word, zipf, accepted, alphabet, language)
     if not dominators:
         return True
     # An inflection is rescued only when everything that dominates it is its
@@ -232,6 +284,7 @@ def real_entries(language: str):
     blooms.validate_wordfreq()
     resources = ROOT / "resources"
     base = (resources / f"{language}.bloom").read_bytes()
+    forms = (resources / f"{language}-forms.bloom").read_bytes()
     english_pattern = re.compile(r"[a-z]+")
     short_words = (
         blooms.SHORT_ENGLISH_WORDS if language == "en" else blooms.SHORT_PERSIAN_WORDS
@@ -246,7 +299,8 @@ def real_entries(language: str):
     def known(candidate: str) -> bool:
         # The curated dictionary only. The common Bloom is raw corpus
         # frequency and contains joined typos (alot, thankyou).
-        return candidate in short_words or bloom_contains(base, candidate)
+        return (candidate in short_words or bloom_contains(base, candidate)
+                or bloom_contains(forms, candidate))
 
     # Pass 1: well-formed tokens with their frequency, most frequent first.
     shaped = []

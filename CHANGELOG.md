@@ -2,6 +2,57 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [4.1.0] - 2026-10-10
+
+Spelling correction rebuilt and measured: more typos fixed, fewer wrong
+guesses, valid and colloquial words left alone, and a clear way to keep a
+spelling of your own. See [Spelling](docs/SPELLING.md).
+
+### Spelling
+
+- **Valid words are no longer "corrected".** The Hunspell dictionaries keep
+  inflections as rules; every form they allow is now known (121,202 English,
+  1,247,798 Persian forms: `hordes`, `certifies`, `مخالفم`, `اسیران`). The
+  frequency table no longer treats colloquial Persian endings as typos:
+  `نمیدونه`, `خونت`, `قدیما`, `شدین`, `نیار`, `پیشش` stay as written (4.0 could
+  change some of them into a word of another meaning, `نمیدونه` → `نمیدونم`).
+  Only a spelling-type neighbour (a letter of the same sound or shape, a
+  missing madda, a vowel letter dropped inside the word) marks a corpus word
+  as a misspelling (`برگذار`, `تلوزیون`, `خوشکل`).
+- **Two slips in one word** are repaired at Balanced and Aggressive:
+  `یغتی` → `یعنی`.
+- **A rare word one key from a very frequent one** is repaired:
+  `خرفه` → `حرفه`, `هشتیم` → `هستیم`, `خروشید` → `خورشید`. A word in the
+  frequency table, a vocabulary-pack term and a word you kept are never
+  touched this way.
+- An extra neighbouring key before the first or after the last letter is
+  removed (`طرفل` → `طرف`); `ک`/`گ` count as a spelling confusion
+  (`خوشکل` → `خوشگل`); a missing vowel letter is likelier than another.
+- The half-space helper no longer splits a dictionary form at a possessive
+  ending (`کتابهایشان` is not `کتابهای‌شان`).
+- Measured on 4,000 generated typos per language that the tuning never saw
+  (Balanced): Persian 64 % fixed (4.0: 54 %), 5.3 % wrong (6.5 %), valid
+  corpus words changed 0.4 % (2.9 %); English 82 % fixed (61 %), 2.9 % wrong
+  (3.9 %). `tests/spell_real_tests.c` checks these limits at every build.
+  The slowest word takes about 3 ms (the hook's budget is 150 ms).
+
+### Keeping your own spelling
+
+- **One Backspace right after a fix, then keep typing**: the word is saved as
+  yours (**Remember undone words**, now on by default for new settings). If
+  you keep deleting instead, nothing is saved.
+- **Writing memory → Open my kept words…** in the tray menu opens the list;
+  delete a line to make that word correctable again.
+- With the writing memory on, repairing a word by hand makes the memory
+  forget that typo as one of your words; a word seen three to seven times no
+  longer blocks a confident fix.
+
+### Build
+
+- `tools/generate_form_blooms.py` builds the word-form Blooms
+  (`resources/en-forms.bloom`, `fa-forms.bloom`, committed);
+  `tools/make_spell_eval.py` builds the fixed evaluation set.
+
 ## [4.0.1] - 2026-10-02
 
 ### Changed

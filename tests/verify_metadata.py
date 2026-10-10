@@ -62,6 +62,8 @@ def main() -> None:
         "resources/fa-frequent.bloom": (1 << 17, 10),
         "resources/en-common-prefix.bloom": (1 << 20, 14),
         "resources/fa-common-prefix.bloom": (1 << 20, 14),
+        "resources/en-forms.bloom": (1 << 21, 9),
+        "resources/fa-forms.bloom": (1 << 24, 9),
     }
     for path, (expected_bits, expected_hashes) in bloom_shapes.items():
         data = (ROOT / path).read_bytes()

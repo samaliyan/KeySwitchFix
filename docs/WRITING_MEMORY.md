@@ -21,6 +21,10 @@ third time, and it is applied only while you repair that word more often than
 you leave it as it is. One Backspace right after an automatic repair restores
 what you typed and makes the memory unlearn that repair.
 
+A word you repair by hand was a typo, not one of your words: since 4.1 the
+memory forgets it as a known word at once, however often it slipped through
+before (a dictionary word such as `then` is kept, since you may also mean it).
+
 Only real repairs are learned: the result must be a real word (or a word you
 type often), the two spellings must be at most two letters apart (one for
 words of four letters or fewer), and an unfinished word (`عزی` → `عزیزم`), a
@@ -28,10 +32,14 @@ dropped ending (`کتابها` → `کتاب`) or a different word are not repai
 
 **Your words.** Every word you finish with Space is counted. A word you have
 typed three times — a name, a brand, jargon, your own spelling — becomes a
-known word: it is never "corrected", it is repaired to when you mistype it
+known word: it is repaired to when you mistype it
 (`سیاوس` → `سیاوش`), and it counts for layout repair (typed on the wrong
-layout, it is switched). Dictionary words you use often rank higher, so an
-ambiguous typo resolves toward the word you actually write.
+layout, it is switched). From eight uses it is never "corrected"; with three
+to seven, only a confident fix to a very frequent word one slip away can
+still change it (4.1), so a typo that slipped through a few times does not
+become permanent — one Backspace keeps a word you meant. Dictionary words you
+use often rank higher, so an ambiguous typo resolves toward the word you
+actually write.
 
 Both work for every language pair (4.0): German or Russian repairs and words
 are learned the same way. A known word counts only for the language whose

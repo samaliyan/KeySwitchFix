@@ -13,10 +13,12 @@ IDR_EN_COMMON_PREFIX RCDATA "en-common-prefix.bloom"
 IDR_FA_COMMON_PREFIX RCDATA "fa-common-prefix.bloom"
 IDR_EN_RANK_TABLE RCDATA "en-rank.bin"
 IDR_FA_RANK_TABLE RCDATA "fa-rank.bin"
+IDR_EN_FORMS_BLOOM RCDATA "en-forms.bloom"
+IDR_FA_FORMS_BLOOM RCDATA "fa-forms.bloom"
 
 1 VERSIONINFO
-FILEVERSION 4,0,1,0
-PRODUCTVERSION 4,0,1,0
+FILEVERSION 4,1,0,0
+PRODUCTVERSION 4,1,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -29,12 +31,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "KeySwitchFix"
       VALUE "FileDescription", "Automatic keyboard layout repair for any two languages"
-      VALUE "FileVersion", "4.0.1"
+      VALUE "FileVersion", "4.1.0"
       VALUE "InternalName", "KeySwitchFix"
       VALUE "LegalCopyright", "Copyright (c) 2026"
       VALUE "OriginalFilename", "KeySwitchFix.exe"
       VALUE "ProductName", "KeySwitchFix"
-      VALUE "ProductVersion", "4.0.1"
+      VALUE "ProductVersion", "4.1.0"
     END
   END
   BLOCK "VarFileInfo"
