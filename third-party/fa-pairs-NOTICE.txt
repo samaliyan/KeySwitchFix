@@ -1,0 +1,16 @@
+resources/fa-pairs.bin (Persian word-pair statistics) is derived from
+Persian Wikipedia.
+
+Source text: the Persian Wikipedia dump of 2018-10-01 (fawiki-20181001),
+as plain text in https://github.com/Text-Mining/Persian-Wikipedia-Corpus
+(commit b3e157ce7fcc2f310dc5c23bf33a1883597714cb).
+
+Wikipedia text is (c) Wikipedia contributors and is available under the
+Creative Commons Attribution-ShareAlike 3.0 Unported License:
+https://creativecommons.org/licenses/by-sa/3.0/
+
+The file holds no text from Wikipedia: only hashes of word pairs and, for
+each, how much more often the two words appear next to each other than
+chance would predict. These derived statistics are distributed under the
+same license, CC BY-SA 3.0. They are rebuilt with tools/count_word_pairs.py
+and tools/generate_pair_table.py (see docs/SPELLING.md).

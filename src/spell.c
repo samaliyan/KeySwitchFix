@@ -298,6 +298,16 @@ static const wchar_t PERSIAN_ALPHABET[] =
 #ifndef KS_REAL_WORD_KEEP
 #define KS_REAL_WORD_KEEP 60
 #endif
+/* Context (4.2): a candidate gains this many tenths of the pair score with
+   the word before it and with the word after it. */
+#ifndef KS_CONTEXT_WEIGHT
+#define KS_CONTEXT_WEIGHT 10
+#endif
+/* ...at most this much in all. */
+#ifndef KS_CONTEXT_CAP
+#define KS_CONTEXT_CAP 40
+#endif
+
 /* The writing memory ranks a word it knows (seen three times) at 30 plus a
    lift of 2 per doubling of its count: 32 at three uses, 34 at four to
    seven, 36 from eight. Up to this rank (fewer than eight uses) it is weak. */
@@ -354,6 +364,9 @@ typedef struct KS_SEARCH {
     int slips;               /* slips in the candidate being scored (1 or 2) */
     int bonus_floor;         /* real-word search: only slips worth this much */
     const wchar_t *alphabet;
+    /* The words around the typed one (NULL: none). */
+    const wchar_t *before;
+    const wchar_t *after;
     /* Keyboard neighbours and homophones of each alphabet letter, found
        once per call. */
     wchar_t near[48][12];
@@ -368,11 +381,58 @@ int ks_spell_rank(const KS_SPELL_LEXICON *lexicon, const wchar_t *word) {
     return rank;
 }
 
+int ks_spell_pair_score(const KS_SPELL_LEXICON *lexicon, const wchar_t *first, const wchar_t *second) {
+    wchar_t key[2 * KS_MAX_WORD + 4];   /* two words of up to 33, a space, the end */
+    size_t a, b;
+    int score;
+    if (!lexicon || !first || !second) return 0;
+    a = wcslen(first);
+    b = wcslen(second);
+    if (!a || !b || a > KS_MAX_WORD + 1 || b > KS_MAX_WORD + 1) return 0;
+    score = 0;
+    if (lexicon->pairs && lexicon->pairs->valid) {
+        memcpy(key, first, a * sizeof(wchar_t));
+        key[a] = L' ';
+        memcpy(key + a + 1, second, (b + 1) * sizeof(wchar_t));
+        score = ks_rank_lookup(lexicon->pairs, key);
+        if (score < 0) score = 0;
+    }
+    if (lexicon->pair_adjust) score = lexicon->pair_adjust(lexicon->pair_adjust_context, first, second, score);
+    return score > 0 ? score : 0;
+}
+
+/* How well a candidate fits the words around it. A split candidate ("در
+   خانه") meets the word before with its first half, the word after with
+   its second. */
+static int context_bonus(const KS_SEARCH *search, const wchar_t *text, KS_SPELL_KIND kind) {
+    wchar_t left[KS_MAX_WORD + 2];
+    const wchar_t *right = text;
+    int total = 0;
+    if ((!search->lexicon->pairs && !search->lexicon->pair_adjust) || (!search->before && !search->after)) return 0;
+    if (kind == KS_SPELL_KIND_SPLIT) {
+        const wchar_t *space = wcschr(text, L' ');
+        size_t n = space ? (size_t)(space - text) : wcslen(text);
+        if (n > KS_MAX_WORD) return 0;
+        memcpy(left, text, n * sizeof(wchar_t));
+        left[n] = 0;
+        if (space) right = space + 1;
+    } else {
+        size_t n = wcslen(text);
+        if (n > KS_MAX_WORD + 1) return 0;
+        memcpy(left, text, (n + 1) * sizeof(wchar_t));
+    }
+    if (search->before) total += ks_spell_pair_score(search->lexicon, search->before, left);
+    if (search->after) total += ks_spell_pair_score(search->lexicon, right, search->after);
+    total = total * KS_CONTEXT_WEIGHT / 10;
+    return total > KS_CONTEXT_CAP ? KS_CONTEXT_CAP : total;
+}
+
 static void consider_ranked(KS_SEARCH *search, const wchar_t *text, int rank,
                             int bonus, KS_SPELL_KIND kind) {
     int score;
 
     if (rank < 0 || wcscmp(text, search->typed) == 0) return;
+    if (kind != KS_SPELL_KIND_ZWNJ) bonus += context_bonus(search, text, kind);
     score = rank + bonus;
 
     if (search->best.valid && wcscmp(search->best.text, text) == 0) {
@@ -855,6 +915,12 @@ int ks_spell_correct(const wchar_t *word, int level,
                      const KS_SPELL_LEXICON *lexicon,
                      const KS_IGNORE_LIST *ignore,
                      KS_SPELL_RESULT *result) {
+    return ks_spell_correct_in_context(word, NULL, NULL, level, lexicon, ignore, result);
+}
+
+int ks_spell_correct_in_context(const wchar_t *word, const wchar_t *before, const wchar_t *after,
+                                int level, const KS_SPELL_LEXICON *lexicon,
+                                const KS_IGNORE_LIST *ignore, KS_SPELL_RESULT *result) {
     KS_SEARCH search;
     KS_LEVEL_POLICY policy;
     size_t length;
@@ -917,6 +983,8 @@ int ks_spell_correct(const wchar_t *word, int level,
     search.level = level;
     search.slips = 1;
     search.alphabet = lexicon->language == KS_LANG_PERSIAN ? PERSIAN_ALPHABET : ENGLISH_ALPHABET;
+    search.before = before && *before ? before : NULL;
+    search.after = after && *after ? after : NULL;
     wcscpy(result->original, word);
 
     if (ks_spell_known(word, lexicon)) {
@@ -934,8 +1002,13 @@ int ks_spell_correct(const wchar_t *word, int level,
         enumerate_candidates(&search);
         result->candidate_count = search.distinct;
         if (!search.best.valid || search.best.rank < KS_REAL_WORD_MIN_RANK) return 0;
-        runner_up_score = search.second.valid && search.second.score > KS_REAL_WORD_KEEP
-                              ? search.second.score : KS_REAL_WORD_KEEP;
+        {
+            /* Leaving the word as typed is worth more where it fits the
+               words around it. */
+            int keep = KS_REAL_WORD_KEEP + context_bonus(&search, word, KS_SPELL_KIND_EDIT);
+            runner_up_score = search.second.valid && search.second.score > keep
+                                  ? search.second.score : keep;
+        }
         if (search.best.score - runner_up_score < policy.margin) return 0;
         finish(result, &search, runner_up_score);
         result->real_word = 1;

@@ -146,6 +146,130 @@ void ks_memory_forget_word(KS_WRITING_MEMORY *memory, const wchar_t *word) {
     memory->dirty = 1;
 }
 
+/* ---- Pairs ------------------------------------------------------------------ */
+
+static int pair_key(const wchar_t *first, const wchar_t *second, wchar_t *key) {
+    size_t a, b;
+    if (!valid_word(first) || !valid_word(second)) return 0;
+    a = wcslen(first);
+    b = wcslen(second);
+    memcpy(key, first, a * sizeof(wchar_t));
+    key[a] = L' ';
+    memcpy(key + a + 1, second, (b + 1) * sizeof(wchar_t));
+    return 1;
+}
+
+static int find_pair(const KS_WRITING_MEMORY *memory, const wchar_t *key, uint32_t *slot_out) {
+    uint32_t slot = word_hash(key) & (KS_MEMORY_PAIR_SLOTS - 1);
+    int probes;
+    for (probes = 0; probes < KS_MEMORY_PAIR_SLOTS; ++probes) {
+        unsigned short entry = memory->pair_slots[slot];
+        if (!entry) {
+            if (slot_out) *slot_out = slot;
+            return -1;
+        }
+        if (wcscmp(memory->pairs[entry - 1].text, key) == 0) {
+            if (slot_out) *slot_out = slot;
+            return entry - 1;
+        }
+        slot = (slot + 1) & (KS_MEMORY_PAIR_SLOTS - 1);
+    }
+    if (slot_out) *slot_out = 0;
+    return -1;
+}
+
+static void rebuild_pair_slots(KS_WRITING_MEMORY *memory) {
+    int i;
+    memset(memory->pair_slots, 0, sizeof(memory->pair_slots));
+    for (i = 0; i < memory->pair_count; ++i) {
+        uint32_t slot = word_hash(memory->pairs[i].text) & (KS_MEMORY_PAIR_SLOTS - 1);
+        while (memory->pair_slots[slot]) slot = (slot + 1) & (KS_MEMORY_PAIR_SLOTS - 1);
+        memory->pair_slots[slot] = (unsigned short)(i + 1);
+    }
+}
+
+static void add_pair_count(KS_WRITING_MEMORY *memory, const wchar_t *key, unsigned count) {
+    uint32_t slot;
+    int index = find_pair(memory, key, &slot);
+    if (index >= 0) {
+        KS_MEMORY_PAIR *pair = &memory->pairs[index];
+        pair->count = pair->count + count > 1000000u ? 1000000u : pair->count + count;
+        pair->last_seen = memory->clock;
+        memory->dirty = 1;
+        return;
+    }
+    if (count > 1000000u) count = 1000000u;
+    if (memory->pair_count >= KS_MEMORY_PAIRS) {
+        /* Full: the least used pair (the oldest among equals) makes room.
+           A pair seen in the last KS_MEMORY_PAIR_GRACE sightings is spared,
+           so a new phrase gets the chance to be seen twice; otherwise each
+           new pair would evict the one before it and nothing new would
+           ever be learned once the table is full. */
+        int weakest = -1;
+        int i;
+        for (i = 0; i < memory->pair_count; ++i) {
+            const KS_MEMORY_PAIR *candidate = &memory->pairs[i];
+            if (memory->clock - candidate->last_seen < KS_MEMORY_PAIR_GRACE) continue;
+            if (weakest < 0 || candidate->count < memory->pairs[weakest].count ||
+                (candidate->count == memory->pairs[weakest].count &&
+                 candidate->last_seen < memory->pairs[weakest].last_seen))
+                weakest = i;
+        }
+        if (weakest < 0) {
+            /* Everything was seen lately (cannot normally happen): the least
+               used, the oldest among equals, goes. */
+            weakest = 0;
+            for (i = 1; i < memory->pair_count; ++i)
+                if (memory->pairs[i].count < memory->pairs[weakest].count ||
+                    (memory->pairs[i].count == memory->pairs[weakest].count &&
+                     memory->pairs[i].last_seen < memory->pairs[weakest].last_seen))
+                    weakest = i;
+        }
+        memory->pairs[weakest] = memory->pairs[--memory->pair_count];
+        rebuild_pair_slots(memory);
+        find_pair(memory, key, &slot);
+    }
+    index = memory->pair_count++;
+    wcscpy(memory->pairs[index].text, key);
+    memory->pairs[index].count = count;
+    memory->pairs[index].last_seen = memory->clock;
+    memory->pair_slots[slot] = (unsigned short)(index + 1);
+    memory->dirty = 1;
+}
+
+void ks_memory_observe_pair(KS_WRITING_MEMORY *memory, const wchar_t *first, const wchar_t *second) {
+    wchar_t key[2 * KS_MAX_WORD + 2];
+    if (!memory || !pair_key(first, second, key)) return;
+    ++memory->clock;
+    add_pair_count(memory, key, 1);
+}
+
+void ks_memory_unobserve_pair(KS_WRITING_MEMORY *memory, const wchar_t *first, const wchar_t *second) {
+    wchar_t key[2 * KS_MAX_WORD + 2];
+    int index;
+    if (!memory || !pair_key(first, second, key)) return;
+    index = find_pair(memory, key, NULL);
+    if (index < 0 || memory->pairs[index].count == 0) return;
+    --memory->pairs[index].count;
+    memory->dirty = 1;
+}
+
+unsigned ks_memory_pair_count(const KS_WRITING_MEMORY *memory, const wchar_t *first, const wchar_t *second) {
+    wchar_t key[2 * KS_MAX_WORD + 2];
+    int index;
+    if (!memory || !pair_key(first, second, key)) return 0;
+    index = find_pair(memory, key, NULL);
+    return index >= 0 ? memory->pairs[index].count : 0;
+}
+
+int ks_memory_pair_score(const KS_WRITING_MEMORY *memory, const wchar_t *first, const wchar_t *second) {
+    unsigned count = ks_memory_pair_count(memory, first, second);
+    int score = 20;
+    if (count < 2) return 0;
+    for (count >>= 1; count > 1 && score < 40; count >>= 1) score += 4;
+    return score;
+}
+
 int ks_memory_rank_adjust(const KS_WRITING_MEMORY *memory, const wchar_t *word, int table_rank) {
     unsigned count;
     unsigned scaled;
@@ -308,6 +432,13 @@ static int order_by_count(const void *left, const void *right) {
                                &g_sort_memory->words[*(const int *)right]);
 }
 
+static int order_pairs_by_count(const void *left, const void *right) {
+    const KS_MEMORY_PAIR *a = &g_sort_memory->pairs[*(const int *)left];
+    const KS_MEMORY_PAIR *b = &g_sort_memory->pairs[*(const int *)right];
+    if (a->count != b->count) return a->count < b->count ? 1 : -1;
+    return wcscmp(a->text, b->text);
+}
+
 size_t ks_memory_serialize(const KS_WRITING_MEMORY *memory, wchar_t *output, size_t capacity) {
     static int order[KS_MEMORY_WORDS];
     size_t used = 0;
@@ -317,7 +448,8 @@ size_t ks_memory_serialize(const KS_WRITING_MEMORY *memory, wchar_t *output, siz
     used = put(output, capacity, used,
                L"# KeySwitchFix writing memory. It never leaves this computer.\n"
                L"# [fixes]: typo, the correction you typed, times seen (applied from 2; 3 if the typo is a real word).\n"
-               L"# [words]: words you have typed at least twice, and how often. Edit or delete lines freely; delete the file to forget everything.\n"
+               L"# [words]: words you have typed at least twice, and how often.\n"
+               L"# [pairs]: two words you have typed one after the other at least twice. Edit or delete lines freely; delete the file to forget everything.\n"
                L"[fixes]\n");
     for (i = 0; i < memory->fix_count; ++i) {
         used = put(output, capacity, used, memory->fixes[i].typo);
@@ -339,6 +471,18 @@ size_t ks_memory_serialize(const KS_WRITING_MEMORY *memory, wchar_t *output, siz
         used = put(output, capacity, used, memory->words[order[i]].text);
         used = put(output, capacity, used, L"\t");
         used = put_number(output, capacity, used, memory->words[order[i]].count);
+        used = put(output, capacity, used, L"\n");
+    }
+    used = put(output, capacity, used, L"[pairs]\n");
+    kept = 0;
+    for (i = 0; i < memory->pair_count; ++i)
+        if (memory->pairs[i].count >= 2) order[kept++] = i;
+    g_sort_memory = memory;
+    qsort(order, (size_t)kept, sizeof(order[0]), order_pairs_by_count);
+    for (i = 0; i < kept; ++i) {
+        used = put(output, capacity, used, memory->pairs[order[i]].text);
+        used = put(output, capacity, used, L"\t");
+        used = put_number(output, capacity, used, memory->pairs[order[i]].count);
         used = put(output, capacity, used, L"\n");
     }
     if (output && capacity) output[used < capacity ? used : capacity - 1] = 0;
@@ -372,7 +516,7 @@ static unsigned parse_count(const wchar_t *text) {
 }
 
 int ks_memory_parse(KS_WRITING_MEMORY *memory, const wchar_t *text) {
-    enum { NONE, FIXES, WORDS } section = NONE;
+    enum { NONE, FIXES, WORDS, PAIRS } section = NONE;
     wchar_t line[3 * (KS_MAX_WORD + 1) + 32];
     const wchar_t *cursor;
     if (!memory || !text) return 0;
@@ -394,6 +538,8 @@ int ks_memory_parse(KS_WRITING_MEMORY *memory, const wchar_t *text) {
                 section = FIXES;
             } else if (wcscmp(line, L"[words]") == 0) {
                 section = WORDS;
+            } else if (wcscmp(line, L"[pairs]") == 0) {
+                section = PAIRS;
             } else {
                 wchar_t *fields[3];
                 int count = split_fields(line, fields, 3);
@@ -402,6 +548,28 @@ int ks_memory_parse(KS_WRITING_MEMORY *memory, const wchar_t *text) {
                     add_fix_count(memory, fields[0], fields[1], (int)parse_count(fields[2]));
                 else if (section == WORDS && count >= 1)
                     add_word_count(memory, fields[0], count >= 2 ? parse_count(fields[1]) : 1);
+                else if (section == PAIRS && count >= 1) {
+                    /* "first second": exactly one space between two words
+                       (spaces around them, from a hand edit, are trimmed;
+                       pairs are looked up in lower case). */
+                    wchar_t *pair_text = fields[0];
+                    wchar_t *space;
+                    wchar_t *cursor;
+                    wchar_t key[2 * KS_MAX_WORD + 2];
+                    size_t length;
+                    while (*pair_text == L' ') ++pair_text;
+                    length = wcslen(pair_text);
+                    while (length && pair_text[length - 1] == L' ') pair_text[--length] = 0;
+                    for (cursor = pair_text; *cursor; ++cursor) *cursor = ks_to_lower(*cursor);
+                    space = wcschr(pair_text, L' ');
+                    if (space && !wcschr(space + 1, L' ')) {
+                        *space = 0;
+                        if (pair_key(pair_text, space + 1, key)) {
+                            unsigned value = count >= 2 ? parse_count(fields[1]) : 2;
+                            if (value) add_pair_count(memory, key, value);
+                        }
+                    }
+                }
             }
         }
         cursor = *end ? end + 1 : end;
@@ -412,7 +580,9 @@ int ks_memory_parse(KS_WRITING_MEMORY *memory, const wchar_t *text) {
         int i;
         /* Loaded words count as seen since the last eviction. */
         for (i = 0; i < memory->word_count; ++i) memory->words[i].last_seen = 1;
-        memory->clock = 1;
+        for (i = 0; i < memory->pair_count; ++i) memory->pairs[i].last_seen = 1;
+        /* ...and outside the grace of new pairs: a loaded pair is not new. */
+        memory->clock = 1 + KS_MEMORY_PAIR_GRACE;
         memory->aged_at = 0;
     }
     memory->dirty = 0;

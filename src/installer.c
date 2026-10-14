@@ -12,7 +12,7 @@
 #include "paths.h"
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.1.0"
+#define APP_VERSION L"4.2.0"
 #define APP_WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 #define WM_APP_EXIT (WM_APP + 9)
 

@@ -13,6 +13,7 @@
 #define IDR_FA_RANK_TABLE       212
 #define IDR_EN_FORMS_BLOOM      213
 #define IDR_FA_FORMS_BLOOM      214
+#define IDR_FA_PAIRS            215
 #define IDR_APP_BINARY          301
 #define IDR_UNINSTALL_BINARY    302
 #define IDR_LANGUAGE_BUNDLE     303

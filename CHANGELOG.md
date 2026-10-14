@@ -2,6 +2,50 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [4.2.0] - 2026-10-14
+
+Spelling reads the words around a typo, not only the typo itself.
+
+### Spelling in context
+
+- **The words around a typo choose its repair.** A table of 734,003 Persian
+  word pairs (how much more often two words stand next to each other than
+  chance), counted in 79 million words of Persian Wikipedia, adds weight to
+  a repair that fits the word before it and the word after it.
+- **The next word can settle the previous one.** A word spelling could not
+  decide alone is looked at again when the next word is finished, and
+  repaired in place: `به بزان مادری` → `به زبان مادری`, `فرق داته باشد` →
+  `فرق داشته باشد`. One Backspace restores both words as typed and keeps the
+  one that was changed.
+- **Your own phrases count too.** With the writing memory on, two words you
+  type one after the other twice become a pair of yours (up to 2,048, kept
+  in `writing-memory.txt` under `[pairs]`), so your colloquial phrases help
+  as much as written Persian: after `من مثلا` twice, `من مثلل` becomes
+  `من مثلا`.
+- Measured on 40,000 typos in sentences of Wikipedia articles held out of
+  the counts (Balanced): 68 % fixed word by word, 79 % with the word before,
+  84 % with both neighbours; wrong repairs 4.5 % → 4.0 %; correct words
+  changed: 6 to 8 of 30,000 in every mode. `tests/spell_real_tests.c` checks
+  a fixed part of this set at every build.
+- Persian only for the corpus pairs (English has no pair table yet); the
+  user's own pairs work for both languages.
+- A typo never becomes one of your phrases (the repaired phrase does), so a
+  repair does not weaken with repetition; a full phrase memory still learns
+  new phrases.
+- The word history of a long sentence drops its oldest words instead of all
+  of them, so the layout repair of earlier words and the context keep
+  working past the 31st word.
+- One Backspace after a fix also takes back the phrases learned with it;
+  phrases are learned only where the fix itself is allowed (not in code
+  editors below Aggressive); a restart never makes the strongest saved
+  phrase the first one to go.
+
+### Data
+
+- `resources/fa-pairs.bin` (4 MB) is built by `tools/count_word_pairs.py`
+  and `tools/generate_pair_table.py` from the Persian Wikipedia dump of
+  2018-10-01 (CC BY-SA 3.0; `third-party/fa-pairs-NOTICE.txt`).
+
 ## [4.1.0] - 2026-10-10
 
 Spelling correction rebuilt and measured: more typos fixed, fewer wrong

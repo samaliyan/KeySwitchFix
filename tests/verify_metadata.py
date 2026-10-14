@@ -108,6 +108,16 @@ def main() -> None:
         check(len(data) == 16 + slot_count * 4, f"{path}: invalid rank table size")
         if path.startswith("resources/"):
             check(word_count >= 16384, f"{path}: too few words for daily vocabulary")
+    # The Persian word-pair table (4.2): committed, a KSRT table of pairs.
+    pairs = (ROOT / "resources/fa-pairs.bin").read_bytes()
+    magic, version, slot_count, pair_count = struct.unpack("<4sIII", pairs[:16])
+    check(magic == b"KSRT" and version == 1 and slot_count == 1 << 20 and
+          len(pairs) == 16 + slot_count * 4 and 500000 <= pair_count <= slot_count * 0.75,
+          "resources/fa-pairs.bin: invalid word-pair table")
+    require("resources/app.rc", 'IDR_FA_PAIRS RCDATA "fa-pairs.bin"')
+    require("third-party/README.txt", "fa-pairs-NOTICE.txt")
+    require("package-release.sh", "fa-pairs-NOTICE.txt")
+    require("src/app.c", "try_respell_previous(")
     require("src/app.c", "try_spelling_correction(")
     require("src/app.c", "ks_ignore_list_add(&g_spelling_ignore")
     require("src/spell.c", "int ks_spell_correct(")

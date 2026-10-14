@@ -379,6 +379,7 @@ static struct { int id; const char *file; unsigned char *data; size_t size; } si
     {IDR_FA_RANK_TABLE, "resources/fa-rank.bin", NULL, 0},
     {IDR_EN_FORMS_BLOOM, "resources/en-forms.bloom", NULL, 0},
     {IDR_FA_FORMS_BLOOM, "resources/fa-forms.bloom", NULL, 0},
+    {IDR_FA_PAIRS, "resources/fa-pairs.bin", NULL, 0},
 };
 
 HRSRC FindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type) {
@@ -506,7 +507,22 @@ DWORD SetFilePointer(HANDLE handle, LONG distance, LONG *high, DWORD method) {
         return INVALID_SET_FILE_POINTER;
     return (DWORD)ftell((FILE *)handle);
 }
+/* The application in front: none (no name), or the one a test names. */
+static const wchar_t *sim_process_name;
+#define SIM_PROCESS_HANDLE ((HANDLE)(uintptr_t)0x3333)
+HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD id) {
+    (void)access; (void)inherit; (void)id;
+    return sim_process_name ? SIM_PROCESS_HANDLE : NULL;
+}
+BOOL QueryFullProcessImageNameW(HANDLE process, DWORD flags, LPWSTR path, DWORD *size) {
+    (void)flags;
+    if (process != SIM_PROCESS_HANDLE || !sim_process_name) return FALSE;
+    swprintf(path, *size, L"C:\\Programs\\%ls", sim_process_name);
+    *size = (DWORD)wcslen(path);
+    return TRUE;
+}
 BOOL CloseHandle(HANDLE handle) {
+    if (handle == SIM_PROCESS_HANDLE) return TRUE;
     if (handle && handle != INVALID_HANDLE_VALUE && handle != (HANDLE)&sim_find) fclose((FILE *)handle);
     return TRUE;
 }
@@ -521,7 +537,7 @@ static DWORD vk_for_scan(DWORD scan) {
     if (scan == 0x0B) return '0';
     if (scan >= 0x10 && scan <= 0x32 && letters[scan - 0x10]) return (DWORD)(letters[scan - 0x10] - 'a' + 'A');
     switch (scan) {
-        case 0x0C: return 0xBD; case 0x0D: return 0xBB; case 0x0E: return VK_BACK;
+        case 0x0C: return 0xBD; case 0x0D: return 0xBB; case 0x0E: return VK_BACK; case 0x0F: return VK_TAB;
         case 0x1A: return 0xDB; case 0x1B: return 0xDD; case 0x1C: return VK_RETURN;
         case 0x27: return 0xBA; case 0x28: return 0xDE; case 0x29: return 0xC0;
         case 0x2B: return 0xDC; case 0x33: return 0xBC; case 0x34: return VK_OEM_PERIOD;
@@ -546,6 +562,7 @@ static void deliver_physical(DWORD vk, DWORD scan) {
     int count;
     if (vk == VK_BACK) { screen_back(); return; }
     if (vk == VK_RETURN) { screen_put(L'\n'); return; }
+    if (vk == VK_TAB) { screen_put(L'\t'); return; }
     if (vk == VK_SPACE) {
         SIM_LAYOUT *layout = find_sim_layout(sim_active);
         screen_put(sim_shift && layout && layout->hkl == (HKL)0x04290429u ? (wchar_t)ZWNJ : L' ');
@@ -583,6 +600,8 @@ static void us_keys(const char *text) {
         DWORD i;
         if (*text == ' ') { press(0x39, 0); continue; }
         if (*text == '\b') { press(0x0E, 0); continue; }
+        if (*text == '\t') { press(0x0F, 0); continue; }
+        if (*text == '~') { press(0x39, 1); continue; }   /* Shift+Space: a half-space (ZWNJ) */
         for (i = 0; i < sizeof(lower) - 1; ++i) {
             if (lower[i] == *text) { press(0x02 + i, 0); break; }
             if (upper[i] == *text) { press(0x02 + i, 1); break; }
@@ -814,6 +833,7 @@ static void spelling(void) {
         load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
         load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
     expect(g_spelling_available, "the spelling tables load");
+    expect(load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs), "the Persian word-pair table loads");
     memset(&g_english_spelling, 0, sizeof(g_english_spelling));
     g_english_spelling.language = KS_LANG_ENGLISH;
     g_english_spelling.ranks = &g_english_rank_table;
@@ -826,11 +846,13 @@ static void spelling(void) {
     g_persian_spelling.words = &g_persian_bloom;
     g_persian_spelling.common = &g_persian_common_bloom;
     g_persian_spelling.forms = &g_persian_forms_bloom;
+    g_persian_spelling.pairs = NULL;
     g_english_spelling.vocabulary = g_persian_spelling.vocabulary = &g_session_vocabulary;
     g_english_spelling.personal = g_persian_spelling.personal = &g_personal_vocabulary;
     g_english_spelling.rank_adjust = g_persian_spelling.rank_adjust = spell_rank_adjust;
     g_english_spelling.rank_adjust_context = &g_rank_language_en;
     g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
+    g_english_spelling.pair_adjust = g_persian_spelling.pair_adjust = spell_pair_adjust;
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_vocab_reset(&g_personal_vocabulary);
@@ -926,6 +948,51 @@ static void spelling(void) {
     g_settings.personal_dictionary = 0;
     g_window = NULL;
 
+    /* Context (4.2). Without the pair table, بزان stays (it could be
+       several words); with it, the next word مادری settles it, and the
+       previous word is repaired in place. */
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("fi fchk lhnvd ");
+    expect_screen(L"\u0628\u0647 \u0628\u0632\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC ",
+                  "word by word, the slip cannot be decided");
+    g_persian_spelling.pairs = &g_persian_pairs;
+    /* A new session: a word typed twice in one session is taken as meant. */
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("fi fchk lhnvd ");
+    expect_screen(L"\u0628\u0647 \u0632\u0628\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC ",
+                  "the next word settles the previous one");
+    g_settings.personal_dictionary = 1;
+    us_keys("\b");
+    expect_screen(L"\u0628\u0647 \u0628\u0632\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC",
+                  "one Backspace restores both words as typed");
+    expect(wcscmp(g_pending_keep, L"\u0628\u0632\u0627\u0646") == 0,
+           "and the word that was changed is the one kept");
+    expect(ks_ignore_list_contains(&g_spelling_ignore, L"\u0628\u0632\u0627\u0646"),
+           "it is not changed again this session");
+    g_pending_keep[0] = 0;
+    g_settings.personal_dictionary = 0;
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("tvr nhji fhan ");
+    expect_screen(L"\u0641\u0631\u0642 \u062F\u0627\u0634\u062A\u0647 \u0628\u0627\u0634\u062F ",
+                  "a missing letter is found from the words around it");
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("kldn,ki ");
+    expect_screen(L"\u0646\u0645\u06CC\u062F\u0648\u0646\u0647 ", "colloquial Persian still stays as written");
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("lk kldn,ki ofvd kdsj ");
+    expect_screen(L"\u0645\u0646 \u0646\u0645\u06CC\u062F\u0648\u0646\u0647 \u062E\u0628\u0631\u06CC \u0646\u06CC\u0633\u062A ",
+                  "a colloquial sentence stays as written");
+
     /* The writing memory: a typo that slipped through three times is
        unlearned by one repair by hand. مثلل is ambiguous (مثل / مثلا), so
        spelling leaves it alone. */
@@ -943,6 +1010,128 @@ static void spelling(void) {
     expect_screen(L"\u0645\u062B\u0644\u0627 ", "the word is repaired by hand");
     expect(ks_memory_word_count(&g_memory, L"\u0645\u062B\u0644\u0644") == 0, "the hand repair unteaches the typo");
     expect(ks_memory_fix_count(&g_memory, L"\u0645\u062B\u0644\u0644") == 1, "and records the repair");
+
+    /* The user's own phrases (4.2): after "من مثلا" twice, مثلل after من
+       is مثلا (alone it is مثل or مثلا). */
+    ks_memory_reset(&g_memory);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("lk legh tvr lk legh ");
+    expect(ks_memory_pair_count(&g_memory, L"\u0645\u0646", L"\u0645\u062B\u0644\u0627") == 2,
+           "the phrase من مثلا is learned");
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("lk legg ");
+    expect_screen(L"\u0645\u0646 \u0645\u062B\u0644\u0627 ", "the user's phrase settles the typo");
+
+    /* A typo the next word repairs is never learned as a phrase; the
+       repaired phrase is, so the next time the fix comes at once. */
+    ks_memory_reset(&g_memory);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("fi fchk lhnvd ");
+    expect_screen(L"\u0628\u0647 \u0632\u0628\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC ",
+                  "the next word repairs the typo");
+    expect(ks_memory_pair_count(&g_memory, L"\u0628\u0647", L"\u0628\u0632\u0627\u0646") == 0 &&
+               ks_memory_pair_count(&g_memory, L"\u0628\u0632\u0627\u0646", L"\u0645\u0627\u062F\u0631\u06CC") == 0,
+           "no phrase with the typo is learned");
+    expect(ks_memory_pair_count(&g_memory, L"\u0628\u0647", L"\u0632\u0628\u0627\u0646") == 1 &&
+               ks_memory_pair_count(&g_memory, L"\u0632\u0628\u0627\u0646", L"\u0645\u0627\u062F\u0631\u06CC") == 1,
+           "the repaired phrase is learned");
+    {
+        /* Undoing it: the fix is not counted as the user's word, the typo is. */
+        unsigned fixed_before = ks_memory_word_count(&g_memory, L"\u0632\u0628\u0627\u0646");
+        unsigned typo_before = ks_memory_word_count(&g_memory, L"\u0628\u0632\u0627\u0646");
+        us_keys("\b");
+        expect(ks_memory_word_count(&g_memory, L"\u0632\u0628\u0627\u0646") + 1 == fixed_before &&
+                   ks_memory_word_count(&g_memory, L"\u0628\u0632\u0627\u0646") == typo_before + 1,
+               "undoing it gives the counts back");
+        g_pending_keep[0] = 0;
+    }
+    {
+        int round;
+        for (round = 0; round < 4; ++round) {
+            ks_ignore_list_reset(&g_spelling_ignore);
+            ks_vocab_reset(&g_session_vocabulary);
+            screen_reset();
+            user_switch((uintptr_t)0x04290429u);
+            us_keys("fi fchk lhnvd ");
+            expect_screen(L"\u0628\u0647 \u0632\u0628\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC ",
+                          "repeated, the typo is still repaired");
+        }
+    }
+    expect(ks_memory_pair_count(&g_memory, L"\u0628\u0647", L"\u0628\u0632\u0627\u0646") == 0 &&
+               ks_memory_pair_count(&g_memory, L"\u0628\u0647", L"\u0632\u0628\u0627\u0646") >= 3,
+           "and only the repaired phrase grows");
+
+    /* In a code editor nothing is learned, even at Aggressive. */
+    ks_memory_reset(&g_memory);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    sim_process_name = L"Code.exe";
+    g_settings.spelling = KS_SPELL_AGGRESSIVE;
+    ++g_settings_generation;
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("tvr nhji fhan ");
+    expect(g_memory.pair_count == 0 && ks_memory_word_count(&g_memory, L"\u062F\u0627\u0634\u062A\u0647") == 0,
+           "nothing is learned in a code editor");
+    sim_process_name = NULL;
+    g_settings.spelling = KS_SPELL_BALANCED;
+    ++g_settings_generation;
+
+    /* A rejected fix teaches no phrase: undone twice, the pair stays at 0. */
+    ks_memory_reset(&g_memory);
+    {
+        int round;
+        for (round = 0; round < 2; ++round) {
+            ks_ignore_list_reset(&g_spelling_ignore);
+            ks_vocab_reset(&g_session_vocabulary);
+            screen_reset();
+            user_switch((uintptr_t)0x04290429u);
+            us_keys("fi fchk lhnvd \b");
+            g_pending_keep[0] = 0;
+        }
+    }
+    expect(ks_memory_pair_count(&g_memory, L"\u0628\u0647", L"\u0632\u0628\u0627\u0646") == 0 &&
+               ks_memory_pair_count(&g_memory, L"\u0632\u0628\u0627\u0646", L"\u0645\u0627\u062F\u0631\u06CC") == 0,
+           "an undone fix leaves no phrase behind");
+    /* A half-space-joined word is not respelled as a piece (the next-word
+       check; a fresh memory, so the learned phrase does not fix it first). */
+    ks_memory_reset(&g_memory);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    us_keys("fi~fchk lhnvd ");
+    expect_screen(L"\u0628\u0647\u200C\u0628\u0632\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC ",
+                  "the second half of a half-space word is left alone");
+    /* A long sentence keeps its context: after 40 words the word before is
+       still known (the history drops its oldest words, not all of them). */
+    ks_memory_reset(&g_memory);
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    screen_reset();
+    user_switch((uintptr_t)0x04290429u);
+    {
+        int word;
+        for (word = 0; word < 40; ++word) us_keys("ni ");   /* ده ده ده ... */
+    }
+    screen_reset();
+    us_keys("fi fchk lhnvd ");
+    expect_screen(L"\u0628\u0647 \u0632\u0628\u0627\u0646 \u0645\u0627\u062F\u0631\u06CC ",
+                  "context works after the 31st word of a sentence");
+
+    /* After Tab, the next field gets no context from the last one. */
+    user_switch((uintptr_t)0x04090409u);
+    screen_reset();
+    us_keys("teh\t");
+    expect_screen(L"the\t", "a fix at Tab");
+    expect(g_spell_prev[0] == 0, "a fix that ends with Tab gives no context to the next field");
     g_memory_active = 0;
     g_settings.learn_writing = 0;
     g_spelling_available = 0;

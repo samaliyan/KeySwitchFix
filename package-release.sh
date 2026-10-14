@@ -30,7 +30,8 @@ zip -9 -X -j "$ZIP" \
   ../third-party/dictionary-en-LICENSE.txt \
   ../third-party/dictionary-fa-LICENSE.txt \
   ../third-party/wordfreq-LICENSE.txt \
-  ../third-party/wordfreq-NOTICE.txt
+  ../third-party/wordfreq-NOTICE.txt \
+  ../third-party/fa-pairs-NOTICE.txt
 zip -9 -X "$ZIP" languages/*.kslang
 
 unzip -t "$ZIP"

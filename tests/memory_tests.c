@@ -377,6 +377,85 @@ int main(void) {
               "a typo of the user's own frequent word is repaired to it");
     }
 
+    /* Pairs (4.2): two words typed one after the other. */
+    {
+        static KS_WRITING_MEMORY pairs;
+        static wchar_t text[1 << 16];
+        static KS_WRITING_MEMORY again;
+        int i;
+        ks_memory_reset(&pairs);
+        ks_memory_observe_pair(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627");
+        CHECK(ks_memory_pair_count(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627") == 1 &&
+                  ks_memory_pair_score(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627") == 0,
+              "a pair seen once has no weight yet");
+        ks_memory_observe_pair(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627");
+        CHECK(ks_memory_pair_score(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627") == 20,
+              "twice: weight 20");
+        for (i = 0; i < 100; ++i) ks_memory_observe_pair(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627");
+        CHECK(ks_memory_pair_score(&pairs, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627") == 40, "often: at most 40");
+        CHECK(ks_memory_pair_count(&pairs, L"\x0645\x062B\x0644\x0627", L"\x0645\x0646") == 0, "pairs are ordered");
+        ks_memory_observe_pair(&pairs, L"a", L"word");          /* too short */
+        ks_memory_observe_pair(&pairs, L"two words", L"x1");    /* a space inside */
+        ks_memory_observe_pair(&pairs, NULL, L"word");
+        CHECK(pairs.pair_count == 1, "invalid words make no pair");
+        ks_memory_observe_pair(&pairs, L"once", L"only");       /* stays off disk */
+        ks_memory_serialize(&pairs, text, sizeof(text) / sizeof(text[0]));
+        CHECK(wcsstr(text, L"[pairs]\n\x0645\x0646 \x0645\x062B\x0644\x0627\t102\n") != NULL &&
+                  !wcsstr(text, L"once only"), "pairs typed twice are saved, a one-off is not");
+        CHECK(ks_memory_parse(&again, text) && again.pair_count == 1 &&
+                  ks_memory_pair_count(&again, L"\x0645\x0646", L"\x0645\x062B\x0644\x0627") == 102,
+              "pairs load back");
+        CHECK(ks_memory_parse(&again, L"[pairs]\nab cd\t5\nab\t9\nab cd ef\t3\n AB cd \t4\nxy zw\nbig one\t999999999\n") &&
+                  again.pair_count == 3 && ks_memory_pair_count(&again, L"ab", L"cd") == 9 &&
+                  ks_memory_pair_count(&again, L"xy", L"zw") == 2 &&
+                  ks_memory_pair_count(&again, L"big", L"one") == 1000000,
+              "malformed pair lines are skipped; a hand-edited line is trimmed and lowered; counts are capped");
+        /* A full table still learns new phrases (the newest pairs are
+           spared for a while, so they can be seen twice). */
+        ks_memory_reset(&pairs);
+        for (i = 0; i < KS_MEMORY_PAIRS; ++i) {
+            wchar_t first[16], second[16];
+            swprintf(first, 16, L"old%d", i);
+            swprintf(second, 16, L"x%d", i);
+            ks_memory_observe_pair(&pairs, first, second);
+            ks_memory_observe_pair(&pairs, first, second);
+        }
+        for (i = 0; i < 50; ++i) {
+            ks_memory_observe_pair(&pairs, L"nw", L"ph");
+            ks_memory_observe_pair(&pairs, L"ph", L"other");
+        }
+        CHECK(pairs.pair_count == KS_MEMORY_PAIRS && ks_memory_pair_count(&pairs, L"nw", L"ph") == 50 &&
+                  ks_memory_pair_score(&pairs, L"nw", L"ph") > 0,
+              "a new phrase is learned when the table is full");
+        /* After a reload of a full table, a new pair takes the place of a
+           weak one, never of the user's most used phrase. */
+        for (i = 0; i < 48; ++i) ks_memory_observe_pair(&pairs, L"top", L"phrase");
+        ks_memory_serialize(&pairs, text, sizeof(text) / sizeof(text[0]));
+        CHECK(ks_memory_parse(&again, text) && again.pair_count == KS_MEMORY_PAIRS, "the full table reloads");
+        ks_memory_observe_pair(&again, L"brand", L"new");
+        CHECK(ks_memory_pair_count(&again, L"top", L"phrase") >= 48 &&
+                  ks_memory_pair_count(&again, L"brand", L"new") == 1,
+              "after a reload the most used phrase survives a new pair");
+        ks_memory_unobserve_pair(&again, L"brand", L"new");
+        ks_memory_unobserve_pair(&again, L"brand", L"new");
+        CHECK(ks_memory_pair_count(&again, L"brand", L"new") == 0, "unobserve takes a sighting back, not below zero");
+        /* Full: the least used pair makes room, the slots stay consistent. */
+        ks_memory_reset(&pairs);
+        for (i = 0; i < KS_MEMORY_PAIRS + 50; ++i) {
+            wchar_t first[16], second[16];
+            swprintf(first, 16, L"w%d", i);
+            swprintf(second, 16, L"v%d", i);
+            ks_memory_observe_pair(&pairs, first, second);
+            if (i < 10) ks_memory_observe_pair(&pairs, first, second);   /* used twice */
+        }
+        CHECK(pairs.pair_count == KS_MEMORY_PAIRS, "the pair table is bounded");
+        CHECK(ks_memory_pair_count(&pairs, L"w3", L"v3") == 2, "a pair used twice survives eviction");
+        CHECK(ks_memory_pair_count(&pairs, L"w2097", L"v2097") == 1, "the newest pair is there");
+        for (i = 0; i < pairs.pair_count; ++i)
+            if (ks_memory_pair_count(&pairs, L"w0", L"v0") != 2) break;
+        CHECK(i == pairs.pair_count, "lookups stay correct after evictions");
+    }
+
     printf("All writing memory and vocabulary tests passed.\n");
     return 0;
 }

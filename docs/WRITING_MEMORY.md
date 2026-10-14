@@ -41,6 +41,14 @@ become permanent — one Backspace keeps a word you meant. Dictionary words you
 use often rank higher, so an ambiguous typo resolves toward the word you
 actually write.
 
+**Your phrases** (4.2). Two words you finish one after the other with Space
+are counted as a pair. A pair typed twice tells spelling which repair fits
+your sentence (`من مثلل` → `من مثلا` once you have written `من مثلا` twice),
+colloquial phrases included. A word spelling doubts (it may be a typo the
+next word repairs) never forms a pair; the repaired phrase does. Up to 2,048
+pairs; when full, the least used goes first, but a pair seen in the last 512
+pairs is spared so that new phrases can still be learned.
+
 Both work for every language pair (4.0): German or Russian repairs and words
 are learned the same way. A known word counts only for the language whose
 alphabet it is written in, and the "real word" check for a repair uses that
@@ -58,10 +66,12 @@ computer only:
 عسیسم	عزیزم	3
 [words]
 عزیزم	57
+[pairs]
+من مثلا	3
 ```
 
-- Only words typed **at least twice** are written to the file; words seen
-  once stay in memory until the program exits.
+- Only words and pairs typed **at least twice** are written to the file;
+  those seen once stay in memory until the program exits.
 - Nothing is learned in password fields Windows can identify, in excluded
   apps, in code editors, terminals and remote-desktop windows, or with the
   setting off. Words are learned only when they end with **Space**: a

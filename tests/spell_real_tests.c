@@ -44,6 +44,7 @@ static unsigned char *load_file(const char *path, size_t *size) {
 }
 
 static KS_RANK_TABLE ranks[2];
+static KS_RANK_TABLE persian_pairs;
 static KS_BLOOM words[2], common[2], forms[2];
 static KS_SPELL_LEXICON lexicon[2];   /* 0 Persian, 1 English */
 static KS_IGNORE_LIST ignore;
@@ -149,6 +150,110 @@ static void reported_words(void) {
         CHECK(result.edits == 2 && !result.real_word, "یغتی is reported as two slips");
         ks_spell_correct(L"خرفه", KS_SPELL_BALANCED, &lexicon[0], &ignore, &result);
         CHECK(result.edits == 1 && result.real_word, "خرفه is reported as a rare-word repair");
+    }
+}
+
+/* ---- Context (4.2) ------------------------------------------------------- */
+
+static int utf8_to_wide(const char *text, wchar_t *out, size_t capacity);
+static double percent(long part, long whole);
+
+static int fixes_in_context(const wchar_t *before, const wchar_t *typed, const wchar_t *after,
+                            const wchar_t *expected) {
+    KS_SPELL_RESULT result;
+    ks_spell_correct_in_context(typed, before, after, KS_SPELL_BALANCED, &lexicon[0], &ignore, &result);
+    if (!result.should_correct || wcscmp(result.replacement, expected) != 0) {
+        fprintf(stderr, "  %ls [%ls] %ls -> %ls (expected %ls)\n", before ? before : L"", typed,
+                after ? after : L"", result.should_correct ? result.replacement : L"(kept)", expected);
+        return 0;
+    }
+    return 1;
+}
+
+static const wchar_t *own_first, *own_second;
+static int own_pairs(const void *context, const wchar_t *first, const wchar_t *second, int table_score) {
+    (void)context;
+    return own_first && wcscmp(first, own_first) == 0 && wcscmp(second, own_second) == 0 ? 30 : table_score;
+}
+
+static void context(void) {
+    KS_SPELL_LEXICON persian = lexicon[0];
+    KS_SPELL_RESULT result;
+    /* Word by word these stay; their neighbours settle them. */
+    CHECK(kept(L"\u0628\u0632\u0627\u0646", KS_SPELL_BALANCED), "بزان alone is left as typed");
+    CHECK(fixes_in_context(L"\u0628\u0647", L"\u0628\u0632\u0627\u0646", L"\u0645\u0627\u062F\u0631\u06CC",
+                           L"\u0632\u0628\u0627\u0646"), "به بزان مادری -> زبان");
+    CHECK(fixes_in_context(L"\u0641\u0631\u0642", L"\u062F\u0627\u062A\u0647", L"\u0628\u0627\u0634\u062F",
+                           L"\u062F\u0627\u0634\u062A\u0647"), "فرق داته باشد -> داشته");
+    CHECK(fixes_in_context(L"\u0634\u0627\u0645\u0644", L"\u0627\u0646\u0648\u0639",
+                           L"\u0645\u062E\u062A\u0644\u0641\u06CC", L"\u0627\u0646\u0648\u0627\u0639"),
+          "شامل انوع مختلفی -> انواع");
+    /* Context never changes a word written correctly. */
+    CHECK(!ks_spell_correct_in_context(L"\u0646\u0645\u06CC\u062F\u0648\u0646\u0647", L"\u0645\u0646", L"\u0686\u06CC",
+                                       KS_SPELL_AGGRESSIVE, &lexicon[0], &ignore, &result),
+          "a colloquial word stays in any context");
+    /* The user's own phrase decides an ambiguous word: مثلل after من. */
+    CHECK(kept(L"\u0645\u062B\u0644\u0644", KS_SPELL_BALANCED), "مثلل alone is ambiguous");
+    persian.pair_adjust = own_pairs;
+    own_first = L"\u0645\u0646";
+    own_second = L"\u0645\u062B\u0644\u0627";
+    CHECK(ks_spell_correct_in_context(L"\u0645\u062B\u0644\u0644", L"\u0645\u0646", NULL, KS_SPELL_BALANCED,
+                                      &persian, &ignore, &result) &&
+              wcscmp(result.replacement, L"\u0645\u062B\u0644\u0627") == 0,
+          "the user's own phrase (من مثلا) settles مثلل");
+    own_first = own_second = NULL;
+    CHECK(ks_spell_pair_score(&lexicon[0], L"\u062D\u0631\u0641\u0647", L"\u0627\u06CC") > 0 &&
+              ks_spell_pair_score(&lexicon[0], L"\u062E\u0631\u0641\u0647", L"\u0627\u06CC") == 0,
+          "حرفه ای is a known pair, خرفه ای is not");
+}
+
+static void context_evaluation(void) {
+    /* Balanced, Persian: no context, the word before, both neighbours. */
+    static const double fixed_at_least[3] = {64, 74, 79};
+    static const double wrong_at_most[3] = {5.5, 5.0, 5.0};
+    static const char *const names[3] = {"no context", "word before", "both sides"};
+    int mode;
+    for (mode = 0; mode < 3; ++mode) {
+        char line[512];
+        long typos = 0, fixed = 0, wrong = 0, valid = 0, changed = 0;
+        FILE *file = fopen("tests/fixtures/spell-context-eval.tsv", "r");
+        if (!file) {
+            CHECK(0, "tests/fixtures/spell-context-eval.tsv loads");
+            return;
+        }
+        while (fgets(line, sizeof(line), file)) {
+            char *kind, *before, *typed, *after, *intended;
+            wchar_t b[64], t[64], a[64], w[64];
+            KS_SPELL_RESULT result;
+            if (line[0] == '#') continue;
+            kind = strtok(line, "\t");
+            before = strtok(NULL, "\t");
+            typed = strtok(NULL, "\t");
+            after = strtok(NULL, "\t");
+            intended = kind && kind[0] == 'T' ? strtok(NULL, "\t") : "";
+            if (!kind || !before || !typed || !after || !intended) continue;
+            if (!utf8_to_wide(before, b, 64) || !utf8_to_wide(typed, t, 64) || !utf8_to_wide(after, a, 64) ||
+                !utf8_to_wide(intended, w, 64)) continue;
+            ks_spell_correct_in_context(t, mode >= 1 ? b : NULL, mode >= 2 ? a : NULL, KS_SPELL_BALANCED,
+                                        &lexicon[0], &ignore, &result);
+            if (kind[0] == 'T') {
+                ++typos;
+                if (result.should_correct) {
+                    if (wcscmp(result.replacement, w) == 0) ++fixed;
+                    else ++wrong;
+                }
+            } else {
+                ++valid;
+                if (result.should_correct && result.kind != KS_SPELL_KIND_ZWNJ) ++changed;
+            }
+        }
+        fclose(file);
+        printf("  context, %-11s typos fixed %5.1f%%  wrong %4.1f%%   valid words changed %ld of %ld\n",
+               names[mode], percent(fixed, typos), percent(wrong, typos), changed, valid);
+        CHECK(typos > 3000 && valid > 2000, "the context set loads");
+        CHECK(percent(fixed, typos) >= fixed_at_least[mode] && percent(wrong, typos) <= wrong_at_most[mode] &&
+                  percent(changed, valid) <= 0.2,
+              "spelling in context within its limits");
     }
 }
 
@@ -321,10 +426,22 @@ int main(void) {
         fprintf(stderr, "FAIL: resources missing (generate the rank tables first)\n");
         return 1;
     }
+    {
+        size_t size;
+        unsigned char *data = load_file("resources/fa-pairs.bin", &size);
+        if (!data || !ks_rank_table_init(&persian_pairs, data, size)) {
+            fprintf(stderr, "FAIL: resources/fa-pairs.bin missing or damaged\n");
+            return 1;
+        }
+    }
     ks_ignore_list_reset(&ignore);
     reported_words();
     kept_words();
     evaluate();
+    /* From here on the Persian lexicon has the pair table. */
+    lexicon[0].pairs = &persian_pairs;
+    context();
+    context_evaluation();
     speed();
     if (failures) {
         fprintf(stderr, "%d spelling check(s) with the real tables FAILED\n", failures);

@@ -17,6 +17,12 @@ KeySwitchFix embeds Bloom representations derived from:
    (this covers every language pack built from wordfreq)
    Full notices: wordfreq-LICENSE.txt and wordfreq-NOTICE.txt
 
+4. Persian Wikipedia (dump of 2018-10-01) / word-pair statistics for
+   spelling in context (resources/fa-pairs.bin)
+   Text license: Creative Commons BY-SA 3.0, (c) Wikipedia contributors
+   Derived statistics: Creative Commons BY-SA 3.0
+   Full notice: fa-pairs-NOTICE.txt
+
 The application resources and the language packs contain probabilistic
 membership bits, compact physical-key collision priors, and (in the packs)
 the language's one- and two-letter words; not the original word-list files.

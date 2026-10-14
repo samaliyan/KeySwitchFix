@@ -64,6 +64,12 @@ layout switch in Store/UWP applications and in applications that ignore or
 delay the switch (`staدیشقی` → `standard`). See
 [Typing helpers](docs/TYPING_HELPERS.md).
 
+Version 4.2 reads the words around a typo: a table of Persian word pairs
+from Wikipedia, and the phrases you write yourself, choose the repair that
+fits the sentence, and a word that only the next word settles is repaired
+when that word is finished (`به بزان مادری` → `به زبان مادری`). Persian typos
+in sentences: 68 % fixed word by word, 84 % in context.
+
 Version 4.1 rebuilds spelling correction and measures it: two slips in a word
 (`یغتی` → `یعنی`), a rare word one key from a frequent one (`خرفه` → `حرفه`),
 every inflected dictionary form and colloquial Persian left alone (`نمیدونه`,
@@ -94,6 +100,7 @@ inferred from the available keys or context alone.
 - Any two languages: English and Persian built in, 14 more as language packs (Arabic, Bulgarian, Dutch, French, German, Greek, Hebrew, Italian, Polish, Portuguese, Russian, Spanish, Turkish, Ukrainian), and a tool to build packs for others
 - Offline spelling correction for Persian and English with Off / Conservative / Balanced / Aggressive levels
 - Half-space (`می‌پرسیدند`) and missing-space (`in the`, `در خانه`) repair
+- Spelling in context: Persian word pairs from Wikipedia and your own phrases pick the repair that fits the sentence
 - Measured spelling: 4,000 generated typos per language and 5,300 valid words are checked at every build (Balanced: Persian 64 % fixed, English 82 %)
 - Learns your own vocabulary: undo a fix with Backspace and keep typing, and the word is yours across restarts; a word you repair by hand is unlearned as a typo
 - Effective union of 159,852 offline English and Persian spellings

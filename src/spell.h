@@ -80,6 +80,10 @@ typedef struct KS_SPELL_LEXICON {
     /* Optional: every inflected form the dictionary's affix rules allow
        (hordes, certifies, مخالفم): valid words that are not stems. */
     const KS_BLOOM *forms;
+    /* Optional (4.2): word pairs and how much more often the second word
+       follows the first than chance (10 x PMI, 0..60), a KSRT table keyed
+       by "first second". Lets the words around a typo choose the repair. */
+    const KS_RANK_TABLE *pairs;
     const KS_VOCAB *vocabulary;   /* optional: words seen this session */
     const KS_VOCAB *personal;     /* optional: the user's saved dictionary */
     /*
@@ -90,6 +94,11 @@ typedef struct KS_SPELL_LEXICON {
      */
     int (*rank_adjust)(const void *context, const wchar_t *word, int table_rank);
     const void *rank_adjust_context;
+    /* Optional: adjusts a pair's score beyond the table (the user's own
+       phrases from the writing memory). Called with the table score (0 when
+       absent); returns the score to use. */
+    int (*pair_adjust)(const void *context, const wchar_t *first, const wchar_t *second, int table_score);
+    const void *pair_adjust_context;
 } KS_SPELL_LEXICON;
 
 /* The lexicon's rank for a word: the table, then rank_adjust. */
@@ -142,6 +151,13 @@ int ks_spell_correct(const wchar_t *word, int level,
                      const KS_SPELL_LEXICON *lexicon,
                      const KS_IGNORE_LIST *ignore,
                      KS_SPELL_RESULT *result);
+/* The same with the word before and the word after it (either may be NULL
+   or empty): a repair that fits them is preferred (4.2). */
+int ks_spell_correct_in_context(const wchar_t *word, const wchar_t *before, const wchar_t *after,
+                                int level, const KS_SPELL_LEXICON *lexicon,
+                                const KS_IGNORE_LIST *ignore, KS_SPELL_RESULT *result);
+/* 10 x PMI of the pair "first second" (0 when unknown or no table). */
+int ks_spell_pair_score(const KS_SPELL_LEXICON *lexicon, const wchar_t *first, const wchar_t *second);
 
 void ks_vocab_reset(KS_VOCAB *vocab);
 /* Records one sighting; returns the new count. */

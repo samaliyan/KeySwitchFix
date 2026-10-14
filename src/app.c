@@ -22,7 +22,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.1.0"
+#define APP_VERSION L"4.2.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -164,6 +164,14 @@ typedef struct UNDO_RECORD {
     ULONGLONG created_at;
     wchar_t original[KS_MAX_PHRASE_CHARS + 1];
     wchar_t replacement[KS_MAX_PHRASE_CHARS + 1];
+    /* A spelling fix of the previous word made when the next one arrived
+       (4.2): the phrase is restored, and this word is the one kept. */
+    wchar_t kept_word[KS_MAX_WORD + 1];
+    /* Phrases the fix taught the writing memory (lower case), taken back
+       when it is undone: "before fix" and/or "fix after". */
+    wchar_t pair_before[KS_MAX_WORD + 1];
+    wchar_t pair_fix[KS_MAX_WORD + 1];
+    wchar_t pair_after[KS_MAX_WORD + 1];
 } UNDO_RECORD;
 
 typedef struct WORD_HISTORY {
@@ -172,6 +180,12 @@ typedef struct WORD_HISTORY {
     KS_SLOT visible_language;
     /* The character that followed this word on screen: Space or ZWNJ. */
     wchar_t separator;
+    /* Spelling looked at this word and could not decide alone (4.2): the
+       next word may settle it. */
+    int spell_doubt;
+    /* The word was typed right after a half-space: it is the second part
+       of one word (می‌خواهم), not a word of its own. */
+    int follows_zwnj;
 } WORD_HISTORY;
 
 static HINSTANCE g_instance;
@@ -427,6 +441,14 @@ static KS_BLOOM g_persian_common_bloom;
 /* Every inflected form the dictionaries allow (spelling only). */
 static KS_BLOOM g_english_forms_bloom;
 static KS_BLOOM g_persian_forms_bloom;
+/* Persian word pairs (4.2): the words around a typo help choose its repair. */
+static KS_RANK_TABLE g_persian_pairs;
+/* The word a spelling fix just typed: the context of the next word, since
+   the fix clears the word history. */
+static wchar_t g_spell_prev[KS_MAX_WORD + 1];
+static HWND g_spell_prev_window;
+/* The word before the last spelling fix (for the user's phrase memory). */
+static wchar_t g_spell_fix_before[KS_MAX_WORD + 1];
 static KS_BLOOM g_english_frequent_bloom;
 static KS_BLOOM g_persian_frequent_bloom;
 static KS_BLOOM g_english_prefix_bloom;
@@ -467,6 +489,8 @@ static HWND g_sentence_window;
 static int g_sentence_started;
 static WORD_HISTORY g_history[KS_MAX_SEQUENCE_WORDS - 1];
 static int g_history_count;
+/* 1 while the word being typed began right after a half-space. */
+static int g_word_follows_zwnj;
 static int g_history_chars;
 static int g_history_overflowed;
 static HWND g_history_window;
@@ -1208,6 +1232,22 @@ static int extra_word_prefix(const void *context, KS_SLOT slot, const wchar_t *p
    frequent words rank by how often they are typed, and dictionary words the
    user favours are lifted a little, so ambiguous typos resolve toward the
    words this person writes. */
+/* The user's own phrases (writing memory) count like the corpus pairs. */
+static int spell_pair_adjust(const void *context, const wchar_t *first, const wchar_t *second, int table_score) {
+    wchar_t a[KS_MAX_WORD + 1];
+    wchar_t b[KS_MAX_WORD + 1];
+    wchar_t *cursor;
+    int own;
+    (void)context;
+    if (!g_memory_active || wcslen(first) > KS_MAX_WORD || wcslen(second) > KS_MAX_WORD) return table_score;
+    safe_copy(a, KS_MAX_WORD + 1, first);
+    safe_copy(b, KS_MAX_WORD + 1, second);
+    for (cursor = a; *cursor; ++cursor) *cursor = ks_to_lower(*cursor);
+    for (cursor = b; *cursor; ++cursor) *cursor = ks_to_lower(*cursor);
+    own = ks_memory_pair_score(&g_memory, a, b);
+    return own > table_score ? own : table_score;
+}
+
 static int spell_rank_adjust(const void *context, const wchar_t *word, int table_rank) {
     KS_LANGUAGE language = *(const KS_LANGUAGE *)context;
     if (table_rank < 0 && g_settings.vocab_it && ks_domain_contains(KS_DOMAIN_IT, language, word))
@@ -1308,6 +1348,7 @@ static void clear_word(void) {
 }
 
 static void clear_history(void) {
+    g_spell_prev[0] = 0;
     g_history_count = 0;
     g_history_chars = 0;
     g_history_overflowed = 0;
@@ -1405,18 +1446,25 @@ static void history_push(HWND window, const KS_TOKEN *tokens, int count,
         clear_history();
         g_history_window = window;
     }
-    if (g_history_count >= KS_MAX_SEQUENCE_WORDS - 1 ||
-        g_history_chars + count + (g_history_count ? 1 : 0) >
-            KS_MAX_SEQUENCE_CHARS - KS_MAX_WORD - 1) {
-        abandon_history();
-        return;
+    /* A long sentence: the oldest words make room (4.2; earlier versions
+       dropped the whole history, and with it the context of every word
+       after the 31st). Only the last few words are ever rewritten. */
+    while (g_history_count > 0 &&
+           (g_history_count >= KS_MAX_SEQUENCE_WORDS - 1 ||
+            g_history_chars + count + 1 > KS_MAX_SEQUENCE_CHARS - KS_MAX_WORD - 1)) {
+        g_history_chars -= g_history[0].count + (g_history_count > 1 ? 1 : 0);
+        memmove(&g_history[0], &g_history[1], (size_t)(g_history_count - 1) * sizeof(g_history[0]));
+        --g_history_count;
     }
+    if (g_history_chars < 0 || g_history_count == 0) g_history_chars = 0;
     memcpy(g_history[g_history_count].tokens, tokens,
            (size_t)count * sizeof(tokens[0]));
     g_history[g_history_count].count = count;
     g_history[g_history_count].visible_language = visible_language;
     g_history[g_history_count].separator =
         delimiter_zwnj ? (wchar_t)ZWNJ : L' ';
+    g_history[g_history_count].spell_doubt = 0;
+    g_history[g_history_count].follows_zwnj = 0;
     g_history_chars += count + (g_history_count ? 1 : 0);
     ++g_history_count;
 }
@@ -3429,8 +3477,31 @@ static void run_focus_query(void) {
 #define SPELL_DECLINED 2        /* the model looked and found nothing safe */
 #define SPELL_SUPPRESSED 3      /* a fix existed but the context forbids it */
 
+/* The word before the one being finished, as it is on screen: the last word
+   of the history, or the word a spelling fix just typed. 0 when there is
+   none (a new sentence, a click, another field). */
+static int context_before(HWND foreground, wchar_t *out) {
+    out[0] = 0;
+    if (g_history_window == foreground && g_history_count > 0) {
+        const WORD_HISTORY *last = &g_history[g_history_count - 1];
+        tokens_to_language(last->tokens, last->count, last->visible_language, out);
+    } else if (g_spell_prev[0] && g_spell_prev_window == foreground) {
+        safe_copy(out, KS_MAX_WORD + 1, g_spell_prev);
+    }
+    return out[0] != 0;
+}
+
+/* After a spelling fix: its last word is the context of the next one. */
+static void remember_spelled_word(HWND foreground, const wchar_t *replacement) {
+    const wchar_t *last = wcsrchr(replacement, L' ');
+    last = last ? last + 1 : replacement;
+    safe_copy(g_spell_prev, KS_MAX_WORD + 1, last);
+    g_spell_prev_window = foreground;
+}
+
 static int try_spelling_correction(HWND foreground, UINT delimiter, int delimiter_zwnj) {
     wchar_t typed[KS_MAX_WORD + 1];
+    wchar_t before[KS_MAX_WORD + 1];
     KS_SPELL_RESULT result;
     KS_DECISION decision;
     const KS_SPELL_LEXICON *lexicon;
@@ -3450,7 +3521,15 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
         if (ks_ignore_list_contains(&g_spelling_ignore, typed)) return SPELL_DECLINED;
         typed[0] = (wchar_t)(typed[0] - L'A' + L'a');
     }
-    if (!ks_spell_correct(typed, g_settings.spelling, lexicon, &g_spelling_ignore, &result) ||
+    context_before(foreground, before);
+    /* The phrase memory learns (before, fix) only when the word before is
+       not itself a word spelling doubts. */
+    if (g_history_window == foreground && g_history_count > 0 && g_history[g_history_count - 1].spell_doubt)
+        g_spell_fix_before[0] = 0;
+    else
+        safe_copy(g_spell_fix_before, KS_MAX_WORD + 1, before);
+    if (!ks_spell_correct_in_context(typed, before, NULL, g_settings.spelling, lexicon,
+                                     &g_spelling_ignore, &result) ||
         !result.should_correct)
         return SPELL_DECLINED;
     if (g_word_auto_capitalized) {
@@ -3494,7 +3573,106 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
     /* The physical tokens no longer describe the text on screen, so the
        sentence model cannot safely rewrite this word again. */
     clear_history();
+    /* Only a Space keeps the sentence going: after Tab or Enter the next
+       word is in another cell, field or line. */
+    if (delimiter == VK_SPACE && !delimiter_zwnj) remember_spelled_word(foreground, decision.replacement);
     return SPELL_APPLIED;
+}
+
+/*
+ * The previous word could not be decided alone (spelling declined it, or it
+ * is a rare word that may be a slip). Now the word after it is known: look
+ * again with both neighbours (4.2). "خرفه" alone is a rare real word; in
+ * "خرفه ای" it is "حرفه ای". On success the screen goes from "P W" to
+ * "P' W", and one Backspace restores "P W" and keeps P.
+ */
+static int helpers_suppressed(HWND foreground);
+
+static int try_respell_previous(HWND foreground, UINT delimiter, int delimiter_zwnj) {
+    const WORD_HISTORY *last;
+    const KS_SPELL_LEXICON *lexicon;
+    wchar_t previous[KS_MAX_WORD + 1];
+    wchar_t earlier[KS_MAX_WORD + 1];
+    wchar_t current[KS_MAX_WORD + 1];
+    wchar_t original[KS_MAX_PHRASE_CHARS + 1];
+    wchar_t replacement[KS_MAX_PHRASE_CHARS + 1];
+    KS_SPELL_RESULT result;
+
+    if (!g_spelling_available || g_settings.spelling < KS_SPELL_BALANCED) return 0;
+    if (delimiter != VK_SPACE || delimiter_zwnj || g_word_mixed || g_word_count < 1) return 0;
+    if (g_history_window != foreground || g_history_count < 1) return 0;
+    last = &g_history[g_history_count - 1];
+    if (!last->spell_doubt || last->follows_zwnj || last->separator != L' ' ||
+        last->visible_language != g_word_language) return 0;
+    /* The second half of a word joined with a half-space is not a word. */
+    if (g_history_count >= 2 && g_history[g_history_count - 2].separator == (wchar_t)ZWNJ) return 0;
+    if (!slot_is(g_word_language, KS_LANG_ENGLISH) && !slot_is(g_word_language, KS_LANG_PERSIAN)) return 0;
+    lexicon = slot_is(g_word_language, KS_LANG_PERSIAN) ? &g_persian_spelling : &g_english_spelling;
+    /* Context comes from the corpus pairs (Persian) or the user's own
+       phrases (writing memory, both languages). */
+    if (!lexicon->pairs && !g_memory_active) return 0;
+    /* Word and Outlook rewrite text behind the caret themselves. */
+    if (focus_facts(foreground)->autocorrect_app) return 0;
+    if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground)) return 0;
+    tokens_to_language(last->tokens, last->count, last->visible_language, previous);
+    tokens_to_language(g_word, g_word_count, g_word_language, current);
+    earlier[0] = 0;
+    if (g_history_count >= 2 && g_history[g_history_count - 2].separator == L' ' &&
+        g_history[g_history_count - 2].visible_language == g_word_language)
+        tokens_to_language(g_history[g_history_count - 2].tokens, g_history[g_history_count - 2].count,
+                           g_word_language, earlier);
+    if (!ks_spell_correct_in_context(previous, earlier, current, g_settings.spelling, lexicon,
+                                     &g_spelling_ignore, &result) ||
+        !result.should_correct || result.kind != KS_SPELL_KIND_EDIT)
+        return 0;
+    if (wcslen(previous) + 1 + wcslen(current) > 64 ||
+        wcslen(result.replacement) + 1 + wcslen(current) > KS_MAX_PHRASE_CHARS) return 0;
+    if (is_protected_field(foreground)) return 0;
+    swprintf(original, KS_MAX_PHRASE_CHARS + 1, L"%ls %ls", previous, current);
+    swprintf(replacement, KS_MAX_PHRASE_CHARS + 1, L"%ls %ls", result.replacement, current);
+    if (!send_replacement(foreground, (int)wcslen(original), replacement, delimiter, delimiter_zwnj,
+                          g_word_language))
+        return 0;
+    store_phrase_undo(foreground, g_word_language, delimiter, delimiter_zwnj, original, replacement);
+    g_undo.spelling = 1;
+    safe_copy(g_undo.kept_word, KS_MAX_WORD + 1, previous);
+    /* Nothing is learned where typing helpers are off (developer tools,
+       excluded apps, remote sessions), as for every other word. */
+    if (g_memory_active && !helpers_suppressed(foreground)) {
+        /* The previous word was counted as typed; it was a typo. */
+        wchar_t noted[KS_MAX_WORD + 1];
+        safe_copy(noted, KS_MAX_WORD + 1, previous);
+        lower_for_slot(noted, g_word_language);
+        ks_memory_unobserve_word(&g_memory, noted);
+        memory_note_word(result.replacement, g_word_language);
+        /* The phrase as it now stands is the user's phrase. */
+        {
+            wchar_t fixed[KS_MAX_WORD + 1];
+            wchar_t next[KS_MAX_WORD + 1];
+            safe_copy(fixed, KS_MAX_WORD + 1, result.replacement);
+            safe_copy(next, KS_MAX_WORD + 1, current);
+            lower_for_slot(fixed, g_word_language);
+            lower_for_slot(next, g_word_language);
+            if (earlier[0]) {
+                wchar_t first[KS_MAX_WORD + 1];
+                safe_copy(first, KS_MAX_WORD + 1, earlier);
+                lower_for_slot(first, g_word_language);
+                ks_memory_observe_pair(&g_memory, first, fixed);
+                safe_copy(g_undo.pair_before, KS_MAX_WORD + 1, first);
+            }
+            ks_memory_observe_pair(&g_memory, fixed, next);
+            safe_copy(g_undo.pair_fix, KS_MAX_WORD + 1, fixed);
+            safe_copy(g_undo.pair_after, KS_MAX_WORD + 1, next);
+        }
+    }
+    InterlockedIncrement(&g_spelling_fixes);
+    stats_count_correction(previous, 1);
+    set_activity_pair(L"Spelling (from the next word)", previous, result.replacement);
+    clear_history();
+    remember_spelled_word(foreground, current);
+    mark_sentence_word(foreground);
+    remember_intent(foreground, g_word_language, 2);
+    return 1;
 }
 
 /*
@@ -3713,15 +3891,26 @@ static int try_undo(int consume_delimiter) {
         set_activity_pair(L"Restored", g_undo.replacement, g_undo.original);
         /* The user rejected a spelling fix: that spelling is now theirs.
            It is written to disk only when the personal dictionary is on. */
-        if (g_memory_active && g_last_noted[0] && wcslen(g_undo.replacement) <= KS_MAX_WORD) {
+        if (g_memory_active && g_last_noted[0] &&
+            (g_undo.kept_word[0] || wcslen(g_undo.replacement) <= KS_MAX_WORD)) {
             /* The replacement was just counted as the user's word; it was
-               not their word after all. */
+               not their word after all. (A fix of the previous word: the
+               replacement is "fixed current"; the fix is its first word.) */
             wchar_t noted[KS_MAX_WORD + 1];
             wchar_t *cursor;
             safe_copy(noted, KS_MAX_WORD + 1, g_undo.replacement);
+            if (g_undo.kept_word[0]) {
+                wchar_t *space = wcschr(noted, L' ');
+                if (space) *space = 0;
+            }
             for (cursor = noted; *cursor; ++cursor) *cursor = ks_to_lower(*cursor);
             if (wcscmp(noted, g_last_noted) == 0) ks_memory_unobserve_word(&g_memory, noted);
             g_last_noted[0] = 0;
+        }
+        /* The phrases the rejected fix taught go too. */
+        if (g_memory_active && g_undo.pair_fix[0]) {
+            if (g_undo.pair_before[0]) ks_memory_unobserve_pair(&g_memory, g_undo.pair_before, g_undo.pair_fix);
+            if (g_undo.pair_after[0]) ks_memory_unobserve_pair(&g_memory, g_undo.pair_fix, g_undo.pair_after);
         }
         if (g_undo.learned) {
             /* The user rejected a learned repair: unlearn it and leave the
@@ -3734,27 +3923,34 @@ static int try_undo(int consume_delimiter) {
             if (g_spelling_fixes > 0) InterlockedDecrement(&g_spelling_fixes);
         }
         if (g_undo.spelling) {
-            /* One undo makes the word trusted for this session. It reaches
-               the personal dictionary only when the user has typed or
-               restored it before, so a stray Backspace cannot teach a typo
-               permanently. */
-            int seen_before = ks_vocab_observe(&g_session_vocabulary, g_undo.original) >= 2;
-            ks_ignore_list_add(&g_spelling_ignore, g_undo.original);
-            ks_vocab_trust(&g_session_vocabulary, g_undo.original);
+            /* One undo makes the word trusted for this session; typing on
+               keeps it for good (Remember undone words). A fix made from
+               the next word restores the phrase but keeps only the word. */
+            const wchar_t *kept = g_undo.kept_word[0] ? g_undo.kept_word : g_undo.original;
+            if (g_undo.kept_word[0] && g_memory_active && !helpers_suppressed(foreground)) {
+                /* The respell had taken the typed word back; it is theirs. */
+                wchar_t word[KS_MAX_WORD + 1];
+                safe_copy(word, KS_MAX_WORD + 1, kept);
+                lower_for_slot(word, g_undo.source_language);
+                ks_memory_observe_word(&g_memory, word);
+            }
+            int seen_before = ks_vocab_observe(&g_session_vocabulary, kept) >= 2;
+            ks_ignore_list_add(&g_spelling_ignore, kept);
+            ks_vocab_trust(&g_session_vocabulary, kept);
             /* A word already kept but not yet saved (its message is still
                queued) is saved now, before this one takes its place. */
             if (g_pending_keep_ready) save_kept_word();
-            if (g_settings.personal_dictionary && wcslen(g_undo.original) <= KS_MAX_WORD) {
-                safe_copy(g_pending_keep, KS_MAX_WORD + 1, g_undo.original);
+            if (g_settings.personal_dictionary && wcslen(kept) <= KS_MAX_WORD) {
+                safe_copy(g_pending_keep, KS_MAX_WORD + 1, kept);
                 g_pending_keep_at = GetTickCount();
                 g_pending_keep_ready = 0;
                 if (seen_before) keep_word_soon();
             }
             /* "Teh" undone at a sentence start must also protect "teh". */
-            if (g_undo.original[0] >= L'A' && g_undo.original[0] <= L'Z' &&
-                wcslen(g_undo.original) <= KS_MAX_WORD) {
+            if (kept[0] >= L'A' && kept[0] <= L'Z' &&
+                wcslen(kept) <= KS_MAX_WORD) {
                 wchar_t lower[KS_MAX_WORD + 1];
-                safe_copy(lower, KS_MAX_WORD + 1, g_undo.original);
+                safe_copy(lower, KS_MAX_WORD + 1, kept);
                 lower[0] = (wchar_t)(lower[0] - L'A' + L'a');
                 ks_ignore_list_add(&g_spelling_ignore, lower);
                 ks_vocab_trust(&g_session_vocabulary, lower);
@@ -4603,6 +4799,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         int retained_word = 0;
         int memory_learning;
         int note_word = 1;
+        int spell_doubt = 0;   /* the word may be a slip only the next word can settle */
         /*
          * Shift+Space is the zero-width non-joiner on both Windows Persian
          * layouts. It ends the current token exactly like Space, but the
@@ -4611,6 +4808,9 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
          */
         UINT boundary_key = zwnj_key ? VK_SPACE : data->vkCode;
         int zwnj = zwnj_key || (boundary_key == VK_SPACE && g_shift_down);
+        /* This word followed a half-space; the next one follows this key. */
+        int word_follows_zwnj = g_word_follows_zwnj;
+        g_word_follows_zwnj = zwnj;
         int terminates_sentence = is_sentence_terminator(boundary_key);
         if (had_word) InterlockedIncrement(&g_words_checked);
         g_dead_key_word = 0;
@@ -4780,24 +4980,72 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             if (consult_spelling) {
                 int outcome = try_spelling_correction(foreground, boundary_key, zwnj);
                 if (outcome == SPELL_APPLIED) {
-                    if (memory_learning) memory_note_word(g_undo.replacement, g_word_language);
+                    if (memory_learning) {
+                        memory_note_word(g_undo.replacement, g_word_language);
+                        /* The phrase as it now stands: the word before, the fix. */
+                        if (g_spell_fix_before[0] && !wcschr(g_undo.replacement, L' ') &&
+                            wcslen(g_undo.replacement) <= KS_MAX_WORD) {
+                            wchar_t first[KS_MAX_WORD + 1];
+                            wchar_t fixed[KS_MAX_WORD + 1];
+                            safe_copy(first, KS_MAX_WORD + 1, g_spell_fix_before);
+                            safe_copy(fixed, KS_MAX_WORD + 1, g_undo.replacement);
+                            lower_for_slot(first, g_word_language);
+                            lower_for_slot(fixed, g_word_language);
+                            ks_memory_observe_pair(&g_memory, first, fixed);
+                            safe_copy(g_undo.pair_before, KS_MAX_WORD + 1, first);
+                            safe_copy(g_undo.pair_fix, KS_MAX_WORD + 1, fixed);
+                        }
+                    }
                     suppress_key_up(data->vkCode);
                     if (terminates_sentence) start_new_sentence(foreground);
                     clear_word();
                     return 1;
                 }
                 if (outcome == SPELL_DECLINED && !active_known) observe_vocabulary(foreground);
+                if (outcome == SPELL_DECLINED) {
+                    /* Unknown, or only a rare word: the next word may
+                       decide it (try_respell_previous). */
+                    const KS_SPELL_LEXICON *lexicon = slot_is(g_word_language, KS_LANG_PERSIAN)
+                                                          ? &g_persian_spelling : &g_english_spelling;
+                    wchar_t typed[KS_MAX_WORD + 1];
+                    tokens_to_language(g_word, g_word_count, g_word_language, typed);
+                    spell_doubt = !ks_spell_known(typed, lexicon) || ks_spell_weakly_known(typed, lexicon);
+                }
             }
         }
         if (!g_skip_word && !g_overflow_count && g_word_count > 0) {
             if (memory_learning && !g_word_mixed && note_word) {
                 wchar_t text[KS_MAX_WORD + 1];
+                wchar_t before[KS_MAX_WORD + 1];
                 tokens_to_language(g_word, g_word_count, g_word_language, text);
                 memory_note_word(text, g_word_language);
+                /* The user's own phrases (4.2): this word after the last.
+                   Never with a word spelling doubts (it may be a typo the
+                   next word repairs): a learned typo pair would argue for
+                   keeping that typo next time. */
+                if (!spell_doubt &&
+                    !(g_history_window == foreground && g_history_count > 0 &&
+                      g_history[g_history_count - 1].spell_doubt) &&
+                    context_before(foreground, before)) {
+                    lower_for_slot(before, g_word_language);
+                    lower_for_slot(text, g_word_language);
+                    ks_memory_observe_pair(&g_memory, before, text);
+                }
                 remember_prev_word(foreground, g_word, g_word_count, g_word_language);
+            }
+            /* This word may settle the one before it (4.2). */
+            if (try_respell_previous(foreground, boundary_key, zwnj)) {
+                suppress_key_up(data->vkCode);
+                if (terminates_sentence) start_new_sentence(foreground);
+                clear_word();
+                return 1;
             }
             history_push(foreground, g_word, g_word_count,
                          g_word_language, boundary_key, zwnj);
+            if (g_history_count > 0 && g_history_window == foreground) {
+                g_history[g_history_count - 1].spell_doubt = spell_doubt;
+                g_history[g_history_count - 1].follows_zwnj = word_follows_zwnj;
+            }
             retained_word = boundary_key == VK_SPACE;
         }
         if (had_word && !retained_word) clear_history();
@@ -7569,6 +7817,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
         load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
         load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
         load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
+    /* Optional: without the pair table spelling works word by word. */
+    load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
     memset(&g_english_spelling, 0, sizeof(g_english_spelling));
     g_english_spelling.language = KS_LANG_ENGLISH;
     g_english_spelling.ranks = &g_english_rank_table;
@@ -7581,6 +7831,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_persian_spelling.words = &g_persian_bloom;
     g_persian_spelling.common = &g_persian_common_bloom;
     g_persian_spelling.forms = &g_persian_forms_bloom;
+    g_persian_spelling.pairs = g_persian_pairs.valid ? &g_persian_pairs : NULL;
     g_english_spelling.vocabulary = &g_session_vocabulary;
     g_persian_spelling.vocabulary = &g_session_vocabulary;
     g_english_spelling.personal = &g_personal_vocabulary;
@@ -7589,6 +7840,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_english_spelling.rank_adjust_context = &g_rank_language_en;
     g_persian_spelling.rank_adjust = spell_rank_adjust;
     g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
+    g_english_spelling.pair_adjust = spell_pair_adjust;
+    g_persian_spelling.pair_adjust = spell_pair_adjust;
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_context_reset(&g_intent_context);
