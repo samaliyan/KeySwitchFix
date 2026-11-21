@@ -491,6 +491,33 @@ int main(void) {
     attested_words();
     kept_words();
     evaluate();
+    /* English word pairs (4.4): the word before chooses between repairs. */
+    {
+        static KS_RANK_TABLE english_pairs;
+        size_t size;
+        unsigned char *data = load_file("resources/en-pairs.bin", &size);
+        KS_SPELL_RESULT result;
+        if (!data || !ks_rank_table_init(&english_pairs, data, size)) {
+            fprintf(stderr, "FAIL: resources/en-pairs.bin missing or damaged\n");
+            return 1;
+        }
+        lexicon[1].pairs = &english_pairs;
+        CHECK(ks_spell_pair_score(&lexicon[1], L"thank", L"you") >= 10 &&
+              ks_spell_pair_score(&lexicon[1], L"look", L"forward") >= 20 &&
+              ks_spell_pair_score(&lexicon[1], L"forward", L"look") == 0,
+              "English pairs are scored, in order");
+        /* "form" and "from" are both words; nothing is changed without or
+           with context (a real word never yields to a neighbour by context). */
+        ks_spell_correct_in_context(L"form", L"away", NULL, KS_SPELL_BALANCED, &lexicon[1], &ignore, &result);
+        CHECK(!result.should_correct, "a valid word is not changed by context");
+        /* thnak: "thank" and "think" are one slip away; after "to" and
+           before "you" the pair decides. */
+        ks_spell_correct_in_context(L"thnak", NULL, L"you", KS_SPELL_BALANCED, &lexicon[1], &ignore, &result);
+        CHECK(result.should_correct && wcscmp(result.replacement, L"thank") == 0,
+              "the next word chooses the repair");
+        CHECK(kept(L"github", KS_SPELL_BALANCED), "names stay with the pair table loaded");
+        lexicon[1].pairs = NULL;
+    }
     /* From here on the Persian lexicon has the pair table. */
     lexicon[0].pairs = &persian_pairs;
     context();

@@ -495,6 +495,8 @@ static KS_BLOOM g_english_wide_prefix_bloom;
 static KS_BLOOM g_persian_wide_prefix_bloom;
 /* Persian word pairs (4.2): the words around a typo help choose its repair. */
 static KS_RANK_TABLE g_persian_pairs;
+/* English word pairs (4.4), from the SymSpell bigram counts. */
+static KS_RANK_TABLE g_english_pairs;
 /* The word a spelling fix just typed: the context of the next word, since
    the fix clears the word history. */
 static wchar_t g_spell_prev[KS_MAX_WORD + 1];
@@ -8417,6 +8419,7 @@ static void load_spelling_lexicons(void) {
         load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
     /* Optional: without the pair table spelling works word by word. */
     load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
+    load_rank_resource(IDR_EN_PAIRS, &g_english_pairs);
     /* Optional: without the wide lexicons only dictionary words are known. */
     load_bloom_resource(IDR_EN_WIDE_BLOOM, &g_english_wide_bloom);
     load_bloom_resource(IDR_FA_WIDE_BLOOM, &g_persian_wide_bloom);
@@ -8429,6 +8432,7 @@ static void load_spelling_lexicons(void) {
     g_english_spelling.common = &g_english_common_bloom;
     g_english_spelling.forms = &g_english_forms_bloom;
     g_english_spelling.attested = g_english_wide_bloom.valid ? &g_english_wide_bloom : NULL;
+    g_english_spelling.pairs = g_english_pairs.valid ? &g_english_pairs : NULL;
     memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
     g_persian_spelling.language = KS_LANG_PERSIAN;
     g_persian_spelling.ranks = &g_persian_rank_table;

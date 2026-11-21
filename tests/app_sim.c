@@ -384,6 +384,7 @@ static struct { int id; const char *file; unsigned char *data; size_t size; } si
     {IDR_FA_WIDE_BLOOM, "resources/fa-wide.bloom", NULL, 0},
     {IDR_EN_WIDE_PREFIX, "resources/en-wide-prefix.bloom", NULL, 0},
     {IDR_FA_WIDE_PREFIX, "resources/fa-wide-prefix.bloom", NULL, 0},
+    {IDR_EN_PAIRS, "resources/en-pairs.bin", NULL, 0},
 };
 
 HRSRC FindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type) {

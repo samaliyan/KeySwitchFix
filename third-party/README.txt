@@ -26,3 +26,8 @@ KeySwitchFix embeds Bloom representations derived from:
 The application resources and the language packs contain probabilistic
 membership bits, compact physical-key collision priors, and (in the packs)
 the language's one- and two-letter words; not the original word-list files.
+
+English word pairs (resources/en-pairs.bin)
+   Derived from the SymSpell frequency lists in symspellpy 6.10.2 (MIT),
+   which come from the Google Books Ngram data (CC BY 3.0) and SCOWL.
+   Full notice: en-pairs-NOTICE.txt

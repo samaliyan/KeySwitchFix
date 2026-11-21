@@ -20,6 +20,7 @@ IDR_EN_WIDE_BLOOM RCDATA "en-wide.bloom"
 IDR_FA_WIDE_BLOOM RCDATA "fa-wide.bloom"
 IDR_EN_WIDE_PREFIX RCDATA "en-wide-prefix.bloom"
 IDR_FA_WIDE_PREFIX RCDATA "fa-wide-prefix.bloom"
+IDR_EN_PAIRS RCDATA "en-pairs.bin"
 
 1 VERSIONINFO
 FILEVERSION 4,3,0,0

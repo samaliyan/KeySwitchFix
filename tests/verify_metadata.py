@@ -117,6 +117,8 @@ def main() -> None:
     require("resources/app.rc", 'IDR_FA_PAIRS RCDATA "fa-pairs.bin"')
     require("third-party/README.txt", "fa-pairs-NOTICE.txt")
     require("package-release.sh", "fa-pairs-NOTICE.txt")
+    require("third-party/README.txt", "en-pairs-NOTICE.txt")
+    require("package-release.sh", "en-pairs-NOTICE.txt")
     require("src/app.c", "try_respell_previous(")
     require("src/app.c", "try_spelling_correction(")
     require("src/app.c", "ks_ignore_list_add(&g_spelling_ignore")
