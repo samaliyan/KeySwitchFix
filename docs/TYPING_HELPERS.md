@@ -128,6 +128,13 @@ as `snippets.txt.bak`).
 
 Hotkey: `Ctrl + Win + X`, in any application.
 
+`Ctrl + Win + Z` (4.4) uses the same clipboard round trip to **convert** the
+selection to the other keyboard layout: every character a letter key of your
+two layouts types is replaced by what the same key types in the other one
+(`sghl nsj lk` becomes `سلام دست من`, and back). The direction is the
+alphabet most of the selection is in; the application is then switched to
+the layout the text now belongs to.
+
 Select text — a paragraph pasted from a web page, an old document, a message
 — and press the hotkey. The selection is replaced by a cleaned copy:
 

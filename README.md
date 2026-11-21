@@ -28,6 +28,13 @@ between any two of 16 languages you pick on the dashboard (see
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
 
+Version 4.4 gives you more control: correct only at the end of a word,
+rules per application (`WINWORD.EXE:spelling`, `Telegram.exe:slow`), a
+tray item that keeps the last changed word for good, a **My words** box on
+the dashboard, `Ctrl + Win + Z` to convert selected text to the other
+layout, English spelling that reads the words around a typo, and an
+optional update check (off by default).
+
 Version 4.3 knows far more words. Names, brands and everyday words that no
 dictionary lists (`github`, `gemini`, `binance`, `zach`, `practise`,
 `دیجیکالا`) are kept exactly as typed instead of being "corrected" or turned
@@ -176,6 +183,7 @@ The executable is currently unsigned, so Microsoft Defender SmartScreen may disp
 - Right-click the tray icon to pause correction, choose **Writing language**, toggle **Fix spelling mistakes**, exclude the app you last typed in, or exit.
 - Press `Ctrl + Win + K` to pause or resume correction from anywhere.
 - Press `Ctrl + Win + X` to clean up the selected text in any application.
+- Press `Ctrl + Win + Z` to convert the selected text to the other keyboard layout (`sghl` ↔ `سلام`).
 - Type a snippet shortcut (for example `tarikh`) and press Space to expand it; **Edit snippets…** opens the list.
 - Closing the dashboard hides it to the tray; choosing **Exit** stops the program.
 - If Windows Explorer restarts, the tray icon restores itself automatically.
