@@ -5365,6 +5365,9 @@ static void clipboard_snapshot_take(CLIPBOARD_SNAPSHOT *snapshot) {
         }
         GlobalUnlock(handle);
     }
+    /* Content held only in formats that cannot be copied (a metafile, a
+       private format): restoring "nothing" would destroy it. */
+    if (snapshot->count == 0 && CountClipboardFormats() > 0) snapshot->partial = 1;
     CloseClipboard();
 }
 
@@ -5502,6 +5505,21 @@ static int any_modifier_down(void) {
  * been copied meanwhile.
  */
 static HWND g_cleanup_target;
+
+/* The clipboard was last written by the application being cleaned up (a
+   Store app's frame and content are different processes). */
+static int clipboard_owned_by_cleanup_target(void) {
+    HWND owner = GetClipboardOwner();
+    DWORD owner_process = 0;
+    DWORD target_process = 0;
+    DWORD focus_process = 0;
+    if (!owner) return 0;
+    GetWindowThreadProcessId(owner, &owner_process);
+    GetWindowThreadProcessId(g_cleanup_target, &target_process);
+    GetWindowThreadProcessId(focused_window(g_cleanup_target), &focus_process);
+    return owner_process == target_process || owner_process == focus_process;
+}
+
 static unsigned long g_cleanup_focus_serial;
 static unsigned long g_cleanup_key_serial;
 
@@ -5545,6 +5563,10 @@ static void continue_selection_cleanup(void) {
             finish_selection_cleanup();
             return;
         }
+        /* Ctrl+C was sent. If the copy has landed, the clipboard holds the
+           selection, and that is the state the restore must replace. */
+        if (GetClipboardSequenceNumber() != g_cleanup_sequence && clipboard_owned_by_cleanup_target())
+            g_cleanup_sequence = GetClipboardSequenceNumber();
         g_cleanup_step = 4;   /* put the user's clipboard back */
     }
     switch (g_cleanup_step) {
@@ -6063,9 +6085,10 @@ static int app_state(const wchar_t **why) {
 
 static void load_tray_icons(void) {
     int size = GetSystemMetrics(SM_CXSMICON);
-    if (!g_icon_normal)
+    if (!g_icon_normal) {
         g_icon_normal = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, size, size, 0);
-    g_icon_normal_owned = g_icon_normal != NULL;
+        g_icon_normal_owned = g_icon_normal != NULL;
+    }
     /* LoadIcon returns a shared icon that must never be destroyed. */
     if (!g_icon_normal) g_icon_normal = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP));
     if (!g_icon_paused) g_icon_paused = make_grey_icon(g_icon_normal);

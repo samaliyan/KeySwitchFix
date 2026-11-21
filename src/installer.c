@@ -546,6 +546,19 @@ static void show_install_complete(HWND dialog) {
     SetFocus(GetDlgItem(dialog, IDC_INSTALL));
 }
 
+/* Esc or the close box. After a finished installation they mean Finish:
+   the copy that was closed for the update must be started again, or the
+   user is left without the program until the next sign-in. */
+static void finish_or_cancel(HWND dialog) {
+    if (!g_install_complete) {
+        EndDialog(dialog, IDCANCEL);
+        return;
+    }
+    g_launch_after_finish = g_was_running ||
+        SendDlgItemMessageW(dialog, IDC_STARTUP, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EndDialog(dialog, IDOK);
+}
+
 static INT_PTR CALLBACK installer_dialog_proc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam) {
     (void)lparam;
     switch (message) {
@@ -576,12 +589,12 @@ static INT_PTR CALLBACK installer_dialog_proc(HWND dialog, UINT message, WPARAM 
                 return TRUE;
             }
             if (LOWORD(wparam) == IDC_CANCEL || LOWORD(wparam) == IDCANCEL) {
-                EndDialog(dialog, IDCANCEL);
+                finish_or_cancel(dialog);
                 return TRUE;
             }
             break;
         case WM_CLOSE:
-            EndDialog(dialog, IDCANCEL);
+            finish_or_cancel(dialog);
             return TRUE;
     }
     return FALSE;
@@ -649,6 +662,11 @@ static void schedule_self_delete(void) {
     PROCESS_INFORMATION process;
     GetModuleFileNameW(NULL, self, MAX_PATH);
     /*
+     * The text after /C begins with a quote and holds more than two, so
+     * cmd would strip the first and the last one and run nothing. With /S
+     * and one more pair of quotes around the whole command, exactly that
+     * outer pair is stripped.
+     *
      * Resolve cmd.exe explicitly. A bare "cmd.exe" is searched starting with
      * the process directory and the current directory, so an uninstaller
      * launched from an untrusted folder could run a planted binary.
@@ -658,11 +676,11 @@ static void schedule_self_delete(void) {
     swprintf(cmd_path, MAX_PATH, L"%ls\\cmd.exe", system_directory);
     if (install_directory_is_ours())
         swprintf(command, MAX_PATH * 4,
-                 L"\"%ls\" /D /C \"%ls\\ping.exe\" 127.0.0.1 -n 3 >NUL & del /F /Q \"%ls\" & rmdir /S /Q \"%ls\"",
+                 L"\"%ls\" /D /S /C \"\"%ls\\ping.exe\" 127.0.0.1 -n 3 >NUL & del /F /Q \"%ls\" & rmdir /S /Q \"%ls\"\"",
                  cmd_path, system_directory, self, g_install_directory);
     else
         swprintf(command, MAX_PATH * 4,
-                 L"\"%ls\" /D /C \"%ls\\ping.exe\" 127.0.0.1 -n 3 >NUL & del /F /Q \"%ls\"",
+                 L"\"%ls\" /D /S /C \"\"%ls\\ping.exe\" 127.0.0.1 -n 3 >NUL & del /F /Q \"%ls\"\"",
                  cmd_path, system_directory, self);
     ZeroMemory(&startup, sizeof(startup));
     startup.cb = sizeof(startup);
