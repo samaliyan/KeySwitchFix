@@ -112,6 +112,7 @@ int ks_text_is_persian(const wchar_t *text) {
 int ks_clean_text(wchar_t *text, int letters, int digits, int punctuation) {
     int changed = 0;
     int persian;
+    int previous_latin = 0;
     wchar_t *token;
     if (!text) return 0;
     persian = ks_text_is_persian(text);
@@ -124,21 +125,32 @@ int ks_clean_text(wchar_t *text, int letters, int digits, int punctuation) {
         if (!*token) break;
         {
             int dots = 0;
+            int letters_seen = 0;
             for (end = token; *end && !is_space(*end); ++end) {
-                if (ks_is_latin_letter(*end)) latin = 1;
+                if (ks_is_latin_letter(*end)) latin = letters_seen = 1;
+                else if (ks_is_letter(*end)) letters_seen = 1;
                 else if (*end == L'.') ++dots;
-                /* Windows paths, addresses and assignments are machine
-                   text; a slash is not (1403/05/12 is a Persian date). */
-                else if (*end == L'\\' || *end == L'@' || *end == L'_' || *end == L'=') latin = 1;
+                /* Windows paths, addresses, assignments and shell or code
+                   operators are machine text; a slash is not (1403/05/12
+                   is a Persian date). */
+                else if (*end == L'\\' || *end == L'@' || *end == L'_' || *end == L'=' ||
+                         *end == L'<' || *end == L'>' || *end == L'&' || *end == L'|' ||
+                         *end == L'{' || *end == L'}') latin = 1;
             }
             /* 192.168.1.10, 1.2.3, 10.0.0.1:1521: an address or a version
                must stay pasteable, so it keeps its ASCII digits. */
             if (dots >= 2) latin = 1;
+            /* A token of symbols and digits right after Latin or machine
+               text belongs to it: `x = y ? 1 : 2;`, `ls -l 2>&1`. */
+            if (!latin && !letters_seen && previous_latin) latin = 1;
+            previous_latin = latin;
         }
         for (cursor = token; cursor < end; ++cursor) {
             wchar_t c = *cursor;
             wchar_t shaped = c;
-            if (letters) shaped = ks_persian_form(shaped);
+            /* A URL or a file name keeps its exact letters: ي and ك in
+               it address a different page or file. */
+            if (letters && !latin) shaped = ks_persian_form(shaped);
             if (!latin) {
                 shaped = ks_shape_digit(shaped, digits, persian ? KS_LANG_PERSIAN : KS_LANG_ENGLISH);
                 /* 1,000 keeps its thousands separator. */

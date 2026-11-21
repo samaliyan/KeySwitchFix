@@ -380,6 +380,10 @@ static struct { int id; const char *file; unsigned char *data; size_t size; } si
     {IDR_EN_FORMS_BLOOM, "resources/en-forms.bloom", NULL, 0},
     {IDR_FA_FORMS_BLOOM, "resources/fa-forms.bloom", NULL, 0},
     {IDR_FA_PAIRS, "resources/fa-pairs.bin", NULL, 0},
+    {IDR_EN_WIDE_BLOOM, "resources/en-wide.bloom", NULL, 0},
+    {IDR_FA_WIDE_BLOOM, "resources/fa-wide.bloom", NULL, 0},
+    {IDR_EN_WIDE_PREFIX, "resources/en-wide-prefix.bloom", NULL, 0},
+    {IDR_FA_WIDE_PREFIX, "resources/fa-wide-prefix.bloom", NULL, 0},
 };
 
 HRSRC FindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type) {
@@ -677,6 +681,9 @@ static void load_builtin(void) {
     g_extra_words.contains = extra_word_known;
     g_extra_words.has_prefix = extra_word_prefix;
     g_lexicons.extra = &g_extra_words;
+    /* As WinMain does: the forms and the wide lexicons guard the layout
+       decision too, so every scenario runs with them. */
+    load_spelling_lexicons();
 }
 
 /* ---- Scenarios ------------------------------------------------------------ */
@@ -827,32 +834,12 @@ static void spelling(void) {
     printf("Spelling with the real tables\n");
     install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
     sim_start(L"en", L"fa");
-    g_spelling_available =
-        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
-        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
-        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
-        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
+    load_spelling_lexicons();
     expect(g_spelling_available, "the spelling tables load");
-    expect(load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs), "the Persian word-pair table loads");
-    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
-    g_english_spelling.language = KS_LANG_ENGLISH;
-    g_english_spelling.ranks = &g_english_rank_table;
-    g_english_spelling.words = &g_english_bloom;
-    g_english_spelling.common = &g_english_common_bloom;
-    g_english_spelling.forms = &g_english_forms_bloom;
-    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
-    g_persian_spelling.language = KS_LANG_PERSIAN;
-    g_persian_spelling.ranks = &g_persian_rank_table;
-    g_persian_spelling.words = &g_persian_bloom;
-    g_persian_spelling.common = &g_persian_common_bloom;
-    g_persian_spelling.forms = &g_persian_forms_bloom;
+    expect(g_persian_pairs.valid, "the Persian word-pair table loads");
+    expect(g_english_wide_bloom.valid && g_persian_wide_bloom.valid, "the wide lexicons load");
+    /* The scenarios below were written for word-by-word spelling. */
     g_persian_spelling.pairs = NULL;
-    g_english_spelling.vocabulary = g_persian_spelling.vocabulary = &g_session_vocabulary;
-    g_english_spelling.personal = g_persian_spelling.personal = &g_personal_vocabulary;
-    g_english_spelling.rank_adjust = g_persian_spelling.rank_adjust = spell_rank_adjust;
-    g_english_spelling.rank_adjust_context = &g_rank_language_en;
-    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
-    g_english_spelling.pair_adjust = g_persian_spelling.pair_adjust = spell_pair_adjust;
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_vocab_reset(&g_personal_vocabulary);
@@ -1137,6 +1124,96 @@ static void spelling(void) {
     g_spelling_available = 0;
 }
 
+/* 4.3: names, brands, inflected forms and punctuation around words. */
+static void wide_lexicon(void) {
+    printf("Names, brands and punctuation (the wide lexicon)\n");
+    install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
+    sim_start(L"en", L"fa");
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    ks_vocab_reset(&g_personal_vocabulary);
+    ks_memory_reset(&g_memory);
+    g_memory_active = 0;
+    load_spelling_lexicons();
+    expect(g_lexicons.wide[KS_SLOT_A][0] && g_lexicons.wide[KS_SLOT_B][1] &&
+           g_lexicons.wide_prefixes[KS_SLOT_A] && g_english_spelling.attested,
+           "the wide lexicons are bound to the pair");
+
+    /* The reported words, and others that were rewritten before. */
+    us_keys("i use github and gemini every day ");
+    expect_screen(L"i use github and gemini every day ", "github and gemini stay");
+    screen_reset();
+    us_keys("zach works at binance with ollama and deepseek ");
+    expect_screen(L"zach works at binance with ollama and deepseek ", "names and brands stay");
+    screen_reset();
+    us_keys("we practise on the top storey ");
+    expect_screen(L"we practise on the top storey ", "British spellings stay");
+    screen_reset();
+    us_keys("this is the kavanaugh case ");
+    expect_screen(L"this is the kavanaugh case ", "a name is not converted while it is typed");
+    screen_reset();
+    us_keys("i will recieve teh letter ");
+    expect_screen(L"I will receive the letter ", "real misspellings are still fixed");
+    screen_reset();
+    /* Punctuation keys are letters on the Persian layout. */
+    us_keys("we have 12, and more ");
+    expect_screen(L"we have 12, and more ", "a comma after a number is not Persian");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("the list [high, low] is here ");
+    expect_screen(L"the list [high, low] is here ", "brackets around English words");
+    screen_reset();
+    us_keys("a sci-fi film ");
+    expect_screen(L"a sci-fi film ", "a fragment after a hyphen is left alone");
+    screen_reset();
+    /* A wrong-layout word is still repaired, also an inflected one. */
+    clear_intent();
+    sim_now += 60000;
+    us_keys("sghl ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "Persian on the US layout is still repaired");
+    /* Now on the Persian layout: words the base dictionary does not list. */
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("ravihd ");            /* قشرهای: "ravi" is an English name */
+    expect_screen(L"\u0642\u0634\u0631\u0647\u0627\u06CC ", "an inflected Persian word is not converted mid-word");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("ok; ");               /* خنک */
+    expect_screen(L"\u062E\u0646\u06A9 ", "a Persian word ending in \u06A9 is not English plus a semicolon");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("cold ");              /* زخمی, a common word; cold is frequent */
+    expect_screen(L"\u0632\u062E\u0645\u06CC ", "a common Persian word does not become a frequent English one");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("hdk d; ;jhf nv fhvi Kaivnhvd");
+    press(0x26, 1);                /* Shift+L: the closing guillemet */
+    us_keys(" hsj ");
+    expect_screen(L"\u0627\u06CC\u0646 \u06CC\u06A9 \u06A9\u062A\u0627\u0628 \u062F\u0631 \u0628\u0627\u0631\u0647 "
+                  L"\u00BB\u0634\u0647\u0631\u062F\u0627\u0631\u06CC\u00AB \u0627\u0633\u062A ",
+                  "guillemets around a Persian word");
+    /* A layout chosen by hand is kept for a word that is a word in it. */
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    user_switch(0x04090409u);
+    hook_event(VK_LMENU, 0x38, WM_SYSKEYDOWN);
+    hook_event(VK_LSHIFT, 0x2A, WM_KEYDOWN);
+    hook_event(VK_LSHIFT, 0x2A, WM_KEYUP);
+    hook_event(VK_LMENU, 0x38, WM_KEYUP);
+    us_keys("leg ");
+    expect_screen(L"leg ", "after a manual switch a collision is not flipped back");
+    screen_reset();
+    us_keys("sghl ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "but a wrong-layout word still is repaired");
+    user_switch(0x04090409u);
+}
+
 static void late_switch(void) {
     printf("Applications that switch late (en / fa)\n");
     install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
@@ -1310,6 +1387,7 @@ int main(void) {
     missing_pack();
     late_switch();
     spelling();
+    wide_lexicon();
     sim_packs[3] = L"ar.kslang";
     sim_packs[4] = L"fr.kslang";
     sim_pack_count = 5;   /* pack_added_later() starts from the first three */

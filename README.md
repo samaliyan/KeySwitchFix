@@ -28,6 +28,14 @@ between any two of 16 languages you pick on the dashboard (see
 
 Detection is confidence-based: the intended word must exist in the opposite-language dictionary while the text produced by the active layout must not. Proper-prefix guards prevent valid words from being changed while they are still being typed. Unambiguous mistakes are corrected immediately; ambiguous matches are checked after an adaptive typing pause or at Space, Enter, or Tab.
 
+Version 4.3 knows far more words. Names, brands and everyday words that no
+dictionary lists (`github`, `gemini`, `binance`, `zach`, `practise`,
+`دیجیکالا`) are kept exactly as typed instead of being "corrected" or turned
+into the other language: a wide lexicon of 158,000 English and 26,000
+Persian tokens stands behind the dictionaries. Add your own in
+`tools/lexicon/`, or simply press Backspace after a change to keep your
+spelling for good.
+
 Version 4.0 lets you choose the **two languages** you switch between: English,
 Persian, Arabic, Bulgarian, Dutch, French, German, Greek, Hebrew, Italian,
 Polish, Portuguese, Russian, Spanish, Turkish or Ukrainian, in any

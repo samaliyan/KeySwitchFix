@@ -436,19 +436,48 @@ int ks_text_known(const wchar_t *text, KS_LANGUAGE language,
    around a word: an opening quote, and a closing quote, comma or semicolon
    (`'file'` → file, `no,` → no). Those keys are letters in some layouts
    (Persian گ ک و, Russian э ж б), so the other reading wins unopposed unless
-   the word between them decides. Brackets are not stripped: ] and [ are the
-   Persian letters چ and ج, which end common words (هیچ is typed id]).
+   the word between them decides. The same goes for brackets and the marks
+   a layout types with Shift on a letter key (Persian « » on K and L):
+   `[high,` is high and «شهرداری» is شهرداری.
    Returns the core's length; target may be the source. */
+/* Either guillemet may open: the Persian keyboard types » first. */
+static int opening_mark(wchar_t c) {
+    return c == L'\'' || c == L'"' || c == L'(' || c == L'[' || c == L'{' ||
+           c == 0x00AB || c == 0x00BB || c == 0x201C || c == 0x2018;
+}
+
+static int closing_mark(wchar_t c) {
+    return c == L'\'' || c == L'"' || c == L',' || c == L';' || c == L'.' ||
+           c == L')' || c == L']' || c == L'}' || c == L':' || c == L'!' || c == L'?' ||
+           c == 0x00BB || c == 0x00AB || c == 0x201D || c == 0x2019 ||
+           c == 0x060C || c == 0x061B || c == 0x061F;
+}
+
 static size_t punctuation_core(const wchar_t *source, wchar_t *target) {
     size_t start = 0;
     size_t end = wcslen(source);
-    while (start < end && (source[start] == L'\'' || source[start] == L'"')) ++start;
+    int bracket = 0;
+    while (start < end && opening_mark(source[start])) {
+        if (source[start] == L'[') bracket = 1;
+        ++start;
+    }
     /* A full stop at the end, too: in a pair where that key is a letter of
        the other language (Russian ю), "it." is one token, and the English
        reading must still count as "it". */
-    while (end > start && (source[end - 1] == L'\'' || source[end - 1] == L'"' ||
-                           source[end - 1] == L',' || source[end - 1] == L';' ||
-                           source[end - 1] == L'.')) --end;
+    while (end > start && closing_mark(source[end - 1])) {
+        if (source[end - 1] == L']') bracket = 1;
+        --end;
+    }
+    /* The square brackets are the Persian letters ج and چ. Around one or
+       two letters they are more likely those (`id]` is هیچ, `[hk` is جان). */
+    if (bracket && end - start < 3) {
+        start = 0;
+        end = wcslen(source);
+        while (start < end && (source[start] == L'\'' || source[start] == L'"')) ++start;
+        while (end > start && (source[end - 1] == L'\'' || source[end - 1] == L'"' ||
+                               source[end - 1] == L',' || source[end - 1] == L';' ||
+                               source[end - 1] == L'.')) --end;
+    }
     memmove(target, source + start, (end - start) * sizeof(wchar_t));
     target[end - start] = 0;
     return end - start;
@@ -476,11 +505,12 @@ int ks_word_membership(const KS_TOKEN *tokens, int count,
    decided it (the punctuation core when that is what was known). */
 static void classify_reading(const KS_TOKEN *tokens, int count, KS_SLOT slot,
                              const KS_LEXICONS *lexicons, int *known, int *frequent,
-                             wchar_t *form) {
+                             wchar_t *form, int *through_core) {
     const KS_LANG_PROFILE *profile = slot_profile(lexicons, slot);
     wchar_t reading[KS_MAX_WORD + 1];
     int length;
     int extra = 0;
+    if (through_core) *through_core = 0;
     ks_tokens_to_slot(tokens, count, slot, reading);
     length = ks_lookup_form(profile, reading, form);
     *known = length > 0 && form_known(profile, form, length, lexicons->words[slot], lexicons->common[slot]);
@@ -499,6 +529,7 @@ static void classify_reading(const KS_TOKEN *tokens, int count, KS_SLOT slot,
                 form_known(profile, core_form, core_form_length,
                            lexicons->words[slot], lexicons->common[slot])) {
                 *known = 1;
+                if (through_core) *through_core = 1;
                 wcscpy(form, core_form);
                 length = core_form_length;
             }
@@ -529,8 +560,8 @@ int ks_classify_word(const KS_TOKEN *tokens, int count,
     if (!frequent) frequent = unused;   /* the caller needs only `known` */
     if (!tokens || !lexicons || !known || count < 1 || count > KS_MAX_WORD) return 0;
     known[0] = frequent[0] = 0;
-    classify_reading(tokens, count, KS_SLOT_A, lexicons, &known[KS_SLOT_A], &frequent[KS_SLOT_A], form);
-    classify_reading(tokens, count, KS_SLOT_B, lexicons, &known[KS_SLOT_B], &frequent[KS_SLOT_B], form);
+    classify_reading(tokens, count, KS_SLOT_A, lexicons, &known[KS_SLOT_A], &frequent[KS_SLOT_A], form, NULL);
+    classify_reading(tokens, count, KS_SLOT_B, lexicons, &known[KS_SLOT_B], &frequent[KS_SLOT_B], form, NULL);
     return 1;
 }
 
@@ -715,7 +746,8 @@ static void prefix_form(const KS_LANG_PROFILE *profile, const wchar_t *reading, 
     output[length] = 0;
 }
 
-/* The target reading is among the 20,000 common words of its language. */
+/* The reading of the keys in `target_slot` is among the 20,000 common
+   words of its language. */
 static int target_is_common(const KS_TOKEN *tokens, int count, KS_SLOT target_slot,
                             const KS_LEXICONS *lexicons) {
     wchar_t word[KS_MAX_WORD + 1];
@@ -725,6 +757,61 @@ static int target_is_common(const KS_TOKEN *tokens, int count, KS_SLOT target_sl
     ks_tokens_to_slot(tokens, count, target_slot, word);
     prefix_form(slot_profile(lexicons, target_slot), word, normal);
     return ks_bloom_contains(common, normal);
+}
+
+static int wide_contains(const KS_LEXICONS *lexicons, KS_SLOT slot, const wchar_t *form) {
+    return ks_bloom_contains(lexicons->wide[slot][0], form) ||
+           ks_bloom_contains(lexicons->wide[slot][1], form);
+}
+
+/*
+ * The reading is a token the wide lexicon attests: a name, a brand, an
+ * abbreviation, an inflected form (zach, kaggle, قشرهای). Not a dictionary
+ * word, so it proves nothing about the layout, but the user may well have
+ * meant exactly this.
+ */
+static int reading_is_wide(const KS_TOKEN *tokens, int count, KS_SLOT slot,
+                           const KS_LEXICONS *lexicons) {
+    const KS_LANG_PROFILE *profile = slot_profile(lexicons, slot);
+    wchar_t reading[KS_MAX_WORD + 1];
+    wchar_t core[KS_MAX_WORD + 1];
+    wchar_t form[KS_MAX_WORD + 1];
+    if (count < 3 || (!lexicons->wide[slot][0] && !lexicons->wide[slot][1])) return 0;
+    ks_tokens_to_slot(tokens, count, slot, reading);
+    if (ks_lookup_form(profile, reading, form) >= 3 && wide_contains(lexicons, slot, form)) return 1;
+    if (punctuation_core(reading, core) >= 3 && wcscmp(core, reading) != 0 &&
+        ks_lookup_form(profile, core, form) >= 3 && wide_contains(lexicons, slot, form))
+        return 1;
+    return 0;
+}
+
+/*
+ * The keys so far are a word of the layout in use followed by one to four
+ * more letters: an ending the dictionary does not list (قشر + های) or a
+ * longer word in the making. Only the finished word can be judged.
+ */
+static int known_stem_continues(const KS_TOKEN *tokens, int count, KS_SLOT slot,
+                                const KS_LEXICONS *lexicons) {
+    const KS_LANG_PROFILE *profile = slot_profile(lexicons, slot);
+    wchar_t reading[KS_MAX_WORD + 1];
+    wchar_t form[KS_MAX_WORD + 1];
+    int stem;
+    for (stem = count - 1; stem >= 3 && stem >= count - 4; --stem) {
+        int length;
+        ks_tokens_to_slot(tokens, stem, slot, reading);
+        length = ks_lookup_form(profile, reading, form);
+        if (length >= 3 && form_known(profile, form, length, lexicons->words[slot], lexicons->common[slot]))
+            return 1;
+    }
+    return 0;
+}
+
+/* Every character of the reading is a letter (no ; , ' keys: `;i` and `v,`
+   cannot be abbreviations). */
+static int reading_all_letters(const wchar_t *reading) {
+    for (; *reading; ++reading)
+        if (!ks_is_letter(*reading)) return 0;
+    return 1;
 }
 
 /* The active reading is a vocabulary-pack or writing-memory word. */
@@ -785,6 +872,9 @@ KS_LIVE_RESULT ks_evaluate_contextual(
     int explicit_preference;
     int active_frequent;
     int target_frequent;
+    int through_core[3] = {0, 0, 0};
+    int target_common;
+    int defer_live = 0;
 
     if (!decision) return KS_LIVE_NONE;
     memset(decision, 0, sizeof(*decision));
@@ -800,10 +890,42 @@ KS_LIVE_RESULT ks_evaluate_contextual(
         ks_tokens_to_b(tokens, count, other);
         if (wcscmp(reading, other) == 0) return KS_LIVE_NONE;
     }
-    if (!ks_classify_word(tokens, count, lexicons, known, frequent))
-        return KS_LIVE_NONE;
+    {
+        wchar_t form[KS_MAX_WORD + 1];
+        known[0] = frequent[0] = 0;
+        classify_reading(tokens, count, KS_SLOT_A, lexicons, &known[KS_SLOT_A], &frequent[KS_SLOT_A],
+                         form, &through_core[KS_SLOT_A]);
+        classify_reading(tokens, count, KS_SLOT_B, lexicons, &known[KS_SLOT_B], &frequent[KS_SLOT_B],
+                         form, &through_core[KS_SLOT_B]);
+    }
 
     target_slot = KS_OTHER_SLOT(active_slot);
+    /*
+     * An inflected form the target dictionary only implies (hordes,
+     * مخالفم) is a word too: a finished token of four keys or more that is
+     * nothing in the layout in use is repaired to it. Corpus-attested
+     * names (wide[..][0]) are deliberately not evidence for a change.
+     */
+    if (!known[target_slot] && !known[active_slot] && phase == KS_PHASE_BOUNDARY && count >= 4 &&
+        lexicons->wide[target_slot][1]) {
+        wchar_t other_reading[KS_MAX_WORD + 1];
+        wchar_t other_form[KS_MAX_WORD + 1];
+        ks_tokens_to_slot(tokens, count, target_slot, other_reading);
+        if (ks_lookup_form(slot_profile(lexicons, target_slot), other_reading, other_form) >= 4 &&
+            ks_bloom_contains(lexicons->wide[target_slot][1], other_form))
+            known[target_slot] = 1;
+    }
+    /*
+     * A word of the other layout with punctuation at its edge ("no," typed
+     * as دخو) is evidence only for a finished token that is nothing in the
+     * layout in use. Persian words end in و ک گ, the keys of , ; ': while
+     * مهمون is being typed it reads "lil," and خنک reads "ok;", and those
+     * must never count as English words, let alone frequent ones.
+     */
+    if (through_core[target_slot]) {
+        if (phase != KS_PHASE_BOUNDARY || known[active_slot]) return KS_LIVE_NONE;
+        frequent[target_slot] = 0;
+    }
     active_profile = slot_profile(lexicons, active_slot);
     active_known = known[active_slot];
     target_known = known[target_slot];
@@ -826,13 +948,33 @@ KS_LIVE_RESULT ks_evaluate_contextual(
          * target waits for the end of the word instead of being rewritten
          * while the user may still be typing mkdir or srv.
          */
+        ks_tokens_to_slot(tokens, count, active_slot, reading);
+        target_common = target_frequent || target_is_common(tokens, count, target_slot, lexicons);
+        /* A reading with a punctuation key in it (`;i` که, `v,` رو) is no
+           abbreviation. */
         if ((count == 2 || (count == 3 && !target_frequent)) &&
-            (active_profile->flags & KS_PROFILE_LATIN) && context_slot == active_slot &&
+            (active_profile->flags & KS_PROFILE_LATIN) &&
+            reading_all_letters(reading) && context_slot == active_slot &&
             context_strength >= 3 && context_strength < 5)
             return KS_LIVE_NONE;
-        if (count <= 3 && !target_frequent && phase != KS_PHASE_BOUNDARY &&
-            !target_is_common(tokens, count, target_slot, lexicons))
+        if (count <= 3 && !target_frequent && phase != KS_PHASE_BOUNDARY && !target_common)
             return KS_LIVE_NONE;
+        /*
+         * What was typed is no dictionary word, but the wide lexicon
+         * attests it: a name, a brand, an abbreviation, an inflected form
+         * (kahn, lpg, قشرهای). It yields only to an everyday word of the
+         * other layout, and inside a sentence of its own language only to
+         * one of the 2,000 most frequent (short attested tokens are too
+         * many to let them stop است or این from being repaired).
+         */
+        if (reading_is_wide(tokens, count, active_slot, lexicons)) {
+            if (!target_common) return KS_LIVE_NONE;
+            if (!target_frequent && context_slot == active_slot && context_strength >= 2 &&
+                context_strength < 5)
+                return KS_LIVE_NONE;
+        }
+        /* A rare target can wait for the pause or the end of the word. */
+        if (!target_common) defer_live = 1;
         confidence = 90;
         if (count >= 5) confidence += 10;
         else if (count >= 3) confidence += 5;
@@ -867,10 +1009,18 @@ KS_LIVE_RESULT ks_evaluate_contextual(
                 evidence += support;
             } else if (context_slot == active_slot)
                 evidence -= context_strength * 30;
-            if (target_frequent && !active_frequent)
-                evidence += 45;
-            else if (active_frequent && !target_frequent)
-                evidence -= 45;
+            /*
+             * Frequency tiers. Two keys carry too little to be guessed
+             * from frequency at all (شه is not "ai"), and a common word of
+             * the layout in use (زخمی, سعد) does not become a frequent word
+             * of the other one (cold, sun) on frequency alone.
+             */
+            if (count > 2) {
+                if (target_frequent && !active_frequent)
+                    evidence += target_is_common(tokens, count, active_slot, lexicons) ? 20 : 45;
+                else if (active_frequent && !target_frequent)
+                    evidence -= 45;
+            }
 
             prior = collision_prior_for(tokens, count, target_slot, lexicons);
             /* A pack or memory word is the user's own vocabulary: corpus
@@ -920,9 +1070,14 @@ KS_LIVE_RESULT ks_evaluate_contextual(
        quote, fewer than three letters say too little to act on before the
        word is finished. */
     {
-        int opening_quote = active_word[0] == L'\'' || active_word[0] == L'"';
-        size_t core_length = punctuation_core(active_word, active_word);
-        if (opening_quote && core_length < 3) return KS_LIVE_NONE;
+        size_t marks = 0;
+        size_t letters;
+        while (opening_mark(active_word[marks])) ++marks;
+        letters = wcslen(active_word) - marks;
+        punctuation_core(active_word, active_word);
+        /* The same behind a bracket: `[hi` may become [high, and is جاه
+           only once the word ends there. */
+        if (marks && letters < 3) return KS_LIVE_NONE;
     }
     active_is_prefix = ks_bloom_contains(lexicons->prefixes[active_slot], active_word);
     /* "kuber" on the English layout is the start of "kubernetes": the
@@ -933,6 +1088,14 @@ KS_LIVE_RESULT ks_evaluate_contextual(
        protected at a pause too, like common words. */
     if (lexicons->extra && lexicons->extra->has_prefix &&
         lexicons->extra->has_prefix(lexicons->extra->context, active_slot, active_word)) {
+        active_is_prefix = 1;
+        active_is_common_prefix = 1;
+    }
+    /* So do the beginnings of wide-lexicon tokens (kav… of kavanaugh), and
+       a word of the layout in use that is being continued (قشر + های). */
+    if (!active_known &&
+        (ks_bloom_contains(lexicons->wide_prefixes[active_slot], active_word) ||
+         known_stem_continues(tokens, count, active_slot, lexicons))) {
         active_is_prefix = 1;
         active_is_common_prefix = 1;
     }
@@ -949,10 +1112,13 @@ KS_LIVE_RESULT ks_evaluate_contextual(
     if (phase == KS_PHASE_LIVE) {
         if (active_known && context_slot == target_slot &&
             context_strength >= 4) return KS_LIVE_CORRECT_NOW;
-        if (active_is_prefix) return KS_LIVE_WAIT_FOR_IDLE;
+        if (active_is_prefix || active_is_common_prefix || defer_live) return KS_LIVE_WAIT_FOR_IDLE;
         return KS_LIVE_CORRECT_NOW;
     }
-    if (!active_known && active_is_common_prefix)
+    /* At a pause the beginning of a common word still waits, and the
+       beginning of any dictionary word waits unless the target is an
+       everyday word (jugg… of juggling is not تعلل). */
+    if (!active_known && (active_is_common_prefix || (active_is_prefix && !target_frequent)))
         return KS_LIVE_WAIT_FOR_IDLE;
     return KS_LIVE_CORRECT_NOW;
 }

@@ -80,6 +80,11 @@ typedef struct KS_SPELL_LEXICON {
     /* Optional: every inflected form the dictionary's affix rules allow
        (hordes, certifies, مخالفم): valid words that are not stems. */
     const KS_BLOOM *forms;
+    /* Optional (4.3): the wide lexicon. Tokens a large corpus attests
+       that no dictionary lists: names, brands, places, abbreviations,
+       variant spellings (zach, binance, practise). Such a token is left
+       exactly as typed; it is never offered as a repair either. */
+    const KS_BLOOM *attested;
     /* Optional (4.2): word pairs and how much more often the second word
        follows the first than chance (10 x PMI, 0..60), a KSRT table keyed
        by "first second". Lets the words around a typo choose the repair. */

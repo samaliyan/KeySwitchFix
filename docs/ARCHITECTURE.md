@@ -166,6 +166,29 @@ the previous engine, and the application by typing 3,000 random mixed
 sentences through the hook of both versions in the simulation
 (`tests/app_sim.c` holds the scenarios that are kept).
 
+## The wide lexicon (4.3)
+
+The base dictionaries decide what is evidence FOR a layout change. The wide
+lexicon (`KS_LEXICONS.wide`, `wide_prefixes`) only protects what was typed
+in the layout in use: tokens a large corpus attests and no dictionary lists
+(names, brands, abbreviations), and the inflected forms the dictionary
+implies (the word-form Blooms).
+
+- A finished token that is no dictionary word but is in the wide lexicon
+  yields only to one of the 20,000 common words of the other layout, and
+  inside a sentence of its own language only to one of the 2,000 most
+  frequent.
+- While a word is being typed, the beginning of a wide token, or a
+  dictionary word followed by up to four more letters (قشر + های), waits
+  for the end of the word.
+- A target reading counts through its punctuation core (`no,`) only for a
+  finished token that is nothing in the layout in use.
+- An inflected form of the target language is a repair target at a word
+  boundary (four keys or more). Corpus-attested names never are.
+
+Spelling uses the same Bloom as `KS_SPELL_LEXICON.attested`: such a token
+is left as typed (see [Spelling](SPELLING.md)).
+
 ## Components
 
 | Component | Responsibility |
@@ -177,6 +200,7 @@ sentences through the hook of both versions in the simulation
 | `resources/*.bloom` | compact offline base, common-word, and proper-prefix membership resources |
 | `tools/generate_blooms.py` | reproducible dictionary normalization and Bloom-resource generation |
 | `tools/generate_rank_tables.py` | wordfreq-derived KSRT frequency tables for spelling correction |
+| `tools/generate_wide_lexicon.py` | the wide lexicons (`*-wide.bloom`, `*-wide-prefix.bloom`) from wordfreq and `tools/lexicon/` |
 | `tools/generate_form_blooms.py` | Hunspell affix expansion into the word-form Blooms (`en-forms.bloom`, `fa-forms.bloom`) |
 | `tools/make_spell_eval.py` | the fixed spelling evaluation set `tests/fixtures/spell-eval.tsv` |
 | `tools/count_word_pairs.py`, `tools/generate_pair_table.py` | Persian word pairs from Wikipedia into `resources/fa-pairs.bin` (spelling in context) |

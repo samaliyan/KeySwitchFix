@@ -1015,6 +1015,14 @@ int ks_spell_correct_in_context(const wchar_t *word, const wchar_t *before, cons
         return 1;
     }
 
+    /*
+     * Not a dictionary word, but a token real text contains: a name, a
+     * brand, an abbreviation (zach, binance, kaggle). The nearest
+     * dictionary word is not what the user meant. Corpus misspellings
+     * (recieve, teh) are kept out of this lexicon when it is built.
+     */
+    if (lexicon->attested && length >= 3 && ks_bloom_contains(lexicon->attested, word)) return 0;
+
     enumerate_candidates(&search);
     enumerate_joins(&search);
     if (!convincing(&search, &policy, length, &runner_up_score) &&

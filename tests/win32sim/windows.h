@@ -493,6 +493,7 @@ typedef size_t SIZE_T;
 #define CF_PRIVATEFIRST 0x200
 #define CF_GDIOBJLAST 0x3FF
 UINT EnumClipboardFormats(UINT);
+int CountClipboardFormats(void);
 SIZE_T GlobalSize(HANDLE);
 void Sleep(DWORD);
 #define WM_QUERYENDSESSION 0x11

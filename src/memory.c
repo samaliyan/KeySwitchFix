@@ -362,11 +362,19 @@ static int add_fix_count(KS_WRITING_MEMORY *memory, const wchar_t *typo, const w
         return entry->count;
     }
     if (memory->fix_count >= KS_MEMORY_FIXES) {
-        int weakest = 0;
+        /* The weakest entry goes, looking from where the last one was
+           replaced: among equals the oldest goes first. (Always taking the
+           first weakest slot made every new repair evict the one before
+           it, so a full table never learned anything again.) */
+        int start = memory->fix_cursor % memory->fix_count;
+        int weakest = start;
         int i;
-        for (i = 1; i < memory->fix_count; ++i)
-            if (memory->fixes[i].count < memory->fixes[weakest].count) weakest = i;
+        for (i = 1; i < memory->fix_count; ++i) {
+            int at = (start + i) % memory->fix_count;
+            if (memory->fixes[at].count < memory->fixes[weakest].count) weakest = at;
+        }
         index = weakest;
+        memory->fix_cursor = (weakest + 1) % memory->fix_count;
     } else {
         index = memory->fix_count++;
     }

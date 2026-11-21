@@ -2,6 +2,82 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [4.3.0] - 2026-11-21
+
+Correctly typed words are left alone: names, brands and everyday words no
+dictionary lists are no longer "corrected" or turned into the other
+language. The result of a full independent review of the program.
+
+### A much larger vocabulary
+
+- **Names, brands and new words stay as typed.** Before, a word that was in
+  no dictionary was treated as a typo of the nearest dictionary word:
+  `zach` → `each`, `binance` → `finance`, `ollama` → `llama`, `practise` →
+  `practice`, `deepseek` → `deep seek`. A new *wide lexicon* of 158,000
+  English tokens that real text contains (wordfreq, one use in 30 million
+  words or more) and 26,000 Persian ones now marks them as words. Typing the
+  80,000 most frequent English words through the hook changed 4,937 of them
+  (6.2 %) in 4.2 and changes 454 (0.6 %) now; of those, the spelling
+  changes are almost all real misspellings (`recieve`, `teh`,
+  `definately`), which are still fixed. On the fixed evaluation set the
+  typos fixed are unchanged (82 % at Balanced) and the valid corpus words
+  changed fell from 2.6 % to 0 %.
+- **Curated lists** in `tools/lexicon/`: 1,100 products, tools, companies
+  and Persian names in Latin letters (`chatgpt`, `supabase`, `digikala`,
+  `rezaei`), 900 Persian loanwords, brands, names, cities and colloquial
+  spellings (`گیتهاب`, `دیجیکالا`, `بعدن`), and the classic English
+  misspellings that must stay repairable. Add your own words there and
+  rebuild.
+- **The layout decision uses it too.** A name or an inflected form typed in
+  the right layout is no longer converted because the other layout's
+  reading happens to be a word, and never while it is still being typed:
+  `kavanaugh` (was `نشرشدشعلا`), `قشرهای` (was `ravihd`), `بمعنای`.
+  Inflected forms the dictionary implies (`hordes`, `مخالفم`) are repair
+  targets at the end of a word.
+
+### Layout detection
+
+- Persian words ending in `و` `ک` `گ` are no longer read as an English word
+  plus `,` `;` `'` (`خنک` → `ok;`, `مهمون` → `lil,`).
+- A common word of the layout in use does not become a frequent word of the
+  other one on frequency alone (`زخمی` → `cold`, `سعد` → `sun`); two-key
+  words are never guessed from frequency.
+- Punctuation typed with letter keys no longer breaks the word next to it:
+  Persian `«شهرداری»`, English `[high, low]`, `12, and`, `sci-fi`.
+- A layout switched by hand is kept for a word that is a word in it (`leg`,
+  `sms` are not flipped back to Persian).
+- The beginning of a common word waits instead of being converted mid-word
+  (`lockd`…, `jugg`…); a rare target waits for a pause or the end of the
+  word.
+- Media keys (Play, Volume) are no longer counted as the letters whose scan
+  codes they share.
+- After Undo, `?` and `,` are shaped for the restored word's language.
+
+### Fixes
+
+- **Uninstall** left the program folder behind: the self-delete command was
+  quoted in a way `cmd` could not run.
+- **Setup** closed with Esc or the close box after installing did not start
+  the new version, leaving the updated program closed.
+- **Clean-up (Ctrl+Win+X)**: a cancelled clean-up could leave the selection
+  on the clipboard instead of your content; a clipboard holding only a
+  metafile was emptied; letters inside URLs and file names are no longer
+  changed (`ي` in a link), nor are code operators in Persian text
+  (`x = y ? 1 : 2;`).
+- **Writing memory**: once 512 repairs were learned, every new one replaced
+  the one before it, so nothing new was learned; a file that could not be
+  read was treated as empty and could be overwritten.
+- The tray icon handle could be destroyed although Windows owns it.
+
+### Data and build
+
+- `tools/generate_wide_lexicon.py` builds `resources/*-wide*.bloom` from
+  wordfreq 3.1.1 and `tools/lexicon/` (0.6 MB in the program; build
+  products like the rank tables). `docs/SPELLING.md` describes the rules.
+- New regression corpora (`tests/corpus/english-names.txt`,
+  `persian-forms.txt`), spelling checks for names and attested
+  misspellings, and a hook simulation of the cases above.
+
 ## [4.2.0] - 2026-10-14
 
 Spelling reads the words around a typo, not only the typo itself.

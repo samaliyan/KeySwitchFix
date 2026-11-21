@@ -22,7 +22,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.2.0"
+#define APP_VERSION L"4.3.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -334,6 +334,14 @@ static DWORD g_last_word_at;
    sits in prose, not after "(" or "=". */
 static int g_previous_key_boundary;
 static int g_word_after_boundary;
+/* The key before this word was a hyphen, a digit or other punctuation
+   typed straight after text (sci-fi, 3rd, v2beta): the word is a fragment
+   of a larger token, and three letters of it say nothing about the layout. */
+static int g_previous_key_joined;
+static int g_word_fragment;
+/* The user switched the layout by hand: the next word is typed in the
+   layout they chose, on purpose. */
+static int g_manual_switch;
 /* The first letter of the current word was capitalised by the hook. */
 static int g_word_auto_capitalized;
 /* Ctrl+Win+X clean-up of the selection: a small state machine driven by
@@ -441,6 +449,13 @@ static KS_BLOOM g_persian_common_bloom;
 /* Every inflected form the dictionaries allow (spelling only). */
 static KS_BLOOM g_english_forms_bloom;
 static KS_BLOOM g_persian_forms_bloom;
+/* The wide lexicons (4.3): names, brands, abbreviations and other tokens
+   real text contains but no dictionary lists, and their beginnings. They
+   protect what the user typed; they are never a reason to change it. */
+static KS_BLOOM g_english_wide_bloom;
+static KS_BLOOM g_persian_wide_bloom;
+static KS_BLOOM g_english_wide_prefix_bloom;
+static KS_BLOOM g_persian_wide_prefix_bloom;
 /* Persian word pairs (4.2): the words around a typo help choose its repair. */
 static KS_RANK_TABLE g_persian_pairs;
 /* The word a spelling fix just typed: the context of the next word, since
@@ -886,7 +901,13 @@ static wchar_t *read_text_file(const wchar_t *path, FILETIME *written) {
         CloseHandle(file);
         return NULL;
     }
-    if (size && !ReadFile(file, bytes, size, &read, NULL)) read = 0;
+    if (size && (!ReadFile(file, bytes, size, &read, NULL) || read != size)) {
+        /* A failed read is not an empty file: the caller must keep what it
+           has rather than save an empty list over the user's data. */
+        CloseHandle(file);
+        HeapFree(GetProcessHeap(), 0, bytes);
+        return NULL;
+    }
     CloseHandle(file);
     bytes[read] = 0;
     bytes[read + 1] = 0;
@@ -1431,6 +1452,9 @@ static void store_pending_word(HWND window, const KS_TOKEN *tokens, int count,
     g_pending_word_window = window;
 }
 
+static void tokens_to_language(const KS_TOKEN *tokens, int count,
+                               KS_SLOT language, wchar_t *output);
+
 static void history_push(HWND window, const KS_TOKEN *tokens, int count,
                          KS_SLOT visible_language, UINT delimiter,
                          int delimiter_zwnj) {
@@ -1442,6 +1466,19 @@ static void history_push(HWND window, const KS_TOKEN *tokens, int count,
         return;
     }
     if (g_history_overflowed) return;
+    {
+        /* A token with no letter in it ("," between "12" and "and") is
+           punctuation, not a word of a sentence in the other language: it
+           ends the run that phrase repair may rewrite. */
+        wchar_t visible[KS_MAX_WORD + 1];
+        const wchar_t *cursor;
+        tokens_to_language(tokens, count, visible_language, visible);
+        for (cursor = visible; *cursor && !ks_is_letter(*cursor); ++cursor) {}
+        if (!*cursor) {
+            clear_history();
+            return;
+        }
+    }
     if (g_history_window != window) {
         clear_history();
         g_history_window = window;
@@ -1893,18 +1930,26 @@ static void bind_slot_lexicons(KS_SLOT slot) {
         g_lexicons.prefixes[slot] = &state->pack.prefixes;
         g_lexicons.common_prefixes[slot] =
             state->pack.common_prefixes.valid ? &state->pack.common_prefixes : NULL;
+        g_lexicons.wide[slot][0] = g_lexicons.wide[slot][1] = NULL;
+        g_lexicons.wide_prefixes[slot] = NULL;
     } else if (state->profile && state->profile->model == KS_LANG_PERSIAN) {
         g_lexicons.words[slot] = &g_persian_bloom;
         g_lexicons.common[slot] = &g_persian_common_bloom;
         g_lexicons.frequent[slot] = &g_persian_frequent_bloom;
         g_lexicons.prefixes[slot] = &g_persian_prefix_bloom;
         g_lexicons.common_prefixes[slot] = &g_persian_common_prefix_bloom;
+        g_lexicons.wide[slot][0] = g_persian_wide_bloom.valid ? &g_persian_wide_bloom : NULL;
+        g_lexicons.wide[slot][1] = g_persian_forms_bloom.valid ? &g_persian_forms_bloom : NULL;
+        g_lexicons.wide_prefixes[slot] = g_persian_wide_prefix_bloom.valid ? &g_persian_wide_prefix_bloom : NULL;
     } else {
         g_lexicons.words[slot] = &g_english_bloom;
         g_lexicons.common[slot] = &g_english_common_bloom;
         g_lexicons.frequent[slot] = &g_english_frequent_bloom;
         g_lexicons.prefixes[slot] = &g_english_prefix_bloom;
         g_lexicons.common_prefixes[slot] = &g_english_common_prefix_bloom;
+        g_lexicons.wide[slot][0] = g_english_wide_bloom.valid ? &g_english_wide_bloom : NULL;
+        g_lexicons.wide[slot][1] = g_english_forms_bloom.valid ? &g_english_forms_bloom : NULL;
+        g_lexicons.wide_prefixes[slot] = g_english_wide_prefix_bloom.valid ? &g_english_wide_prefix_bloom : NULL;
     }
     g_lexicons.profile[slot] = state->profile;
 }
@@ -1974,6 +2019,7 @@ static void release_language_pair(void) {
     for (slot = KS_SLOT_A; slot <= KS_SLOT_B; ++slot) {
         g_lexicons.words[slot] = g_lexicons.common[slot] = g_lexicons.frequent[slot] = NULL;
         g_lexicons.prefixes[slot] = g_lexicons.common_prefixes[slot] = NULL;
+        g_lexicons.wide[slot][0] = g_lexicons.wide[slot][1] = g_lexicons.wide_prefixes[slot] = NULL;
         if (g_slots[slot].pack_data) HeapFree(GetProcessHeap(), 0, g_slots[slot].pack_data);
         g_slots[slot].pack_data = NULL;
     }
@@ -3959,6 +4005,9 @@ static int try_undo(int consume_delimiter) {
         }
         clear_intent();
         remember_intent(foreground, g_undo.source_language, 4);
+        /* The word on screen is the original again: "?" and "," after it
+           are shaped for its language, not for the one just taken back. */
+        remember_corrected_word(foreground, g_undo.source_language);
         mark_sentence_word(foreground);
         clear_history();
         g_undo.valid = 0;
@@ -4427,6 +4476,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             clear_intent();
             clear_history();
             forget_layout_request();
+            g_manual_switch = 1;
         }
         return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
     }
@@ -4450,7 +4500,12 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
     if (data->vkCode == VK_SPACE && g_windows_down) {
         clear_intent();
         forget_layout_request();
+        g_manual_switch = 1;
     }
+    /* Media, browser and launcher keys share scan codes with letters (Play
+       is 0x22 like G, Volume Down 0x2E like C). They type nothing. */
+    if (data->vkCode >= 0xA6 && data->vkCode <= 0xB7)
+        return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
 
     if (data->vkCode == VK_BACK && !shortcut_modifier_down() &&
         g_undo.valid && GetForegroundWindow() == g_undo.window &&
@@ -4624,6 +4679,13 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
      * boundary exactly like Shift+Space, not part of the word.
      */
     mapped = map_physical_key(data->scanCode, shift, caps, &token);
+    if (g_manual_switch && mapped > 0 && !translate) {
+        /* A layout chosen by hand is mild evidence for itself: a word that
+           is a word in it (leg, sms) is not flipped back. A word that is
+           nothing in it is still repaired. */
+        g_manual_switch = 0;
+        remember_intent(foreground, language, 2);
+    }
     if (mapped < 0) {
         /* A letter key of this pair that one of its layouts cannot type as
            one character: the word is no longer followed, and the rest of
@@ -4733,9 +4795,11 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         }
         if (g_word_count == 0) {
             g_word_after_boundary = g_previous_key_boundary;
+            g_word_fragment = g_previous_key_joined;
             g_word_auto_capitalized = capitalize;
         }
         g_previous_key_boundary = 0;
+        g_previous_key_joined = 0;
         /* An untrusted word is not corrected, but a pending layout switch
            still types its keys in the requested alphabet. */
         if (g_skip_word)
@@ -4769,7 +4833,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             if (g_word_mixed) return deliver_key(code, wparam, lparam, data, translate, shift, caps, foreground, language, capitalize);
         }
 
-        if (!g_overflow_count) {
+        if (!g_overflow_count && !(g_word_fragment && g_word_count <= 3)) {
             intent = current_intent(foreground, &intent_strength);
             live_result = ks_evaluate_contextual(
                 g_word, g_word_count, g_word_language, g_settings.sensitivity,
@@ -4800,6 +4864,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         int memory_learning;
         int note_word = 1;
         int spell_doubt = 0;   /* the word may be a slip only the next word can settle */
+        /* "fi" of sci-fi, "rd" of 3rd: not a word of its own. */
+        int short_fragment = g_word_fragment && g_word_count <= 3;
         /*
          * Shift+Space is the zero-width non-joiner on both Windows Persian
          * layouts. It ends the current token exactly like Space, but the
@@ -4837,6 +4903,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         remember_last_word(foreground);
         g_previous_key_boundary = boundary_key == VK_SPACE || boundary_key == VK_RETURN ||
                                   boundary_key == VK_TAB;
+        g_previous_key_joined = 0;
         /* Snippets and the lone "i" come before every other evaluation:
            the user asked for exactly this text. */
         if (!g_skip_word && !g_overflow_count && !g_word_mixed && g_word_count > 0 &&
@@ -4909,7 +4976,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
          * isolated-word decision. A later word can therefore supply the
          * missing evidence for earlier ambiguous text.
          */
-        if (!g_skip_word && !g_overflow_count && g_word_count > 0 &&
+        if (!g_skip_word && !g_overflow_count && g_word_count > 0 && !short_fragment &&
             try_sequence_correction(
                 foreground, g_word, g_word_count, g_word_language,
                 boundary_key, zwnj, intent, intent_strength)) {
@@ -4918,7 +4985,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             clear_word();
             return 1;
         }
-        if (!g_skip_word && !g_overflow_count &&
+        if (!g_skip_word && !g_overflow_count && !short_fragment &&
             ks_evaluate_contextual(
                 g_word, g_word_count, g_word_language, g_settings.sensitivity,
                 intent, intent_strength, sentence_start(foreground),
@@ -5076,6 +5143,12 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         clear_history();
         g_capitalize_armed = 0;
         g_capitalize_next = 0;
+        /* A printable key typed straight after a word or a number joins
+           what follows to it. */
+        g_previous_key_joined = (g_word_count > 0 || g_last_key_was_digit) && !g_control_down &&
+                                !g_alt_down && !g_windows_down &&
+                                ((data->vkCode >= '0' && data->vkCode <= '9') ||
+                                 (data->vkCode >= 0xBA && data->vkCode <= 0xE2));
         g_last_key_was_digit = data->vkCode >= '0' && data->vkCode <= '9';
         g_previous_key_boundary = 0;
         g_dead_key_word = active_layout_dead_key(data->scanCode, shift, caps);
@@ -5292,6 +5365,9 @@ static void clipboard_snapshot_take(CLIPBOARD_SNAPSHOT *snapshot) {
         }
         GlobalUnlock(handle);
     }
+    /* Content held only in formats that cannot be copied (a metafile, a
+       private format): restoring "nothing" would destroy it. */
+    if (snapshot->count == 0 && CountClipboardFormats() > 0) snapshot->partial = 1;
     CloseClipboard();
 }
 
@@ -5429,6 +5505,21 @@ static int any_modifier_down(void) {
  * been copied meanwhile.
  */
 static HWND g_cleanup_target;
+
+/* The clipboard was last written by the application being cleaned up (a
+   Store app's frame and content are different processes). */
+static int clipboard_owned_by_cleanup_target(void) {
+    HWND owner = GetClipboardOwner();
+    DWORD owner_process = 0;
+    DWORD target_process = 0;
+    DWORD focus_process = 0;
+    if (!owner) return 0;
+    GetWindowThreadProcessId(owner, &owner_process);
+    GetWindowThreadProcessId(g_cleanup_target, &target_process);
+    GetWindowThreadProcessId(focused_window(g_cleanup_target), &focus_process);
+    return owner_process == target_process || owner_process == focus_process;
+}
+
 static unsigned long g_cleanup_focus_serial;
 static unsigned long g_cleanup_key_serial;
 
@@ -5472,6 +5563,10 @@ static void continue_selection_cleanup(void) {
             finish_selection_cleanup();
             return;
         }
+        /* Ctrl+C was sent. If the copy has landed, the clipboard holds the
+           selection, and that is the state the restore must replace. */
+        if (GetClipboardSequenceNumber() != g_cleanup_sequence && clipboard_owned_by_cleanup_target())
+            g_cleanup_sequence = GetClipboardSequenceNumber();
         g_cleanup_step = 4;   /* put the user's clipboard back */
     }
     switch (g_cleanup_step) {
@@ -5990,9 +6085,10 @@ static int app_state(const wchar_t **why) {
 
 static void load_tray_icons(void) {
     int size = GetSystemMetrics(SM_CXSMICON);
-    if (!g_icon_normal)
+    if (!g_icon_normal) {
         g_icon_normal = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, size, size, 0);
-    g_icon_normal_owned = g_icon_normal != NULL;
+        g_icon_normal_owned = g_icon_normal != NULL;
+    }
     /* LoadIcon returns a shared icon that must never be destroyed. */
     if (!g_icon_normal) g_icon_normal = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_APP));
     if (!g_icon_paused) g_icon_paused = make_grey_icon(g_icon_normal);
@@ -7725,6 +7821,57 @@ static int command_line_has(const wchar_t *name) {
     return found;
 }
 
+/*
+ * Everything beyond the base dictionaries: the spelling tables, the word
+ * forms, the word pairs and the wide lexicons. All optional: a build that
+ * shipped without them still repairs layouts, and the dashboard says that
+ * spelling is unavailable.
+ */
+static void load_spelling_lexicons(void) {
+    /*
+     * Spelling correction needs the frequency tables. They are generated from
+     * wordfreq at build time; if a build shipped without them, the layout
+     * repair keeps working and the dashboard says spelling is unavailable.
+     */
+    g_spelling_available =
+        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
+        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
+        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
+        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
+    /* Optional: without the pair table spelling works word by word. */
+    load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
+    /* Optional: without the wide lexicons only dictionary words are known. */
+    load_bloom_resource(IDR_EN_WIDE_BLOOM, &g_english_wide_bloom);
+    load_bloom_resource(IDR_FA_WIDE_BLOOM, &g_persian_wide_bloom);
+    load_bloom_resource(IDR_EN_WIDE_PREFIX, &g_english_wide_prefix_bloom);
+    load_bloom_resource(IDR_FA_WIDE_PREFIX, &g_persian_wide_prefix_bloom);
+    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
+    g_english_spelling.language = KS_LANG_ENGLISH;
+    g_english_spelling.ranks = &g_english_rank_table;
+    g_english_spelling.words = &g_english_bloom;
+    g_english_spelling.common = &g_english_common_bloom;
+    g_english_spelling.forms = &g_english_forms_bloom;
+    g_english_spelling.attested = g_english_wide_bloom.valid ? &g_english_wide_bloom : NULL;
+    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
+    g_persian_spelling.language = KS_LANG_PERSIAN;
+    g_persian_spelling.ranks = &g_persian_rank_table;
+    g_persian_spelling.words = &g_persian_bloom;
+    g_persian_spelling.common = &g_persian_common_bloom;
+    g_persian_spelling.forms = &g_persian_forms_bloom;
+    g_persian_spelling.pairs = g_persian_pairs.valid ? &g_persian_pairs : NULL;
+    g_persian_spelling.attested = g_persian_wide_bloom.valid ? &g_persian_wide_bloom : NULL;
+    g_english_spelling.vocabulary = &g_session_vocabulary;
+    g_persian_spelling.vocabulary = &g_session_vocabulary;
+    g_english_spelling.personal = &g_personal_vocabulary;
+    g_persian_spelling.personal = &g_personal_vocabulary;
+    g_english_spelling.rank_adjust = spell_rank_adjust;
+    g_english_spelling.rank_adjust_context = &g_rank_language_en;
+    g_persian_spelling.rank_adjust = spell_rank_adjust;
+    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
+    g_english_spelling.pair_adjust = spell_pair_adjust;
+    g_persian_spelling.pair_adjust = spell_pair_adjust;
+}
+
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_ansi, int show_command) {
     unsigned activity_before_load = 0;
     int language_pair_ok = 1;
@@ -7807,41 +7954,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_extra_words.has_prefix = extra_word_prefix;
     g_extra_words.context = NULL;
     g_lexicons.extra = &g_extra_words;
-    /*
-     * Spelling correction needs the frequency tables. They are generated from
-     * wordfreq at build time; if a build shipped without them, the layout
-     * repair keeps working and the dashboard says spelling is unavailable.
-     */
-    g_spelling_available =
-        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
-        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
-        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
-        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
-    /* Optional: without the pair table spelling works word by word. */
-    load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
-    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
-    g_english_spelling.language = KS_LANG_ENGLISH;
-    g_english_spelling.ranks = &g_english_rank_table;
-    g_english_spelling.words = &g_english_bloom;
-    g_english_spelling.common = &g_english_common_bloom;
-    g_english_spelling.forms = &g_english_forms_bloom;
-    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
-    g_persian_spelling.language = KS_LANG_PERSIAN;
-    g_persian_spelling.ranks = &g_persian_rank_table;
-    g_persian_spelling.words = &g_persian_bloom;
-    g_persian_spelling.common = &g_persian_common_bloom;
-    g_persian_spelling.forms = &g_persian_forms_bloom;
-    g_persian_spelling.pairs = g_persian_pairs.valid ? &g_persian_pairs : NULL;
-    g_english_spelling.vocabulary = &g_session_vocabulary;
-    g_persian_spelling.vocabulary = &g_session_vocabulary;
-    g_english_spelling.personal = &g_personal_vocabulary;
-    g_persian_spelling.personal = &g_personal_vocabulary;
-    g_english_spelling.rank_adjust = spell_rank_adjust;
-    g_english_spelling.rank_adjust_context = &g_rank_language_en;
-    g_persian_spelling.rank_adjust = spell_rank_adjust;
-    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
-    g_english_spelling.pair_adjust = spell_pair_adjust;
-    g_persian_spelling.pair_adjust = spell_pair_adjust;
+    load_spelling_lexicons();
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_context_reset(&g_intent_context);

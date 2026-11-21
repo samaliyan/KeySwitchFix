@@ -2,6 +2,10 @@
 dist/
 resources/en-rank.bin
 resources/fa-rank.bin
+resources/en-wide.bloom
+resources/en-wide-prefix.bloom
+resources/fa-wide.bloom
+resources/fa-wide-prefix.bloom
 resources/*.res
 *.exe
 *.pdb

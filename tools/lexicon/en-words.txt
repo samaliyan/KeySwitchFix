@@ -1,0 +1,120 @@
+# English tokens that are words for the people who type them but that the
+# dictionaries and the 2021 corpus do not attest: products, companies,
+# tools and names that appeared or grew since. They are kept as typed
+# (never "corrected", never mistaken for the other keyboard layout).
+# One or more tokens per line; '#' starts a comment; letters only.
+
+# AI and machine learning
+chatgpt openai anthropic claude gemini copilot deepseek ollama llama mistral
+perplexity grok midjourney huggingface langchain llamaindex pytorch tensorflow
+keras sklearn numpy scipy pandas matplotlib seaborn jupyter colab kaggle
+transformers tokenizer tokenizers embeddings finetune finetuning finetuned
+llm llms genai rag chatbot chatbots agentic multimodal qwen kimi cohere
+groq openrouter whisper sora runway elevenlabs suno notebooklm cursor
+windsurf codex devin replit lovable bolt cline aider lmstudio vllm gguf
+onnx cuda cudnn xgboost lightgbm catboost opencv mediapipe diffusers lora
+comfyui automatic gradio streamlit wandb mlflow dvc airflow dagster prefect
+# Developer tools, languages and frameworks
+github gitlab bitbucket gitea codeberg sourcehut vercel netlify heroku
+supabase firebase firestore appwrite pocketbase planetscale neon upstash
+cloudflare fastly akamai digitalocean linode vultr hetzner ovh arvancloud
+nextjs nuxt nuxtjs svelte sveltekit solidjs remix astro vite vitest webpack
+rollup esbuild turbopack babel eslint prettier biome tailwind tailwindcss
+shadcn daisyui bootstrap bulma chakra mantine redux zustand pinia mobx
+vuejs vuex reactjs preact angularjs htmx alpinejs jquery lodash axios
+nodejs deno bunjs expressjs fastify nestjs koa hono trpc graphql apollo
+prisma drizzle sequelize typeorm mongoose knex sqlalchemy alembic pydantic
+fastapi flask django starlette uvicorn gunicorn celery pytest unittest
+laravel symfony codeigniter wordpress woocommerce drupal joomla magento
+shopify wix squarespace webflow framer figma sketch zeplin canva miro
+golang rustlang kotlin swiftui dart flutter xamarin maui ionic capacitor
+cordova electron tauri qt gtk wxwidgets dotnet aspnet blazor razor nuget
+typescript javascript coffeescript webassembly wasm elixir erlang haskell
+scala clojure ocaml fsharp julia fortran cobol perl lua zig nim crystal
+postgres postgresql mysql mariadb sqlite mongodb redis memcached cassandra
+couchdb dynamodb cockroachdb clickhouse duckdb snowflake bigquery redshift
+databricks elasticsearch opensearch meilisearch typesense algolia qdrant
+pinecone weaviate milvus chroma pgvector timescaledb influxdb neo4j
+kubernetes kubectl minikube k3s helm argocd fluxcd istio linkerd envoy
+traefik nginx caddy haproxy podman containerd docker dockerfile dockerhub
+terraform pulumi ansible saltstack vagrant packer nomad consul etcd
+prometheus grafana loki tempo jaeger zipkin opentelemetry datadog newrelic
+sentry bugsnag rollbar pagerduty opsgenie statuspage uptimerobot
+jenkins circleci travis teamcity buildkite drone tekton gitops devops
+vscode vscodium neovim nvim emacs intellij pycharm webstorm phpstorm
+goland clion rider datagrip xcode eclipse netbeans sublime notepad
+postman insomnia swagger openapi grpc protobuf thrift avro parquet
+oauth openid keycloak okta cognito clerk authjs nextauth passkey passkeys
+jwt bcrypt argon totp webauthn yubikey bitwarden keepass lastpass
+wireguard openvpn tailscale zerotier nordvpn protonvpn shadowsocks vless
+vmess trojan xray singbox clash nekoray hiddify psiphon outline
+homebrew winget chocolatey scoop apt pacman flatpak snapcraft appimage
+ubuntu debian fedora centos rocky almalinux archlinux manjaro kali mint
+opensuse nixos gentoo freebsd openbsd macos ios ipados watchos android
+hyprland wayland xorg gnome kde xfce cinnamon systemd grub
+# Companies, products, platforms
+google youtube gmail facebook instagram whatsapp telegram twitter tiktok
+snapchat linkedin pinterest reddit discord twitch tumblr quora medium
+substack mastodon bluesky threads signal viber skype zoom webex slack
+notion obsidian evernote onenote trello asana clickup jira confluence
+airtable coda linear basecamp todoist calendly loom dropbox onedrive
+icloud nextcloud mega pcloud wetransfer netflix spotify soundcloud deezer
+hulu disney primevideo hbo crunchyroll imdb goodreads duolingo coursera
+udemy udacity edx khanacademy codecademy leetcode hackerrank codeforces
+stackoverflow stackexchange wikipedia wikimedia fandom quizlet chegg
+amazon ebay aliexpress alibaba temu shein etsy walmart ikea paypal stripe
+wise revolut payoneer skrill venmo zelle klarna binance coinbase kraken
+kucoin bybit okx bitget metamask bitcoin ethereum solana cardano dogecoin
+tether usdt litecoin ripple polkadot tron toncoin notcoin hamster uniswap
+nft nfts defi dao web3 blockchain stablecoin altcoin memecoin airdrop
+nvidia intel amd qualcomm mediatek broadcom tsmc samsung xiaomi huawei
+oppo vivo realme oneplus honor poco redmi nokia motorola lenovo asus
+acer msi gigabyte asrock dell alienware razer logitech corsair steelseries
+hyperx kingston sandisk seagate toshiba hitachi sony panasonic philips
+bosch siemens dyson tesla byd rivian lucid waymo uber lyft bolt airbnb
+booking tripadvisor skyscanner expedia agoda doordash ubereats
+playstation xbox nintendo steam epicgames ubisoft rockstar valve riot
+fortnite minecraft roblox pubg valorant overwatch warzone genshin dota
+csgo fifa eafc gta cyberpunk skyrim zelda pokemon tetris
+iphone ipad macbook imac airpods homepod airtag pixel galaxy chromebook
+chromecast firestick kindle fitbit garmin gopro oculus quest
+photoshop illustrator indesign lightroom premiere aftereffects acrobat
+davinci capcut inshot filmora audacity obs vlc winrar winzip
+# Everyday internet words
+email emails inbox username usernames login logins logout signup signin
+online offline website websites webpage webcam podcast podcasts vlog vlogs
+blog blogs blogger vlogger youtuber tiktoker streamer influencer hashtag
+hashtags emoji emojis meme memes selfie selfies gif gifs screenshot
+screenshots livestream wifi hotspot bluetooth smartphone smartwatch
+touchscreen fullscreen wallpaper homepage dropdown popup tooltip checkbox
+dashboard sidebar navbar footer backend frontend fullstack codebase
+dataset datasets timestamp timestamps metadata changelog roadmap
+workflow workflows onboarding offboarding upskill freelancer freelancers
+coworking startup startups fintech edtech healthtech proptech saas paas
+iaas chatroom unfollow unfriend unsubscribe retweet repost upvote downvote
+# Persian names and places in Latin letters
+iran iranian tehran isfahan esfahan shiraz tabriz mashhad karaj ahvaz qom
+kerman rasht yazd urmia zahedan hamedan kermanshah arak ardabil bandar
+abbas kish qeshm gilan mazandaran khorasan khuzestan fars azerbaijan
+kurdistan lorestan sistan baluchestan golestan semnan zanjan qazvin
+bushehr hormozgan ilam kohgiluyeh chaharmahal alborz damavand zagros
+persia persian farsi nowruz norooz yalda chaharshanbe sizdah haftsin
+ali reza mohammad mohammed ahmad hossein hosein hassan hasan mehdi mahdi
+amir saeed saeid majid hamid vahid navid omid farhad farshad behzad
+behnam bahram babak kaveh kian kiana arash aref arman armin ashkan dariush
+darius kourosh cyrus sina sepehr soheil sohrab rostam siavash pouya pooya
+peyman payam parham parsa milad meysam mostafa morteza mojtaba mansour
+masoud mahmoud jafar javad kamran keyvan iman ehsan erfan danial daniel
+yasin yousef yusef younes zahra fatemeh maryam mina mahsa mahshid negar
+negin nazanin neda nasrin narges leila laleh shirin shiva sara sahar
+samira setareh sepideh roya raha parisa parvin pegah niloofar niloufar
+mona mitra mahnaz elham elnaz elaheh azadeh atefeh arezoo anahita bahar
+banafsheh golnaz hanieh hoda kimia ladan marjan mojgan nahid sadaf saba
+tara taraneh yasaman yasamin zeinab ziba rezaei rezaie ahmadi mohammadi
+hosseini karimi rahimi moradi jafari sadeghi kazemi mousavi hashemi
+akbari alavi amini asadi bagheri ebrahimi esmaeili fallah ghasemi
+heidari jalali kamali mahdavi najafi rahmani rostami salehi soltani
+tehrani yazdani zamani zarei digikala snapp tapsi divar torob aparat
+filimo namava bale eitaa rubika soroush shad zarinpal idpay sheypoor
+alibaba cafebazaar myket bazaar irancell hamrahaval rightel shatel
+asiatech mokhaberat saipa pride samand peykan tara dena

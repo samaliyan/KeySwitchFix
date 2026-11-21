@@ -105,6 +105,15 @@ typedef struct KS_LEXICONS {
     const KS_BLOOM *frequent[3];        /* the 2,000 most frequent words */
     const KS_BLOOM *prefixes[3];        /* proper prefixes of dictionary words */
     const KS_BLOOM *common_prefixes[3]; /* proper prefixes of common words */
+    /*
+     * Optional (4.3): the wide lexicon. Tokens a large corpus attests but
+     * no dictionary lists (names, brands, places, abbreviations) and the
+     * inflected forms the dictionary only implies. Two Blooms per slot.
+     * A reading found here is never evidence FOR a layout change; it only
+     * protects what the user typed in the layout in use.
+     */
+    const KS_BLOOM *wide[3][2];
+    const KS_BLOOM *wide_prefixes[3];   /* proper prefixes of wide tokens */
     const KS_EXTRA_WORDS *extra;        /* optional */
 } KS_LEXICONS;
 

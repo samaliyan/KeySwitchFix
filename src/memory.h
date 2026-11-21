@@ -67,6 +67,7 @@ typedef struct KS_WRITING_MEMORY {
     unsigned short slots[KS_MEMORY_SLOTS];   /* word index + 1; 0 = empty */
     KS_MEMORY_FIX fixes[KS_MEMORY_FIXES];
     int fix_count;
+    int fix_cursor;   /* where the next eviction starts looking */
     KS_MEMORY_PAIR pairs[KS_MEMORY_PAIRS];
     int pair_count;
     unsigned short pair_slots[KS_MEMORY_PAIR_SLOTS];   /* pair index + 1 */
