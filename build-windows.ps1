@@ -77,6 +77,27 @@ if ($rankStale) {
     Run $python @("tools\generate_rank_tables.py")
 }
 
+# --- wide lexicons (wordfreq): names, brands, abbreviations ----------------
+$wideFiles = @("resources\en-wide.bloom", "resources\en-wide-prefix.bloom",
+               "resources\fa-wide.bloom", "resources\fa-wide-prefix.bloom")
+$wideStale = $false
+foreach ($wideFile in $wideFiles) { if (-not (Test-Path $wideFile)) { $wideStale = $true } }
+if (-not $wideStale) {
+    $oldestWide = $wideFiles | ForEach-Object { (Get-Item $_).LastWriteTimeUtc } | Sort-Object | Select-Object -First 1
+    $wideInputs = @("tools\generate_wide_lexicon.py", "tools\generate_rank_tables.py", "resources\en-forms.bloom",
+                    "resources\fa-forms.bloom", "resources\en.bloom", "resources\fa.bloom") +
+                  @(Get-ChildItem tools\lexicon\*.txt | ForEach-Object { $_.FullName })
+    foreach ($wideInput in $wideInputs) {
+        if ((Get-Item $wideInput).LastWriteTimeUtc -gt $oldestWide) { $wideStale = $true }
+    }
+}
+if ($wideStale) {
+    Step "Generating the wide lexicons (wordfreq 3.1.1)"
+    & $python -m pip install --quiet wordfreq==3.1.1
+    if ($LASTEXITCODE -ne 0) { Fail "pip install wordfreq==3.1.1" }
+    Run $python @("tools\generate_wide_lexicon.py")
+}
+
 Step "Metadata verification"
 Run $python @("tools\generate_domain_words.py")
 Run $python @("tests\verify_metadata.py")

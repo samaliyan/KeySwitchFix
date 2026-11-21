@@ -32,6 +32,23 @@ else
   done
 fi
 
+# The wide lexicons (names, brands, abbreviations: tokens a corpus attests
+# and no dictionary lists) are a build product of wordfreq as well. Rebuilt
+# when an input changed: the generator, the curated lists, the rank inputs.
+if [ ! -f resources/en-wide.bloom ] || [ ! -f resources/en-wide-prefix.bloom ] || \
+   [ ! -f resources/fa-wide.bloom ] || [ ! -f resources/fa-wide-prefix.bloom ]; then
+  python3 tools/generate_wide_lexicon.py
+else
+  for input in tools/generate_wide_lexicon.py tools/generate_rank_tables.py tools/lexicon/*.txt \
+               resources/en-forms.bloom resources/fa-forms.bloom resources/en.bloom resources/fa.bloom; do
+    if [ "$input" -nt resources/en-wide.bloom ] || [ "$input" -nt resources/fa-wide.bloom ]; then
+      echo "Wide lexicons are older than $input: regenerating them."
+      python3 tools/generate_wide_lexicon.py
+      break
+    fi
+  done
+fi
+
 python3 tools/generate_domain_words.py
 python3 tests/verify_metadata.py
 

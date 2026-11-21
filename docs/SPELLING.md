@@ -71,6 +71,49 @@ The Persian table now holds 26,353 words (23,164 in 4.0). The tables are a
 build product listed in `.gitignore`; `build-native.sh` generates them, which
 requires `pip install wordfreq==3.1.1`.
 
+## The wide lexicon (4.3): names, brands and other real words
+
+A dictionary lists the words of a language. People also type names
+(`zach`, `rezaei`), brands and products (`github`, `binance`, `ollama`),
+places, abbreviations (`sms`, `uae`), other spellings (`practise`,
+`storey`) and new words. Until 4.2 such a token was a typo by definition,
+and it was "repaired" to the nearest dictionary word. Typing the 80,000
+most frequent English words changed 6.2 % of them.
+
+The wide lexicon is a Bloom (`resources/en-wide.bloom`, `fa-wide.bloom`) of
+every token that real text contains:
+
+- English: the tokens of wordfreq's large list at zipf 1.5 or more (one use
+  in 30 million words): 158,000 tokens.
+- Persian: the words of the rank table.
+- The curated lists `tools/lexicon/en-words.txt` and `fa-words.txt`: words
+  newer than the corpus, Persian names in Latin letters, loanwords.
+
+A word found there is **left exactly as typed** at every level. It is not
+offered as a repair either (it has no frequency), so it cannot make things
+worse.
+
+A corpus also attests misspellings. They are kept out when the lexicon is
+built, so they are still repaired:
+
+| Kept out when a dictionary word 63x more frequent is… | Examples |
+| --- | --- |
+| two swapped letters away (6 letters or more; 4 when the word is among the most frequent) | `recieve`, `beleive`, `thier`, `frist` |
+| a doubled letter away (7 letters with the double missing, 8 with one too many) | `commited`, `begining`, `carefull` |
+| one vowel or one inner letter away (8 letters or more) | `definately`, `goverment`, `existance` |
+| listed in `tools/lexicon/en-misspellings.txt` | `teh`, `adn`, `alot`, `ofthe`, `untill` |
+
+The rules are strict on purpose. Frequency cannot tell `zach`/`each` from
+`recieve`/`receive`; the kind of slip and the length can, mostly. Where they
+cannot (`levin`/`kevin`, `tsar`/`star`), the word is kept: changing a
+correct name is worse than leaving a typo, and Backspace plus the personal
+dictionary handle the rest. Run-together words cannot be told from names by
+rule either (`hasan` is "has an"), so only the listed ones are split.
+
+The layout decision uses the same lexicon, with the word-form Blooms and a
+Bloom of the beginnings of wide tokens (see
+[Architecture](ARCHITECTURE.md#the-wide-lexicon-43)).
+
 ## Candidates
 
 **One slip.** Every string within Damerau–Levenshtein distance one of the
