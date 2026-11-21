@@ -51,6 +51,20 @@ jobs:
           cmp "$RUNNER_TEMP/forms/en-forms.bloom" resources/en-forms.bloom
           cmp "$RUNNER_TEMP/forms/fa-forms.bloom" resources/fa-forms.bloom
 
+      - name: Frequent-word Blooms and collision priors reproduce
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/guards"
+          cp resources/en.bloom resources/fa.bloom "$RUNNER_TEMP/guards/"
+          python3 tools/generate_blooms.py \
+            --dictionary-root "$RUNNER_TEMP/dictionaries/node_modules" \
+            --output-dir "$RUNNER_TEMP/guards" --prior-output "$RUNNER_TEMP/guards/collision_priors.inc"
+          for name in en-prefix fa-prefix en-common fa-common en-frequent fa-frequent \
+                      en-common-prefix fa-common-prefix; do
+            cmp "$RUNNER_TEMP/guards/$name.bloom" "resources/$name.bloom"
+          done
+          diff <(tr -d '\r' < src/collision_priors.inc) <(tr -d '\r' < "$RUNNER_TEMP/guards/collision_priors.inc")
+
       - name: Install Zig cross-compiler
         run: >-
           npm install
