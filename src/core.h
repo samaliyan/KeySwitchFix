@@ -193,6 +193,11 @@ int ks_word_membership(const KS_TOKEN *tokens, int count,
 int ks_classify_word(const KS_TOKEN *tokens, int count,
                      const KS_LEXICONS *lexicons,
                      int known[3], int frequent[3]);
+/* 1 when the reading of the keys in `slot` is a token of the wide lexicon
+   (a name, a brand, an inflected form): not a dictionary word, but very
+   likely what the user meant. */
+int ks_reading_attested(const KS_TOKEN *tokens, int count, KS_SLOT slot,
+                        const KS_LEXICONS *lexicons);
 int ks_collision_prior_points(const wchar_t *english_word);
 int ks_evaluate_sequence(const KS_SEQUENCE_WORD *words, int word_count,
                          int sensitivity,

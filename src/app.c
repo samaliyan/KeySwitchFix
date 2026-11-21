@@ -83,6 +83,8 @@
 #define IDC_VOCAB_IT 141
 #define IDC_LANGUAGE_FIRST 142
 #define IDC_LANGUAGE_SECOND 143
+#define IDC_BOUNDARY_ONLY 144
+#define IDC_CHECK_UPDATES 145
 #define IDC_TILE_VALUE 120      /* 120..123 */
 #define IDC_TILE_CAPTION 130    /* 130..133 */
 #define UI_TILE_COUNT 4
@@ -145,6 +147,10 @@ typedef struct SETTINGS {
        language packs. */
     wchar_t language_first[8];
     wchar_t language_second[8];
+    /* 4.4: correct only when a word is finished (never while it is being
+       typed), and the opt-in check for a newer release. */
+    int boundary_only;
+    int check_updates;
     wchar_t excluded[512];
 } SETTINGS;
 
@@ -270,7 +276,12 @@ struct FOCUS_FACTS {
     unsigned long settings_generation;
     DWORD computed_at;
     int excluded;
+    /* Per-application rules from the excluded-apps list (4.4):
+       "name.exe:spelling" and "name.exe:slow". */
+    int no_spelling;
+    int boundary_only;
     int developer_tool;
+    int terminal;
     int remote;
     int protected_field;
     int excel;
@@ -342,6 +353,15 @@ static int g_word_fragment;
 /* The user switched the layout by hand: the next word is typed in the
    layout they chose, on purpose. */
 static int g_manual_switch;
+/* The word being typed continues one that was converted while it was
+   typed (4.4): if the finished word turns out to be nothing in the layout
+   it was converted to, the conversion is taken back. */
+static int g_word_resumed;
+/* The previous key was Enter (or the field was just entered): in a
+   terminal the next word may be a password typed at a prompt that shows
+   nothing, so it is not corrected while it is typed. */
+static int g_after_enter = 1;
+static int g_word_line_first;
 /* The first letter of the current word was capitalised by the hook. */
 static int g_word_auto_capitalized;
 /* Ctrl+Win+X clean-up of the selection: a small state machine driven by
@@ -693,6 +713,8 @@ static void load_settings(void) {
     g_settings.snippets = GetPrivateProfileIntW(L"Typing", L"Snippets", 1, g_settings_path) != 0;
     g_settings.learn_writing = GetPrivateProfileIntW(L"Memory", L"LearnWriting", 0, g_settings_path) != 0;
     g_settings.vocab_it = GetPrivateProfileIntW(L"Vocabulary", L"IT", 1, g_settings_path) != 0;
+    g_settings.boundary_only = GetPrivateProfileIntW(L"General", L"EndOfWordOnly", 0, g_settings_path) != 0;
+    g_settings.check_updates = GetPrivateProfileIntW(L"General", L"CheckUpdates", 0, g_settings_path) != 0;
     GetPrivateProfileStringW(L"Languages", L"First", L"en", g_settings.language_first, 8, g_settings_path);
     GetPrivateProfileStringW(L"Languages", L"Second", L"fa", g_settings.language_second, 8, g_settings_path);
     normalize_language_pair(g_settings.language_first, g_settings.language_second);
@@ -801,6 +823,10 @@ static int save_settings(void) {
     ok &= WritePrivateProfileStringW(L"Memory", L"LearnWriting", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.vocab_it);
     ok &= WritePrivateProfileStringW(L"Vocabulary", L"IT", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.boundary_only);
+    ok &= WritePrivateProfileStringW(L"General", L"EndOfWordOnly", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.check_updates);
+    ok &= WritePrivateProfileStringW(L"General", L"CheckUpdates", number, g_settings_path);
     ok &= WritePrivateProfileStringW(L"Languages", L"First", g_settings.language_first, g_settings_path);
     ok &= WritePrivateProfileStringW(L"Languages", L"Second", g_settings.language_second, g_settings_path);
     g_startup_registry_failed = !update_startup_registry();
@@ -1360,6 +1386,7 @@ static void clear_word(void) {
     g_word_peak_complete = 0;
     g_word_count = 0;
     g_word_mixed = 0;
+    g_word_resumed = 0;
     g_overflow_count = 0;
     g_has_context = 0;
     g_skip_word = 0;
@@ -2178,18 +2205,39 @@ static int basename_equals(const wchar_t *path, const wchar_t *candidate, size_t
 }
 
 /* Returns the executable file name (without directory) of a window's process. */
+/* The names of the last few processes asked about. A focus change asks
+   about the same two processes (the host and the focused control's) up to
+   eight times; opening a process is a system call each time. An entry is
+   trusted for a minute: a process id can be reused, a name cannot change. */
+#define PROCESS_NAME_CACHE 4
+static struct {
+    DWORD process_id;
+    DWORD stored_at;
+    wchar_t name[MAX_PATH];
+} g_process_names[PROCESS_NAME_CACHE];
+static int g_process_name_next;
+
 static int query_process_basename(HWND window, wchar_t *name, size_t capacity) {
     DWORD process_id = 0;
     HANDLE process;
     wchar_t path[MAX_PATH];
     DWORD length = MAX_PATH;
     const wchar_t *base;
+    DWORD now = GetTickCount();
+    int i;
 
     if (!name || capacity == 0) return 0;
     name[0] = 0;
     if (!window) return 0;
     GetWindowThreadProcessId(window, &process_id);
     if (!process_id) return 0;
+    for (i = 0; i < PROCESS_NAME_CACHE; ++i) {
+        if (g_process_names[i].process_id == process_id && g_process_names[i].name[0] &&
+            now - g_process_names[i].stored_at < 60000u) {
+            safe_copy(name, capacity, g_process_names[i].name);
+            return name[0] != 0;
+        }
+    }
     process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
     if (!process) return 0;
     if (!QueryFullProcessImageNameW(process, 0, path, &length)) {
@@ -2199,23 +2247,70 @@ static int query_process_basename(HWND window, wchar_t *name, size_t capacity) {
     CloseHandle(process);
     base = wcsrchr(path, L'\\');
     safe_copy(name, capacity, base ? base + 1 : path);
+    if (name[0]) {
+        g_process_names[g_process_name_next].process_id = process_id;
+        g_process_names[g_process_name_next].stored_at = now;
+        safe_copy(g_process_names[g_process_name_next].name, MAX_PATH, name);
+        g_process_name_next = (g_process_name_next + 1) % PROCESS_NAME_CACHE;
+    }
     return name[0] != 0;
 }
 
-static int excluded_list_contains(const wchar_t *name) {
+/*
+ * What the excluded-apps list says about a program. A plain name excludes
+ * it altogether. A name with a rule keeps the layout repair and changes
+ * one thing (4.4):
+ *     WINWORD.EXE:spelling   no spelling correction there
+ *     Telegram.exe:slow      corrections only when a word is finished
+ * A file name cannot contain a colon, so the rule is unambiguous.
+ */
+#define APP_RULE_EXCLUDED 1
+#define APP_RULE_NO_SPELLING 2
+#define APP_RULE_BOUNDARY_ONLY 4
+
+/* The length of an entry's program name, and its rule. */
+static size_t excluded_entry_name(const wchar_t *start, const wchar_t *end, int *rule) {
+    const wchar_t *colon = start;
+    while (colon < end && *colon != L':') ++colon;
+    *rule = APP_RULE_EXCLUDED;
+    if (colon < end) {
+        const wchar_t *word = colon + 1;
+        size_t length;
+        while (word < end && *word == L' ') ++word;
+        length = (size_t)(end - word);
+        if (length == 8 && _wcsnicmp(word, L"spelling", 8) == 0) *rule = APP_RULE_NO_SPELLING;
+        else if (length == 4 && _wcsnicmp(word, L"slow", 4) == 0) *rule = APP_RULE_BOUNDARY_ONLY;
+        /* An unknown rule is read as the safe one: excluded. */
+        end = colon;
+        while (end > start && end[-1] == L' ') --end;
+    }
+    return (size_t)(end - start);
+}
+
+/* The rules (APP_RULE_*) the list holds for a program; 0 when none. */
+static int excluded_list_rules(const wchar_t *name) {
     const wchar_t *cursor = g_settings.excluded;
+    int rules = 0;
     if (!name || !*name) return 0;
     while (*cursor) {
         const wchar_t *start;
         const wchar_t *end;
+        size_t length;
+        int rule;
         while (*cursor == L' ' || *cursor == L',' || *cursor == L';') ++cursor;
         start = cursor;
         while (*cursor && *cursor != L',' && *cursor != L';') ++cursor;
         end = cursor;
         while (end > start && end[-1] == L' ') --end;
-        if (end > start && basename_equals(name, start, (size_t)(end - start))) return 1;
+        if (end <= start) continue;
+        length = excluded_entry_name(start, end, &rule);
+        if (length && basename_equals(name, start, length)) rules |= rule;
     }
-    return 0;
+    return rules;
+}
+
+static int excluded_list_contains(const wchar_t *name) {
+    return (excluded_list_rules(name) & APP_RULE_EXCLUDED) != 0;
 }
 
 static void excluded_list_toggle(const wchar_t *name) {
@@ -2266,6 +2361,7 @@ static void excluded_list_toggle(const wchar_t *name) {
 
 static HWND focused_window(HWND foreground);
 
+/* APP_RULE_* for the application the user is typing in. */
 static int compute_process_excluded(HWND foreground) {
     DWORD process_id = 0;
     wchar_t name[MAX_PATH];
@@ -2277,7 +2373,7 @@ static int compute_process_excluded(HWND foreground) {
     GetWindowThreadProcessId(foreground, &process_id);
     GetWindowThreadProcessId(focus, &focus_process_id);
     if (!process_id || process_id == GetCurrentProcessId() ||
-        focus_process_id == GetCurrentProcessId()) return 1;
+        focus_process_id == GetCurrentProcessId()) return APP_RULE_EXCLUDED;
     if (!query_process_basename(foreground, name, MAX_PATH)) return 0;
     /*
      * The focused control may belong to another process: the app behind a
@@ -2291,7 +2387,7 @@ static int compute_process_excluded(HWND foreground) {
         query_process_basename(focus, focus_name, MAX_PATH);
     safe_copy(g_last_typed_process, MAX_PATH,
               focus_name[0] && _wcsicmp(name, L"ApplicationFrameHost.exe") == 0 ? focus_name : name);
-    return excluded_list_contains(name) || (focus_name[0] && excluded_list_contains(focus_name));
+    return excluded_list_rules(name) | (focus_name[0] ? excluded_list_rules(focus_name) : 0);
 }
 
 static HWND focused_window(HWND foreground) {
@@ -3227,7 +3323,15 @@ static void open_my_words(void) {
  * active there, but spelling correction is skipped below Aggressive. The
  * user-editable "Excluded apps" list still disables everything.
  */
+/* Returns 1 for a code editor or database tool, 2 for a terminal (where a
+   password prompt shows nothing and cannot be detected). */
 static int developer_tool_process(HWND foreground) {
+    static const wchar_t *const terminals[] = {
+        L"WindowsTerminal.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+        L"conhost.exe", L"OpenConsole.exe", L"mintty.exe", L"alacritty.exe",
+        L"wezterm-gui.exe", L"putty.exe", L"git-bash.exe", L"bash.exe", L"wsl.exe",
+        L"ubuntu.exe", L"kitty.exe", L"MobaXterm.exe", L"SecureCRT.exe"
+    };
     static const wchar_t *const developer_tools[] = {
         L"WindowsTerminal.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
         L"conhost.exe", L"OpenConsole.exe", L"mintty.exe", L"alacritty.exe",
@@ -3250,6 +3354,8 @@ static int developer_tool_process(HWND foreground) {
         /* The host process, then the focused control's process (a UWP app
            behind its frame, a web view inside an IDE). */
         if (!query_process_basename(pass ? focus : foreground, name, MAX_PATH)) continue;
+        for (i = 0; i < sizeof(terminals) / sizeof(terminals[0]); ++i)
+            if (_wcsicmp(name, terminals[i]) == 0) return 2;
         for (i = 0; i < sizeof(developer_tools) / sizeof(developer_tools[0]); ++i) {
             if (_wcsicmp(name, developer_tools[i]) == 0) return 1;
         }
@@ -3301,9 +3407,16 @@ static const FOCUS_FACTS *focus_facts(HWND foreground) {
     g_facts.focus_serial = g_focus_serial;
     g_facts.settings_generation = g_settings_generation;
     g_facts.computed_at = now ? now : 1;
-    g_facts.excluded = compute_process_excluded(foreground);
-    g_facts.remote = remote_session_process(foreground);
-    g_facts.developer_tool = g_facts.remote || developer_tool_process(foreground);
+    {
+        int rules = compute_process_excluded(foreground);
+        int tool = developer_tool_process(foreground);
+        g_facts.excluded = (rules & APP_RULE_EXCLUDED) != 0;
+        g_facts.no_spelling = (rules & APP_RULE_NO_SPELLING) != 0;
+        g_facts.boundary_only = (rules & APP_RULE_BOUNDARY_ONLY) != 0;
+        g_facts.remote = remote_session_process(foreground);
+        g_facts.developer_tool = g_facts.remote || tool != 0;
+        g_facts.terminal = tool == 2;
+    }
     g_facts.autocorrect_app = autocorrect_process(foreground);
     /* g_focus_event_protected is -1 while the accessibility query for the
        field is still running: unknown counts as protected. */
@@ -3349,6 +3462,7 @@ static void engine_reset_for_focus(void) {
     /* The Excel cell state is left alone: F2 or a double-click may move the
        focus to the cell editor, which is exactly the "editing" state. */
     g_word_untrusted = 0;
+    g_after_enter = 1;
     /* The cached focused control belongs to the old field (Tab between
        fields keeps the same top-level window). */
     g_target.thread = 0;
@@ -3588,6 +3702,8 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
        only once a correction is actually about to be applied. */
     if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground))
         return SPELL_SUPPRESSED;
+    /* "name.exe:spelling" in the excluded-apps list. */
+    if (focus_facts(foreground)->no_spelling) return SPELL_SUPPRESSED;
     if (is_protected_field(foreground)) {
         set_activity(L"Correction skipped in a protected password field.");
         return SPELL_SUPPRESSED;
@@ -3633,6 +3749,7 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
  * "P' W", and one Backspace restores "P W" and keeps P.
  */
 static int helpers_suppressed(HWND foreground);
+static int live_correction_allowed(HWND foreground);
 
 static int try_respell_previous(HWND foreground, UINT delimiter, int delimiter_zwnj) {
     const WORD_HISTORY *last;
@@ -3658,7 +3775,7 @@ static int try_respell_previous(HWND foreground, UINT delimiter, int delimiter_z
        phrases (writing memory, both languages). */
     if (!lexicon->pairs && !g_memory_active) return 0;
     /* Word and Outlook rewrite text behind the caret themselves. */
-    if (focus_facts(foreground)->autocorrect_app) return 0;
+    if (focus_facts(foreground)->autocorrect_app || focus_facts(foreground)->no_spelling) return 0;
     if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground)) return 0;
     tokens_to_language(last->tokens, last->count, last->visible_language, previous);
     tokens_to_language(g_word, g_word_count, g_word_language, current);
@@ -4023,6 +4140,21 @@ static int try_undo(int consume_delimiter) {
    get the raw keys: digits, punctuation and letters are never reshaped
    there. focus_facts caches per focused element and is invalidated by focus
    events (a browser's login fields share one window) and settings changes. */
+/*
+ * May a word be corrected while it is still being typed? Not when the user
+ * asked for corrections at the end of a word only (globally, or for this
+ * application with "name.exe:slow"), and not for the first word of a line
+ * in a terminal: a password typed at a prompt shows nothing, and changing
+ * it (and the layout) unseen would lock the user out. At Space the word is
+ * corrected as usual.
+ */
+static int live_correction_allowed(HWND foreground) {
+    const FOCUS_FACTS *facts = focus_facts(foreground);
+    if (g_settings.boundary_only || facts->boundary_only) return 0;
+    if (facts->terminal && g_word_line_first) return 0;
+    return 1;
+}
+
 static int helpers_suppressed(HWND foreground) {
     const FOCUS_FACTS *facts = focus_facts(foreground);
     return facts->excluded || facts->remote || facts->developer_tool || facts->protected_field;
@@ -4745,6 +4877,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
                than the translation window: a mixed word, repaired whole at
                the next evaluation. */
             g_word_mixed = g_pending_word.visible_language != language;
+            g_word_resumed = 1;
             g_overflow_count = 0;
             g_has_context = 1;
             g_word_window = foreground;
@@ -4795,6 +4928,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         }
         if (g_word_count == 0) {
             g_word_after_boundary = g_previous_key_boundary;
+            g_word_line_first = g_after_enter;
+            g_after_enter = 0;
             g_word_fragment = g_previous_key_joined;
             g_word_auto_capitalized = capitalize;
         }
@@ -4833,7 +4968,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             if (g_word_mixed) return deliver_key(code, wparam, lparam, data, translate, shift, caps, foreground, language, capitalize);
         }
 
-        if (!g_overflow_count && !(g_word_fragment && g_word_count <= 3)) {
+        if (!g_overflow_count && !(g_word_fragment && g_word_count <= 3) &&
+            live_correction_allowed(foreground)) {
             intent = current_intent(foreground, &intent_strength);
             live_result = ks_evaluate_contextual(
                 g_word, g_word_count, g_word_language, g_settings.sensitivity,
@@ -4904,6 +5040,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         g_previous_key_boundary = boundary_key == VK_SPACE || boundary_key == VK_RETURN ||
                                   boundary_key == VK_TAB;
         g_previous_key_joined = 0;
+        g_after_enter = boundary_key == VK_RETURN;
         /* Snippets and the lone "i" come before every other evaluation:
            the user asked for exactly this text. */
         if (!g_skip_word && !g_overflow_count && !g_word_mixed && g_word_count > 0 &&
@@ -4976,6 +5113,38 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
          * isolated-word decision. A later word can therefore supply the
          * missing evidence for earlier ambiguous text.
          */
+        /*
+         * This word was converted while it was being typed, and the user
+         * went on typing it. Finished, it is nothing in the layout it was
+         * converted to, while the keys spell a name or a form of the
+         * original layout (kavanaugh, converted at "kav"): the conversion
+         * was wrong, so the word and the layout go back.
+         */
+        if (g_word_resumed && !g_skip_word && !g_overflow_count && !g_word_mixed && g_word_count >= 4 &&
+            slot_valid(g_word_language)) {
+            int resumed_known[3] = {0, 0, 0};
+            KS_SLOT original_slot = KS_OTHER_SLOT(g_word_language);
+            if (ks_classify_word(g_word, g_word_count, &g_lexicons, resumed_known, NULL) &&
+                !resumed_known[g_word_language] && !resumed_known[original_slot] &&
+                !ks_reading_attested(g_word, g_word_count, g_word_language, &g_lexicons) &&
+                ks_reading_attested(g_word, g_word_count, original_slot, &g_lexicons)) {
+                memset(&decision, 0, sizeof(decision));
+                decision.should_correct = 1;
+                decision.key_count = g_word_count;
+                decision.confidence = 90;
+                decision.source_slot = g_word_language;
+                decision.target_slot = original_slot;
+                tokens_to_language(g_word, g_word_count, g_word_language, decision.original);
+                tokens_to_language(g_word, g_word_count, original_slot, decision.replacement);
+                if (apply_decision(foreground, &decision, g_word_count, boundary_key, zwnj)) {
+                    history_push(foreground, g_word, g_word_count, original_slot, boundary_key, zwnj);
+                    suppress_key_up(data->vkCode);
+                    if (terminates_sentence) start_new_sentence(foreground);
+                    clear_word();
+                    return 1;
+                }
+            }
+        }
         if (!g_skip_word && !g_overflow_count && g_word_count > 0 && !short_fragment &&
             try_sequence_correction(
                 foreground, g_word, g_word_count, g_word_language,
@@ -5842,6 +6011,8 @@ static HBRUSH g_brush_tile;
 static HWND g_tile_values[UI_TILE_COUNT];
 static HWND g_tile_captions[UI_TILE_COUNT];
 static HWND g_personal_dictionary;
+static HWND g_boundary_only;
+static HWND g_check_updates;
 static HWND g_digits;
 static HWND g_punctuation;
 static HWND g_persian_letters;
@@ -6301,6 +6472,8 @@ static void update_controls_from_settings(void) {
     SendMessageW(g_personal_dictionary, BM_SETCHECK,
                  g_settings.personal_dictionary ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_startup, BM_SETCHECK, g_settings.start_with_windows ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_boundary_only, BM_SETCHECK, g_settings.boundary_only ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_check_updates, BM_SETCHECK, g_settings.check_updates ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_digits, CB_SETCURSEL, (WPARAM)g_settings.digits, 0);
     SendMessageW(g_punctuation, BM_SETCHECK, g_settings.punctuation ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_persian_letters, BM_SETCHECK, g_settings.persian_letters ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -6364,6 +6537,8 @@ static void read_controls_to_settings(void) {
         g_pending_keep_ready = 0;
     }
     g_settings.start_with_windows = SendMessageW(g_startup, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_settings.boundary_only = SendMessageW(g_boundary_only, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_settings.check_updates = SendMessageW(g_check_updates, BM_GETCHECK, 0, 0) == BST_CHECKED;
     selection = SendMessageW(g_digits, CB_GETCURSEL, 0, 0);
     if (selection >= KS_DIGITS_OFF && selection <= KS_DIGITS_LATIN) g_settings.digits = (int)selection;
     g_settings.punctuation = SendMessageW(g_punctuation, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -6664,6 +6839,10 @@ static void create_ui(HWND window) {
     g_spelling = combo(window, 0, 3, IDC_SPELLING, spelling, 4);
     g_startup = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(0) + 2, UI_SIDE_WIDTH, L"Start with Wi&ndows",
                          IDC_APP_STARTUP);
+    g_boundary_only = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(1) + 2, UI_SIDE_WIDTH,
+                               L"Fix at &end of word only", IDC_BOUNDARY_ONLY);
+    g_check_updates = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(2) + 2, UI_SIDE_WIDTH,
+                               L"Chec&k for updates", IDC_CHECK_UPDATES);
     g_personal_dictionary = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(3) + 2, UI_SIDE_WIDTH,
                                      L"&Remember undone words", IDC_PERSONAL_DICTIONARY);
     row_label(window, 0, 4, L"E&xcluded apps");
@@ -6674,9 +6853,10 @@ static void create_ui(HWND window) {
     /* The setting holds 511 characters: stop there rather than cut silently. */
     SendMessageW(g_excluded, EM_SETLIMITTEXT, 511, 0);
     hint(window, 0, UI_CONTROL_LEFT, UI_ROW(5) - 4, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 64,
-         L"Program file names separated by commas, for example KeePass.exe; the tray menu can "
-         L"exclude the app you last typed in. One Backspace right after a correction restores "
-         L"what you typed (Remember undone words keeps it).", 0);
+         L"Program file names separated by commas (KeePass.exe); the tray menu can exclude the "
+         L"app you last typed in. Add :spelling to switch off only spelling there "
+         L"(WINWORD.EXE:spelling), or :slow to correct only at the end of a word. One Backspace "
+         L"right after a correction restores what you typed.", 0);
 
     /* Page 1: Typing. */
     row_label(window, 1, 0, L"&Digits");
@@ -7370,6 +7550,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                  (id == IDC_SENSITIVITY || id == IDC_LANGUAGE_MODE || id == IDC_SPELLING || id == IDC_DIGITS)) ||
                 (notification == BN_CLICKED &&
                  (id == IDC_APP_STARTUP || id == IDC_PERSONAL_DICTIONARY || id == IDC_PUNCTUATION ||
+                  id == IDC_BOUNDARY_ONLY || id == IDC_CHECK_UPDATES ||
                   id == IDC_PERSIAN_LETTERS || id == IDC_CAPITALIZE || id == IDC_SNIPPETS ||
                   id == IDC_LEARN_WRITING || id == IDC_VOCAB_IT)) ||
                 (notification == CBN_CLOSEUP &&

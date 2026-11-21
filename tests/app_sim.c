@@ -1060,6 +1060,7 @@ static void spelling(void) {
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     sim_process_name = L"Code.exe";
+    memset(g_process_names, 0, sizeof(g_process_names));   /* another application now */
     g_settings.spelling = KS_SPELL_AGGRESSIVE;
     ++g_settings_generation;
     screen_reset();
@@ -1068,6 +1069,7 @@ static void spelling(void) {
     expect(g_memory.pair_count == 0 && ks_memory_word_count(&g_memory, L"\u062F\u0627\u0634\u062A\u0647") == 0,
            "nothing is learned in a code editor");
     sim_process_name = NULL;
+    memset(g_process_names, 0, sizeof(g_process_names));   /* another application now */
     g_settings.spelling = KS_SPELL_BALANCED;
     ++g_settings_generation;
 

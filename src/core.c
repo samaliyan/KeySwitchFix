@@ -785,6 +785,13 @@ static int reading_is_wide(const KS_TOKEN *tokens, int count, KS_SLOT slot,
     return 0;
 }
 
+int ks_reading_attested(const KS_TOKEN *tokens, int count, KS_SLOT slot,
+                        const KS_LEXICONS *lexicons) {
+    if (!tokens || !lexicons || count < 1 || count > KS_MAX_WORD ||
+        (slot != KS_SLOT_A && slot != KS_SLOT_B)) return 0;
+    return reading_is_wide(tokens, count, slot, lexicons);
+}
+
 /*
  * The keys so far are a word of the layout in use followed by one to four
  * more letters: an ending the dictionary does not list (قشر + های) or a
