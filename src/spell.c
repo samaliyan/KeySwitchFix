@@ -205,6 +205,32 @@ void ks_vocab_trust(KS_VOCAB *vocab, const wchar_t *word) {
     if (entry && entry->count < KS_VOCAB_TRUST_COUNT) entry->count = KS_VOCAB_TRUST_COUNT;
 }
 
+int ks_vocab_forget(KS_VOCAB *vocab, const wchar_t *word) {
+    KS_VOCAB_ENTRY *entry;
+    int index;
+    if (!vocab || !word || !*word) return 0;
+    entry = vocab_find(vocab, word);
+    if (!entry) return 0;
+    index = (int)(entry - vocab->entries);
+    /* A full ring keeps its entries in order of age starting at `next`:
+       put the oldest first, so that closing the gap keeps that order. */
+    if (vocab->count == KS_VOCAB_CAPACITY && vocab->next != 0) {
+        static KS_VOCAB_ENTRY ordered[KS_VOCAB_CAPACITY];   /* too large for the stack */
+        int i;
+        for (i = 0; i < KS_VOCAB_CAPACITY; ++i)
+            ordered[i] = vocab->entries[(vocab->next + i) % KS_VOCAB_CAPACITY];
+        memcpy(vocab->entries, ordered, sizeof(ordered));
+        index = (index - vocab->next + KS_VOCAB_CAPACITY) % KS_VOCAB_CAPACITY;
+        vocab->next = 0;
+    }
+    memmove(&vocab->entries[index], &vocab->entries[index + 1],
+            (size_t)(vocab->count - index - 1) * sizeof(vocab->entries[0]));
+    --vocab->count;
+    memset(&vocab->entries[vocab->count], 0, sizeof(vocab->entries[0]));
+    vocab->next = vocab->count % KS_VOCAB_CAPACITY;
+    return 1;
+}
+
 int ks_vocab_trusted(const KS_VOCAB *vocab, const wchar_t *word) {
     int i;
     if (!vocab || !word) return 0;
