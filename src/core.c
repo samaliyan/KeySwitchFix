@@ -436,19 +436,47 @@ int ks_text_known(const wchar_t *text, KS_LANGUAGE language,
    around a word: an opening quote, and a closing quote, comma or semicolon
    (`'file'` → file, `no,` → no). Those keys are letters in some layouts
    (Persian گ ک و, Russian э ж б), so the other reading wins unopposed unless
-   the word between them decides. Brackets are not stripped: ] and [ are the
-   Persian letters چ and ج, which end common words (هیچ is typed id]).
+   the word between them decides. The same goes for brackets and the marks
+   a layout types with Shift on a letter key (Persian « » on K and L):
+   `[high,` is high and «شهرداری» is شهرداری.
    Returns the core's length; target may be the source. */
+static int opening_mark(wchar_t c) {
+    return c == L'\'' || c == L'"' || c == L'(' || c == L'[' || c == L'{' ||
+           c == 0x00AB || c == 0x201C || c == 0x2018;
+}
+
+static int closing_mark(wchar_t c) {
+    return c == L'\'' || c == L'"' || c == L',' || c == L';' || c == L'.' ||
+           c == L')' || c == L']' || c == L'}' || c == L':' || c == L'!' || c == L'?' ||
+           c == 0x00BB || c == 0x201D || c == 0x2019 ||
+           c == 0x060C || c == 0x061B || c == 0x061F;
+}
+
 static size_t punctuation_core(const wchar_t *source, wchar_t *target) {
     size_t start = 0;
     size_t end = wcslen(source);
-    while (start < end && (source[start] == L'\'' || source[start] == L'"')) ++start;
+    int bracket = 0;
+    while (start < end && opening_mark(source[start])) {
+        if (source[start] == L'[') bracket = 1;
+        ++start;
+    }
     /* A full stop at the end, too: in a pair where that key is a letter of
        the other language (Russian ю), "it." is one token, and the English
        reading must still count as "it". */
-    while (end > start && (source[end - 1] == L'\'' || source[end - 1] == L'"' ||
-                           source[end - 1] == L',' || source[end - 1] == L';' ||
-                           source[end - 1] == L'.')) --end;
+    while (end > start && closing_mark(source[end - 1])) {
+        if (source[end - 1] == L']') bracket = 1;
+        --end;
+    }
+    /* The square brackets are the Persian letters ج and چ. Around one or
+       two letters they are more likely those (`id]` is هیچ, `[hk` is جان). */
+    if (bracket && end - start < 3) {
+        start = 0;
+        end = wcslen(source);
+        while (start < end && (source[start] == L'\'' || source[start] == L'"')) ++start;
+        while (end > start && (source[end - 1] == L'\'' || source[end - 1] == L'"' ||
+                               source[end - 1] == L',' || source[end - 1] == L';' ||
+                               source[end - 1] == L'.')) --end;
+    }
     memmove(target, source + start, (end - start) * sizeof(wchar_t));
     target[end - start] = 0;
     return end - start;
