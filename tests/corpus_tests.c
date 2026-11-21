@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static KS_BLOOM g_blooms[10];
+static KS_BLOOM g_blooms[16];
 static KS_LEXICONS g_lexicons;
 
 /* Slot A is English and slot B Persian here (the default pair). */
@@ -35,6 +35,9 @@ static int extra_prefix(const void *context, KS_SLOT slot, const wchar_t *prefix
 static const KS_EXTRA_WORDS g_extra = {extra_contains, extra_prefix, NULL};
 
 /* Loaded files live until exit; freed there so leak checkers stay quiet. */
+#define NAMES_LIMIT 1.0
+#define FORMS_LIMIT 1.0
+
 static unsigned char *g_loaded[32];
 static int g_loaded_count;
 
@@ -133,9 +136,10 @@ typedef struct RUN {
 } RUN;
 
 int main(void) {
-    static const char *names[10] = {
+    static const char *names[16] = {
         "en", "fa", "en-common", "fa-common", "en-frequent", "fa-frequent",
-        "en-prefix", "fa-prefix", "en-common-prefix", "fa-common-prefix" };
+        "en-prefix", "fa-prefix", "en-common-prefix", "fa-common-prefix",
+        "en-wide", "fa-wide", "en-forms", "fa-forms", "en-wide-prefix", "fa-wide-prefix" };
     static const RUN runs[] = {
         {"tests/corpus/english-common.txt", 0, 0, KS_SLOT_NONE, 0, 0.0, "English, no context"},
         {"tests/corpus/english-common.txt", 0, 0, KS_SLOT_B, 4, 1.5, "English inside Persian text"},
@@ -155,12 +159,18 @@ int main(void) {
         {"tests/corpus/persian-common.txt", 1, 1, KS_SLOT_A, 3, 92.0, "Persian on the English layout, English text"},
         {"tests/corpus/persian-common.txt", 1, 1, KS_SLOT_NONE, 0, 98.5, "Persian typed on the English layout"},
         {"tests/corpus/english-tech.txt", 0, 1, KS_SLOT_NONE, 0, 95.0, "Tech words typed on the Persian layout"},
+        /* The wide lexicon (4.3): names, brands and inflected forms that no
+           dictionary lists stay as typed. */
+        {"tests/corpus/english-names.txt", 0, 0, KS_SLOT_NONE, 0, NAMES_LIMIT, "English names and brands, no context"},
+        {"tests/corpus/english-names.txt", 0, 0, KS_SLOT_A, 3, 0.0, "English names and brands in English text"},
+        {"tests/corpus/persian-forms.txt", 1, 0, KS_SLOT_NONE, 0, FORMS_LIMIT, "Persian forms and names, no context"},
+        {"tests/corpus/persian-forms.txt", 1, 0, KS_SLOT_B, 3, 0.0, "Persian forms and names in Persian text"},
     };
     size_t i;
     int failed = 0;
 
     setlocale(LC_ALL, "C.UTF-8");
-    for (i = 0; i < 10; ++i) {
+    for (i = 0; i < 16; ++i) {
         char path[128];
         size_t size = 0;
         unsigned char *data;
@@ -181,6 +191,12 @@ int main(void) {
     g_lexicons.prefixes[KS_SLOT_B] = &g_blooms[7];
     g_lexicons.common_prefixes[KS_SLOT_A] = &g_blooms[8];
     g_lexicons.common_prefixes[KS_SLOT_B] = &g_blooms[9];
+    g_lexicons.wide[KS_SLOT_A][0] = &g_blooms[10];
+    g_lexicons.wide[KS_SLOT_B][0] = &g_blooms[11];
+    g_lexicons.wide[KS_SLOT_A][1] = &g_blooms[12];
+    g_lexicons.wide[KS_SLOT_B][1] = &g_blooms[13];
+    g_lexicons.wide_prefixes[KS_SLOT_A] = &g_blooms[14];
+    g_lexicons.wide_prefixes[KS_SLOT_B] = &g_blooms[15];
     g_lexicons.extra = &g_extra;
 
     for (i = 0; i < sizeof(runs) / sizeof(runs[0]); ++i) {

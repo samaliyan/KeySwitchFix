@@ -1124,6 +1124,96 @@ static void spelling(void) {
     g_spelling_available = 0;
 }
 
+/* 4.3: names, brands, inflected forms and punctuation around words. */
+static void wide_lexicon(void) {
+    printf("Names, brands and punctuation (the wide lexicon)\n");
+    install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
+    sim_start(L"en", L"fa");
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    ks_vocab_reset(&g_personal_vocabulary);
+    ks_memory_reset(&g_memory);
+    g_memory_active = 0;
+    load_spelling_lexicons();
+    expect(g_lexicons.wide[KS_SLOT_A][0] && g_lexicons.wide[KS_SLOT_B][1] &&
+           g_lexicons.wide_prefixes[KS_SLOT_A] && g_english_spelling.attested,
+           "the wide lexicons are bound to the pair");
+
+    /* The reported words, and others that were rewritten before. */
+    us_keys("i use github and gemini every day ");
+    expect_screen(L"i use github and gemini every day ", "github and gemini stay");
+    screen_reset();
+    us_keys("zach works at binance with ollama and deepseek ");
+    expect_screen(L"zach works at binance with ollama and deepseek ", "names and brands stay");
+    screen_reset();
+    us_keys("we practise on the top storey ");
+    expect_screen(L"we practise on the top storey ", "British spellings stay");
+    screen_reset();
+    us_keys("this is the kavanaugh case ");
+    expect_screen(L"this is the kavanaugh case ", "a name is not converted while it is typed");
+    screen_reset();
+    us_keys("i will recieve teh letter ");
+    expect_screen(L"I will receive the letter ", "real misspellings are still fixed");
+    screen_reset();
+    /* Punctuation keys are letters on the Persian layout. */
+    us_keys("we have 12, and more ");
+    expect_screen(L"we have 12, and more ", "a comma after a number is not Persian");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("the list [high, low] is here ");
+    expect_screen(L"the list [high, low] is here ", "brackets around English words");
+    screen_reset();
+    us_keys("a sci-fi film ");
+    expect_screen(L"a sci-fi film ", "a fragment after a hyphen is left alone");
+    screen_reset();
+    /* A wrong-layout word is still repaired, also an inflected one. */
+    clear_intent();
+    sim_now += 60000;
+    us_keys("sghl ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "Persian on the US layout is still repaired");
+    /* Now on the Persian layout: words the base dictionary does not list. */
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("ravihd ");            /* قشرهای: "ravi" is an English name */
+    expect_screen(L"\u0642\u0634\u0631\u0647\u0627\u06CC ", "an inflected Persian word is not converted mid-word");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("ok; ");               /* خنک */
+    expect_screen(L"\u062E\u0646\u06A9 ", "a Persian word ending in \u06A9 is not English plus a semicolon");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("cold ");              /* زخمی, a common word; cold is frequent */
+    expect_screen(L"\u0632\u062E\u0645\u06CC ", "a common Persian word does not become a frequent English one");
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    us_keys("hdk d; ;jhf nv fhvi Kaivnhvd");
+    press(0x26, 1);                /* Shift+L: the closing guillemet */
+    us_keys(" hsj ");
+    expect_screen(L"\u0627\u06CC\u0646 \u06CC\u06A9 \u06A9\u062A\u0627\u0628 \u062F\u0631 \u0628\u0627\u0631\u0647 "
+                  L"\u00BB\u0634\u0647\u0631\u062F\u0627\u0631\u06CC\u00AB \u0627\u0633\u062A ",
+                  "guillemets around a Persian word");
+    /* A layout chosen by hand is kept for a word that is a word in it. */
+    screen_reset();
+    clear_intent();
+    sim_now += 60000;
+    user_switch(0x04090409u);
+    hook_event(VK_LMENU, 0x38, WM_SYSKEYDOWN);
+    hook_event(VK_LSHIFT, 0x2A, WM_KEYDOWN);
+    hook_event(VK_LSHIFT, 0x2A, WM_KEYUP);
+    hook_event(VK_LMENU, 0x38, WM_KEYUP);
+    us_keys("leg ");
+    expect_screen(L"leg ", "after a manual switch a collision is not flipped back");
+    screen_reset();
+    us_keys("sghl ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "but a wrong-layout word still is repaired");
+    user_switch(0x04090409u);
+}
+
 static void late_switch(void) {
     printf("Applications that switch late (en / fa)\n");
     install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
@@ -1297,6 +1387,7 @@ int main(void) {
     missing_pack();
     late_switch();
     spelling();
+    wide_lexicon();
     sim_packs[3] = L"ar.kslang";
     sim_packs[4] = L"fr.kslang";
     sim_pack_count = 5;   /* pack_added_later() starts from the first three */

@@ -440,15 +440,16 @@ int ks_text_known(const wchar_t *text, KS_LANGUAGE language,
    a layout types with Shift on a letter key (Persian « » on K and L):
    `[high,` is high and «شهرداری» is شهرداری.
    Returns the core's length; target may be the source. */
+/* Either guillemet may open: the Persian keyboard types » first. */
 static int opening_mark(wchar_t c) {
     return c == L'\'' || c == L'"' || c == L'(' || c == L'[' || c == L'{' ||
-           c == 0x00AB || c == 0x201C || c == 0x2018;
+           c == 0x00AB || c == 0x00BB || c == 0x201C || c == 0x2018;
 }
 
 static int closing_mark(wchar_t c) {
     return c == L'\'' || c == L'"' || c == L',' || c == L';' || c == L'.' ||
            c == L')' || c == L']' || c == L'}' || c == L':' || c == L'!' || c == L'?' ||
-           c == 0x00BB || c == 0x201D || c == 0x2019 ||
+           c == 0x00BB || c == 0x00AB || c == 0x201D || c == 0x2019 ||
            c == 0x060C || c == 0x061B || c == 0x061F;
 }
 
@@ -961,12 +962,15 @@ KS_LIVE_RESULT ks_evaluate_contextual(
         /*
          * What was typed is no dictionary word, but the wide lexicon
          * attests it: a name, a brand, an abbreviation, an inflected form
-         * (kahn, sms, قشرهای). It yields only to an everyday word of the
-         * other layout, and never inside a sentence of its own language.
+         * (kahn, lpg, قشرهای). It yields only to an everyday word of the
+         * other layout, and inside a sentence of its own language only to
+         * one of the 2,000 most frequent (short attested tokens are too
+         * many to let them stop است or این from being repaired).
          */
         if (reading_is_wide(tokens, count, active_slot, lexicons)) {
             if (!target_common) return KS_LIVE_NONE;
-            if (context_slot == active_slot && context_strength >= 2 && context_strength < 5)
+            if (!target_frequent && context_slot == active_slot && context_strength >= 2 &&
+                context_strength < 5)
                 return KS_LIVE_NONE;
         }
         /* A rare target can wait for the pause or the end of the word. */
@@ -1066,9 +1070,14 @@ KS_LIVE_RESULT ks_evaluate_contextual(
        quote, fewer than three letters say too little to act on before the
        word is finished. */
     {
-        int opening_quote = active_word[0] == L'\'' || active_word[0] == L'"';
-        size_t core_length = punctuation_core(active_word, active_word);
-        if (opening_quote && core_length < 3) return KS_LIVE_NONE;
+        size_t marks = 0;
+        size_t letters;
+        while (opening_mark(active_word[marks])) ++marks;
+        letters = wcslen(active_word) - marks;
+        punctuation_core(active_word, active_word);
+        /* The same behind a bracket: `[hi` may become [high, and is جاه
+           only once the word ends there. */
+        if (marks && letters < 3) return KS_LIVE_NONE;
     }
     active_is_prefix = ks_bloom_contains(lexicons->prefixes[active_slot], active_word);
     /* "kuber" on the English layout is the start of "kubernetes": the

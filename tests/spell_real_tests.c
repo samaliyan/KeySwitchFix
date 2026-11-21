@@ -45,7 +45,7 @@ static unsigned char *load_file(const char *path, size_t *size) {
 
 static KS_RANK_TABLE ranks[2];
 static KS_RANK_TABLE persian_pairs;
-static KS_BLOOM words[2], common[2], forms[2];
+static KS_BLOOM words[2], common[2], forms[2], wide[2];
 static KS_SPELL_LEXICON lexicon[2];   /* 0 Persian, 1 English */
 static KS_IGNORE_LIST ignore;
 
@@ -67,6 +67,10 @@ static int load_language(int index, const char *code) {
     lexicon[index].words = &words[index];
     lexicon[index].common = &common[index];
     lexicon[index].forms = &forms[index];
+    /* The wide lexicon: names, brands and other attested tokens. */
+    snprintf(path, sizeof(path), "resources/%s-wide.bloom", code);
+    if (!(data = load_file(path, &size)) || !ks_bloom_init(&wide[index], data, size)) return 0;
+    lexicon[index].attested = &wide[index];
     return 1;
 }
 
@@ -150,6 +154,54 @@ static void reported_words(void) {
         CHECK(result.edits == 2 && !result.real_word, "یغتی is reported as two slips");
         ks_spell_correct(L"خرفه", KS_SPELL_BALANCED, &lexicon[0], &ignore, &result);
         CHECK(result.edits == 1 && result.real_word, "خرفه is reported as a rare-word repair");
+    }
+}
+
+/* ---- Names, brands and other words no dictionary lists (4.3) -------------- */
+
+static void attested_words(void) {
+    /* Reported: github and gemini "corrected" while typing English. None of
+       these is in the dictionary; every one was rewritten before 4.3
+       (zach -> each, binance -> finance, practise -> practice, ...). */
+    static const wchar_t *const names[] = {
+        L"github", L"gemini", L"gitlab", L"binance", L"ollama", L"deepseek", L"openai",
+        L"chatgpt", L"anthropic", L"kaggle", L"tiktok", L"supabase", L"vercel", L"nvidia",
+        L"zach", L"levin", L"tobin", L"manny", L"paulo", L"oskar", L"karolina", L"kravis",
+        L"practise", L"storey", L"learnt", L"gamers", L"defences", L"behaviours", L"optimise",
+        L"wwe", L"uae", L"nsw", L"sms", L"iot", L"dlc", L"etsy", L"braun", L"ebooks",
+        L"waterhouse", L"takedown", L"realtime", L"homeschool", L"groupon", L"hasan", L"asher",
+        L"wasnt", L"gettin", L"somethin", L"tehran", L"shiraz", L"rezaei", L"digikala",
+        L"\u06AF\u06CC\u062A\u0647\u0627\u0628",               /* گیتهاب */
+        L"\u062F\u06CC\u062C\u06CC\u06A9\u0627\u0644\u0627",   /* دیجیکالا */
+        L"\u0628\u0639\u062F\u0646",                             /* بعدن */
+    };
+    /* A corpus attests these too, but they are misspellings: still fixed. */
+    static const wchar_t *const fixed[][2] = {
+        {L"teh", L"the"}, {L"hte", L"the"}, {L"adn", L"and"}, {L"thier", L"their"},
+        {L"recieve", L"receive"}, {L"beleive", L"believe"}, {L"definately", L"definitely"},
+        {L"seperate", L"separate"}, {L"goverment", L"government"}, {L"begining", L"beginning"},
+        {L"commited", L"committed"}, {L"succesful", L"successful"}, {L"untill", L"until"},
+        {L"frist", L"first"}, {L"jsut", L"just"}, {L"ofthe", L"of the"}, {L"aswell", L"as well"},
+        {L"becuase", L"because"}, {L"enviroment", L"environment"},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        CHECK(kept(names[i], KS_SPELL_BALANCED), "a name, brand or variant spelling is kept as typed");
+        CHECK(kept(names[i], KS_SPELL_AGGRESSIVE), "...at Aggressive too");
+    }
+    for (i = 0; i < sizeof(fixed) / sizeof(fixed[0]); ++i)
+        CHECK(fixes(fixed[i][0], KS_SPELL_BALANCED, fixed[i][1]), "a corpus-attested misspelling is still fixed");
+    /* An unattested typo next to a name is still a typo. */
+    CHECK(fixes(L"githbu", KS_SPELL_BALANCED, L"github") || kept(L"githbu", KS_SPELL_BALANCED),
+          "a typo of a name is repaired to it or left alone, never to another word");
+    /* Without the wide lexicon the old behaviour is still there (the
+       resource is optional). */
+    {
+        KS_SPELL_LEXICON bare = lexicon[1];
+        KS_SPELL_RESULT result;
+        bare.attested = NULL;
+        ks_spell_correct(L"zach", KS_SPELL_BALANCED, &bare, &ignore, &result);
+        CHECK(result.should_correct, "zach is only protected by the wide lexicon");
     }
 }
 
@@ -423,7 +475,7 @@ static void speed(void) {
 
 int main(void) {
     if (!load_language(0, "fa") || !load_language(1, "en")) {
-        fprintf(stderr, "FAIL: resources missing (generate the rank tables first)\n");
+        fprintf(stderr, "FAIL: resources missing (generate the rank tables and the wide lexicons first)\n");
         return 1;
     }
     {
@@ -436,6 +488,7 @@ int main(void) {
     }
     ks_ignore_list_reset(&ignore);
     reported_words();
+    attested_words();
     kept_words();
     evaluate();
     /* From here on the Persian lexicon has the pair table. */
