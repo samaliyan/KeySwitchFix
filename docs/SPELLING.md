@@ -224,6 +224,19 @@ colloquial writing gains less from the corpus pairs; your own pairs make up
 the difference over time. English has no corpus pair table yet; your own
 English pairs work.
 
+### English pairs (4.4)
+
+English has a pair table too: `resources/en-pairs.bin`, 141,152 ordered
+pairs built by `tools/generate_en_pair_table.py` from the SymSpell bigram
+and word counts (Google Books Ngram; `third-party/en-pairs-NOTICE.txt`).
+The score is the same 10 x PMI. The two count lists are on different
+scales, which lifts every score by a constant; it is calibrated on
+"of the" (about five times likelier than chance). Measured on the 1,925
+English evaluation typos whose intended word has a known left neighbour,
+at Balanced: 82.1 % fixed and 2.7 % wrong without context, 87.2 % and 2.4 %
+with the true word before, and exactly the no-context numbers with a
+random word before (a wrong context does no harm).
+
 ## Decision
 
 The best candidate wins only if all of these hold for the chosen level:

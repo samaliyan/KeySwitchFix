@@ -39,7 +39,41 @@ static int untouched(const wchar_t *typed, int level, const KS_SPELL_LEXICON *le
            !result.should_correct;
 }
 
+/* 4.4: a word can be taken out of a vocabulary, also from a full ring. */
+static int vocabulary_forget(void) {
+    static KS_VOCAB vocab;
+    wchar_t word[16];
+    int i;
+    ks_vocab_reset(&vocab);
+    ks_vocab_trust(&vocab, L"alpha");
+    ks_vocab_trust(&vocab, L"beta");
+    ks_vocab_trust(&vocab, L"gamma");
+    CHECK(ks_vocab_forget(&vocab, L"beta") && vocab.count == 2, "a word is removed");
+    CHECK(!ks_vocab_trusted(&vocab, L"beta") && ks_vocab_trusted(&vocab, L"alpha") &&
+          ks_vocab_trusted(&vocab, L"gamma"), "only that word is removed");
+    CHECK(!ks_vocab_forget(&vocab, L"beta"), "removing it twice reports that it was not there");
+    ks_vocab_trust(&vocab, L"delta");
+    CHECK(vocab.count == 3 && ks_vocab_trusted(&vocab, L"delta"), "the freed slot is used again");
+    /* Fill the ring past its capacity, then remove one from the middle. */
+    ks_vocab_reset(&vocab);
+    for (i = 0; i < KS_VOCAB_CAPACITY + 10; ++i) {
+        swprintf(word, 16, L"w%d", i);
+        ks_vocab_trust(&vocab, word);
+    }
+    CHECK(vocab.count == KS_VOCAB_CAPACITY && !ks_vocab_trusted(&vocab, L"w5") &&
+          ks_vocab_trusted(&vocab, L"w10"), "the ring recycled its oldest entries");
+    CHECK(ks_vocab_forget(&vocab, L"w500") && vocab.count == KS_VOCAB_CAPACITY - 1 &&
+          !ks_vocab_trusted(&vocab, L"w500"), "a word is removed from a full ring");
+    CHECK(ks_vocab_trusted(&vocab, L"w10") && ks_vocab_trusted(&vocab, L"w1033"), "the others stay");
+    ks_vocab_trust(&vocab, L"fresh");
+    ks_vocab_trust(&vocab, L"fresher");
+    CHECK(ks_vocab_trusted(&vocab, L"fresh") && !ks_vocab_trusted(&vocab, L"w10") &&
+          ks_vocab_trusted(&vocab, L"w11"), "after that the oldest entry is the next to go");
+    return 0;
+}
+
 int main(void) {
+    if (vocabulary_forget()) return 1;
     size_t en_rank_size = 0, fa_rank_size = 0, en_size = 0, fa_size = 0;
     size_t en_common_size = 0, fa_common_size = 0;
     unsigned char *en_rank_data = load_file("tests/fixtures/rank-fixture-en.bin", &en_rank_size);

@@ -1,0 +1,19 @@
+resources/en-pairs.bin: English word pairs
+
+Built by tools/generate_en_pair_table.py from two files shipped with the
+symspellpy package, version 6.10.2 (https://github.com/mammothb/symspellpy,
+MIT License, Copyright (c) 2020 mmb L (Python port), Copyright (c) 2019
+Wolf Garbe (SymSpell)):
+
+    frequency_dictionary_en_82_765.txt
+    frequency_bigramdictionary_en_243_342.txt
+
+Those frequency lists are derived from the Google Books Ngram data
+(http://storage.googleapis.com/books/ngrams/books/datasetsv2.html), which
+is licensed under the Creative Commons Attribution 3.0 Unported License
+(https://creativecommons.org/licenses/by/3.0/), and from the SCOWL word
+lists (http://wordlist.aspell.net/).
+
+The table holds no text: for each of 141,152 ordered word pairs it stores a
+24-bit fingerprint and one number, how much more often the second word
+follows the first than chance predicts.

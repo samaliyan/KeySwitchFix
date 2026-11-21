@@ -2,6 +2,67 @@
 
 All notable changes to KeySwitchFix are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [4.4.0] - 2026-11-21
+
+More control over when and where the program corrects, and the technical
+points left open by the review of 4.3.
+
+### New
+
+- **Fix at end of word only** (Correction page). The program no longer
+  changes a word while you are still typing it; it decides at Space, Enter
+  or Tab. Fewer surprises, at the price of seeing the repair a moment
+  later. Off by default.
+- **Rules per application** in the excluded-apps list: `WINWORD.EXE:spelling`
+  keeps the layout repair there and switches spelling off;
+  `Telegram.exe:slow` corrects there only at the end of a word. A plain
+  name still excludes the application altogether.
+- **Never change this word again**: the tray menu names the last word the
+  program changed. One click keeps it for good, for spelling and for the
+  layout decision (a kept word is no longer converted to the other
+  language either).
+- **My words** (Memory & words page): type a word and press Keep or Remove,
+  without editing the file by hand.
+- **Convert selected text** with `Ctrl + Win + Z`: the selection is
+  rewritten as the same keys would have typed it in the other layout
+  (`sghl nsj lk` ↔ `سلام دست من`), for the cases automatic detection
+  missed, and the application is switched to that layout.
+- **English spelling in context.** A table of 141,152 English word pairs
+  (from the SymSpell bigram counts, Google Books Ngram) lets the word
+  before and after choose the repair, as Persian has had since 4.2: with
+  the word before, 87 % of the evaluation typos are fixed instead of 82 %,
+  with fewer wrong repairs and no valid word changed.
+- **Check for updates** (off by default). When you turn it on, the program
+  asks GitHub once a day for the latest release tag and tells you in the
+  tray when there is a newer version. Nothing is downloaded or installed,
+  and nothing about you is sent. With it off the program makes no network
+  request at all, as before.
+- **Silent install**: `KeySwitchFix-Setup.exe /silent` installs or updates
+  without a window (`/nolaunch` leaves the program closed), for winget and
+  scripts.
+
+### Changed
+
+- **A conversion made in the middle of a word is taken back** when the
+  finished word turns out to be nothing in the layout it was converted to,
+  while the keys spell a name or a form of the original layout.
+- **Terminals**: the first word of a line is not changed while it is typed
+  (a password at a prompt shows nothing); it is still repaired at Space.
+- **Less work per key.** The names of the foreground programs are kept for
+  a minute instead of being asked from Windows up to eight times at every
+  focus change.
+- **A program that has hung with the clipboard** no longer makes clean-up
+  wait for it (and with it every key, since the hooks share that thread):
+  clean-up is skipped with a note.
+- **`settings.ini` is UTF-16**: an excluded program whose name has letters
+  outside the system code page is kept across restarts. An existing file
+  is converted once.
+- The frequent-word lists and the collision priors were regenerated with
+  the current generator (four short Persian words and six priors were
+  missing), and CI now checks that they reproduce.
+- The release workflow builds with a read-only token and publishes from a
+  second job that runs no downloaded code.
+
 ## [4.3.0] - 2026-11-21
 
 Correctly typed words are left alone: names, brands and everyday words no

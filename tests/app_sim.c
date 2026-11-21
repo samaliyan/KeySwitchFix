@@ -384,6 +384,7 @@ static struct { int id; const char *file; unsigned char *data; size_t size; } si
     {IDR_FA_WIDE_BLOOM, "resources/fa-wide.bloom", NULL, 0},
     {IDR_EN_WIDE_PREFIX, "resources/en-wide-prefix.bloom", NULL, 0},
     {IDR_FA_WIDE_PREFIX, "resources/fa-wide-prefix.bloom", NULL, 0},
+    {IDR_EN_PAIRS, "resources/en-pairs.bin", NULL, 0},
 };
 
 HRSRC FindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type) {
@@ -1060,6 +1061,7 @@ static void spelling(void) {
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     sim_process_name = L"Code.exe";
+    memset(g_process_names, 0, sizeof(g_process_names));   /* another application now */
     g_settings.spelling = KS_SPELL_AGGRESSIVE;
     ++g_settings_generation;
     screen_reset();
@@ -1068,6 +1070,7 @@ static void spelling(void) {
     expect(g_memory.pair_count == 0 && ks_memory_word_count(&g_memory, L"\u062F\u0627\u0634\u062A\u0647") == 0,
            "nothing is learned in a code editor");
     sim_process_name = NULL;
+    memset(g_process_names, 0, sizeof(g_process_names));   /* another application now */
     g_settings.spelling = KS_SPELL_BALANCED;
     ++g_settings_generation;
 
@@ -1211,6 +1214,148 @@ static void wide_lexicon(void) {
     screen_reset();
     us_keys("sghl ");
     expect_screen(L"\u0633\u0644\u0627\u0645 ", "but a wrong-layout word still is repaired");
+    user_switch(0x04090409u);
+}
+
+/* A new, empty field: nothing typed before is remembered. */
+static void sim_fresh(void) {
+    screen_reset();
+    clear_word();
+    clear_history();
+    clear_intent();
+    g_pending_word_valid = 0;
+    g_undo.valid = 0;
+    sim_now += 60000;
+}
+
+/* 4.4: end-of-word mode, per-application rules, terminals, kept words,
+   selection conversion. */
+static void version_4_4(void) {
+    printf("End-of-word mode, application rules, kept words (4.4)\n");
+    install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
+    sim_start(L"en", L"fa");
+    load_spelling_lexicons();
+    ks_ignore_list_reset(&g_spelling_ignore);
+    ks_vocab_reset(&g_session_vocabulary);
+    ks_vocab_reset(&g_personal_vocabulary);
+    ks_memory_reset(&g_memory);
+    g_memory_active = 0;
+    sim_process_name = NULL;
+    memset(g_process_names, 0, sizeof(g_process_names));
+
+    /* By default a clear wrong-layout word is repaired while it is typed. */
+    us_keys("sghl");
+    expect_screen(L"\u0633\u0644\u0627\u0645", "a word is repaired before Space by default");
+    us_keys(" ");
+    /* With "Fix at end of word only" nothing changes until Space. */
+    sim_fresh();
+    user_switch(0x04090409u);
+    g_settings.boundary_only = 1;
+    ++g_settings_generation;
+    us_keys("sghl");
+    expect_screen(L"sghl", "end-of-word mode leaves the word alone while it is typed");
+    us_keys(" ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "and repairs it at Space");
+    g_settings.boundary_only = 0;
+
+    /* The same for one application: name.exe:slow. */
+    sim_fresh();
+    user_switch(0x04090409u);
+    sim_process_name = L"Telegram.exe";
+    memset(g_process_names, 0, sizeof(g_process_names));
+    safe_copy(g_settings.excluded, 512, L"KeePass.exe, telegram.exe:slow, WINWORD.EXE : spelling");
+    ++g_settings_generation;
+    us_keys("sghl");
+    expect_screen(L"sghl", "name.exe:slow waits for the end of the word in that application");
+    us_keys(" ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "and repairs it there");
+    expect(!process_is_excluded(GetForegroundWindow()), "an application with a rule is not excluded");
+    /* name.exe:spelling keeps the layout repair and drops spelling. */
+    sim_fresh();
+    user_switch(0x04090409u);
+    sim_process_name = L"WINWORD.EXE";
+    memset(g_process_names, 0, sizeof(g_process_names));
+    ++g_settings_generation;
+    us_keys("i will recieve it ");
+    expect_screen(L"i will recieve it ", "name.exe:spelling switches spelling off there");
+    sim_fresh();
+    us_keys("sghl ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "but the layout is still repaired");
+    /* A plain name still excludes the application altogether. */
+    sim_fresh();
+    user_switch(0x04090409u);
+    sim_process_name = L"KeePass.exe";
+    memset(g_process_names, 0, sizeof(g_process_names));
+    ++g_settings_generation;
+    us_keys("sghl ");
+    expect_screen(L"sghl ", "a plain name excludes the application");
+    g_settings.excluded[0] = 0;
+
+    /* A terminal: the first word of a line may be a password at a prompt
+       that shows nothing. It is not changed while it is typed. */
+    sim_fresh();
+    sim_process_name = L"WindowsTerminal.exe";
+    memset(g_process_names, 0, sizeof(g_process_names));
+    ++g_settings_generation;
+    g_after_enter = 1;
+    us_keys("sghl");
+    expect_screen(L"sghl", "the first word of a terminal line is not changed while it is typed");
+    us_keys(" ");
+    expect_screen(L"\u0633\u0644\u0627\u0645 ", "at Space it is repaired");
+    expect(sim_active == (HKL)0x04290429u, "the terminal was switched to Persian");
+    sim_process_name = NULL;
+    memset(g_process_names, 0, sizeof(g_process_names));
+    ++g_settings_generation;
+
+    /* "Never change this word": kept for spelling and for the layout. */
+    sim_fresh();
+    user_switch(0x04090409u);
+    g_settings.personal_dictionary = 1;
+    remove(sim_dictionary_file);
+    wcscpy(g_personal_dictionary_path, L"C:\\Sim\\data\\personal-dictionary.txt");
+    us_keys("col ");                /* زخم: a common Persian word */
+    expect_screen(L"\u0632\u062E\u0645 ", "col is taken as Persian with no context");
+    expect(wcscmp(g_last_changed, L"col") == 0 && g_last_changed_slot == slot_of_model(KS_LANG_ENGLISH),
+           "the tray menu can offer the word that was changed");
+    expect(keep_word_forever(g_last_changed, g_last_changed_slot), "the word is kept");
+    sim_fresh();
+    sim_now += 60000;
+    user_switch(0x04090409u);
+    us_keys("col ");
+    expect_screen(L"col ", "a kept word is not converted again");
+    expect(forget_kept_word(L"col"), "the word can be removed from the kept words");
+    sim_fresh();
+    sim_now += 60000;
+    user_switch(0x04090409u);
+    us_keys("col ");
+    expect_screen(L"\u0632\u062E\u0645 ", "a removed word is converted again");
+    g_settings.personal_dictionary = 0;
+    ks_vocab_reset(&g_personal_vocabulary);
+
+    /* The update check compares release tags. */
+    expect(version_newer(L"v4.5.0", L"4.4.0") && version_newer(L"4.4.1", L"4.4.0") &&
+               version_newer(L"v5.0", L"4.9.9") && version_newer(L"v4.10.0", L"4.9.0"),
+           "a later release is recognised");
+    expect(!version_newer(L"v4.4.0", L"4.4.0") && !version_newer(L"v4.3.9", L"4.4.0") &&
+               !version_newer(L"", L"4.4.0") && !version_newer(L"latest", L"4.4.0") &&
+               !version_newer(L"v4.5.0-beta", L"4.4.0") && !version_newer(L"v999999.0.0", L"4.4.0"),
+           "the same, an older, a pre-release or a malformed tag is not offered");
+
+    /* Selection conversion: the same keys in the other layout. */
+    {
+        wchar_t text[64];
+        KS_SLOT target = KS_SLOT_NONE;
+        wcscpy(text, L"sghl nsj lk");
+        expect(convert_text_layout(text, &target) &&
+                   wcscmp(text, L"\u0633\u0644\u0627\u0645 \u062F\u0633\u062A \u0645\u0646") == 0 &&
+                   target == slot_of_model(KS_LANG_PERSIAN),
+               "English-layout keys are converted to Persian");
+        expect(convert_text_layout(text, &target) && wcscmp(text, L"sghl nsj lk") == 0 &&
+                   target == slot_of_model(KS_LANG_ENGLISH),
+               "and Persian text back to the English-layout keys");
+        wcscpy(text, L"123 ... 456");
+        expect(!convert_text_layout(text, &target), "text without letters is left alone");
+    }
     user_switch(0x04090409u);
 }
 
@@ -1388,6 +1533,7 @@ int main(void) {
     late_switch();
     spelling();
     wide_lexicon();
+    version_4_4();
     sim_packs[3] = L"ar.kslang";
     sim_packs[4] = L"fr.kslang";
     sim_pack_count = 5;   /* pack_added_later() starts from the first three */

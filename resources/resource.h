@@ -18,6 +18,7 @@
 #define IDR_FA_WIDE_BLOOM       217
 #define IDR_EN_WIDE_PREFIX      218
 #define IDR_FA_WIDE_PREFIX      219
+#define IDR_EN_PAIRS            220
 #define IDR_APP_BINARY          301
 #define IDR_UNINSTALL_BINARY    302
 #define IDR_LANGUAGE_BUNDLE     303

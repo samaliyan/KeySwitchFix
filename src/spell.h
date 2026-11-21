@@ -170,6 +170,8 @@ int ks_vocab_observe(KS_VOCAB *vocab, const wchar_t *word);
 /* Marks a word as trusted immediately (undo, personal dictionary). */
 void ks_vocab_trust(KS_VOCAB *vocab, const wchar_t *word);
 int ks_vocab_trusted(const KS_VOCAB *vocab, const wchar_t *word);
+/* Removes a word; returns 1 when it was there. */
+int ks_vocab_forget(KS_VOCAB *vocab, const wchar_t *word);
 
 void ks_ignore_list_reset(KS_IGNORE_LIST *list);
 void ks_ignore_list_add(KS_IGNORE_LIST *list, const wchar_t *word);

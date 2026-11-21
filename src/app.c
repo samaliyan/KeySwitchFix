@@ -3,6 +3,9 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <oleacc.h>
+#ifndef KS_WIN32SIM
+#include <winhttp.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,7 +25,7 @@
 #endif
 
 #define APP_NAME L"KeySwitchFix"
-#define APP_VERSION L"4.3.0"
+#define APP_VERSION L"4.4.0"
 #define APP_MUTEX L"Local\\KeySwitchFix.Native.2.0"
 #define WINDOW_CLASS L"KeySwitchFix.MainWindow.2"
 
@@ -36,6 +39,8 @@
 #define WM_APP_LANGUAGES (WM_APP + 5)
 /* Save the word the user kept (undid a correction of, then moved on). */
 #define WM_APP_KEEP_WORD (WM_APP + 6)
+/* The update check finished on its thread (4.4). */
+#define WM_APP_UPDATE (WM_APP + 7)
 
 #define ID_TRAY 1
 #define ID_TIMER_STATUS 10
@@ -45,6 +50,7 @@
 #define ID_TIMER_HOOK_WATCHDOG 14
 #define ID_HOTKEY_TOGGLE 15
 #define ID_HOTKEY_CLEANUP 16
+#define ID_HOTKEY_CONVERT 17
 #define ID_TIMER_CLEANUP 17
 #define ID_TIMER_STATS 18
 #define ID_TIMER_SNIPPETS 19
@@ -52,6 +58,7 @@
 #define ID_TIMER_FOCUS_QUERY 21
 #define ID_TIMER_STATE_QUERY 22
 #define ID_TIMER_LANGUAGES 23
+#define ID_TIMER_UPDATE 24
 
 /*
  * Windows silently removes a low-level hook whose callback exceeds the
@@ -83,6 +90,12 @@
 #define IDC_VOCAB_IT 141
 #define IDC_LANGUAGE_FIRST 142
 #define IDC_LANGUAGE_SECOND 143
+#define IDC_BOUNDARY_ONLY 144
+#define IDC_CHECK_UPDATES 145
+#define IDC_MY_WORD 146
+#define IDC_MY_WORD_ADD 147
+#define IDC_MY_WORD_REMOVE 148
+#define IDC_MY_WORDS_OPEN 149
 #define IDC_TILE_VALUE 120      /* 120..123 */
 #define IDC_TILE_CAPTION 130    /* 130..133 */
 #define UI_TILE_COUNT 4
@@ -109,6 +122,9 @@
 #define IDM_FORGET_MEMORY 216
 #define IDM_VOCAB_IT 217
 #define IDM_OPEN_MY_WORDS 218
+#define IDM_KEEP_LAST 219
+#define IDM_CONVERT 220
+#define IDM_UPDATE 221
 
 /* Marks the input KeySwitchFix injects. Chosen at start-up, so another
    program cannot make its keys look like ours. */
@@ -145,6 +161,10 @@ typedef struct SETTINGS {
        language packs. */
     wchar_t language_first[8];
     wchar_t language_second[8];
+    /* 4.4: correct only when a word is finished (never while it is being
+       typed), and the opt-in check for a newer release. */
+    int boundary_only;
+    int check_updates;
     wchar_t excluded[512];
 } SETTINGS;
 
@@ -219,6 +239,9 @@ static int g_exit_requested;
 static int g_hotkey_registered;
 static int g_toggle_hotkey_registered;
 static int g_cleanup_hotkey_registered;
+/* The newer version the opt-in update check found, or empty. */
+static wchar_t g_update_version[24];
+static int g_convert_hotkey_registered;
 /* Snippets: the table, its file, and the file time it was loaded from. */
 static KS_SNIPPET_TABLE g_snippets;
 static wchar_t g_snippets_path[MAX_PATH];
@@ -270,7 +293,12 @@ struct FOCUS_FACTS {
     unsigned long settings_generation;
     DWORD computed_at;
     int excluded;
+    /* Per-application rules from the excluded-apps list (4.4):
+       "name.exe:spelling" and "name.exe:slow". */
+    int no_spelling;
+    int boundary_only;
     int developer_tool;
+    int terminal;
     int remote;
     int protected_field;
     int excel;
@@ -342,6 +370,15 @@ static int g_word_fragment;
 /* The user switched the layout by hand: the next word is typed in the
    layout they chose, on purpose. */
 static int g_manual_switch;
+/* The word being typed continues one that was converted while it was
+   typed (4.4): if the finished word turns out to be nothing in the layout
+   it was converted to, the conversion is taken back. */
+static int g_word_resumed;
+/* The previous key was Enter (or the field was just entered): in a
+   terminal the next word may be a password typed at a prompt that shows
+   nothing, so it is not corrected while it is typed. */
+static int g_after_enter = 1;
+static int g_word_line_first;
 /* The first letter of the current word was capitalised by the hook. */
 static int g_word_auto_capitalized;
 /* Ctrl+Win+X clean-up of the selection: a small state machine driven by
@@ -458,6 +495,8 @@ static KS_BLOOM g_english_wide_prefix_bloom;
 static KS_BLOOM g_persian_wide_prefix_bloom;
 /* Persian word pairs (4.2): the words around a typo help choose its repair. */
 static KS_RANK_TABLE g_persian_pairs;
+/* English word pairs (4.4), from the SymSpell bigram counts. */
+static KS_RANK_TABLE g_english_pairs;
 /* The word a spelling fix just typed: the context of the next word, since
    the fix clears the word history. */
 static wchar_t g_spell_prev[KS_MAX_WORD + 1];
@@ -693,6 +732,8 @@ static void load_settings(void) {
     g_settings.snippets = GetPrivateProfileIntW(L"Typing", L"Snippets", 1, g_settings_path) != 0;
     g_settings.learn_writing = GetPrivateProfileIntW(L"Memory", L"LearnWriting", 0, g_settings_path) != 0;
     g_settings.vocab_it = GetPrivateProfileIntW(L"Vocabulary", L"IT", 1, g_settings_path) != 0;
+    g_settings.boundary_only = GetPrivateProfileIntW(L"General", L"EndOfWordOnly", 0, g_settings_path) != 0;
+    g_settings.check_updates = GetPrivateProfileIntW(L"General", L"CheckUpdates", 0, g_settings_path) != 0;
     GetPrivateProfileStringW(L"Languages", L"First", L"en", g_settings.language_first, 8, g_settings_path);
     GetPrivateProfileStringW(L"Languages", L"Second", L"fa", g_settings.language_second, 8, g_settings_path);
     normalize_language_pair(g_settings.language_first, g_settings.language_second);
@@ -772,6 +813,8 @@ static int save_settings(void) {
         g_startup_registry_failed = !update_startup_registry();
         return 0;
     }
+    /* Names in the excluded-apps list may use any alphabet (4.4). */
+    ks_ensure_unicode_ini(g_settings_path);
     swprintf(number, 16, L"%d", g_settings.enabled);
     ok &= WritePrivateProfileStringW(L"General", L"Enabled", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.sensitivity);
@@ -801,6 +844,10 @@ static int save_settings(void) {
     ok &= WritePrivateProfileStringW(L"Memory", L"LearnWriting", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.vocab_it);
     ok &= WritePrivateProfileStringW(L"Vocabulary", L"IT", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.boundary_only);
+    ok &= WritePrivateProfileStringW(L"General", L"EndOfWordOnly", number, g_settings_path);
+    swprintf(number, 16, L"%d", g_settings.check_updates);
+    ok &= WritePrivateProfileStringW(L"General", L"CheckUpdates", number, g_settings_path);
     ok &= WritePrivateProfileStringW(L"Languages", L"First", g_settings.language_first, g_settings_path);
     ok &= WritePrivateProfileStringW(L"Languages", L"Second", g_settings.language_second, g_settings_path);
     g_startup_registry_failed = !update_startup_registry();
@@ -1238,6 +1285,11 @@ static KS_SCRIPT script_of(wchar_t c);
 static int extra_word_known(const void *context, KS_SLOT slot, const wchar_t *word) {
     (void)context;
     if (g_settings.vocab_it && ks_domain_contains(KS_DOMAIN_IT, slot_model(slot), word)) return 1;
+    /* A word the user kept (Backspace after a change, "Never change", My
+       words) is theirs for the layout decision as well (4.4). */
+    if (g_settings.personal_dictionary && (slot == KS_SLOT_A || slot == KS_SLOT_B) &&
+        script_of(word[0]) == g_slots[slot].script && ks_vocab_trusted(&g_personal_vocabulary, word))
+        return 1;
     if (!g_memory_active || (slot != KS_SLOT_A && slot != KS_SLOT_B) ||
         script_of(word[0]) != g_slots[slot].script)
         return 0;
@@ -1360,6 +1412,7 @@ static void clear_word(void) {
     g_word_peak_complete = 0;
     g_word_count = 0;
     g_word_mixed = 0;
+    g_word_resumed = 0;
     g_overflow_count = 0;
     g_has_context = 0;
     g_skip_word = 0;
@@ -2178,18 +2231,39 @@ static int basename_equals(const wchar_t *path, const wchar_t *candidate, size_t
 }
 
 /* Returns the executable file name (without directory) of a window's process. */
+/* The names of the last few processes asked about. A focus change asks
+   about the same two processes (the host and the focused control's) up to
+   eight times; opening a process is a system call each time. An entry is
+   trusted for a minute: a process id can be reused, a name cannot change. */
+#define PROCESS_NAME_CACHE 4
+static struct {
+    DWORD process_id;
+    DWORD stored_at;
+    wchar_t name[MAX_PATH];
+} g_process_names[PROCESS_NAME_CACHE];
+static int g_process_name_next;
+
 static int query_process_basename(HWND window, wchar_t *name, size_t capacity) {
     DWORD process_id = 0;
     HANDLE process;
     wchar_t path[MAX_PATH];
     DWORD length = MAX_PATH;
     const wchar_t *base;
+    DWORD now = GetTickCount();
+    int i;
 
     if (!name || capacity == 0) return 0;
     name[0] = 0;
     if (!window) return 0;
     GetWindowThreadProcessId(window, &process_id);
     if (!process_id) return 0;
+    for (i = 0; i < PROCESS_NAME_CACHE; ++i) {
+        if (g_process_names[i].process_id == process_id && g_process_names[i].name[0] &&
+            now - g_process_names[i].stored_at < 60000u) {
+            safe_copy(name, capacity, g_process_names[i].name);
+            return name[0] != 0;
+        }
+    }
     process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
     if (!process) return 0;
     if (!QueryFullProcessImageNameW(process, 0, path, &length)) {
@@ -2199,23 +2273,70 @@ static int query_process_basename(HWND window, wchar_t *name, size_t capacity) {
     CloseHandle(process);
     base = wcsrchr(path, L'\\');
     safe_copy(name, capacity, base ? base + 1 : path);
+    if (name[0]) {
+        g_process_names[g_process_name_next].process_id = process_id;
+        g_process_names[g_process_name_next].stored_at = now;
+        safe_copy(g_process_names[g_process_name_next].name, MAX_PATH, name);
+        g_process_name_next = (g_process_name_next + 1) % PROCESS_NAME_CACHE;
+    }
     return name[0] != 0;
 }
 
-static int excluded_list_contains(const wchar_t *name) {
+/*
+ * What the excluded-apps list says about a program. A plain name excludes
+ * it altogether. A name with a rule keeps the layout repair and changes
+ * one thing (4.4):
+ *     WINWORD.EXE:spelling   no spelling correction there
+ *     Telegram.exe:slow      corrections only when a word is finished
+ * A file name cannot contain a colon, so the rule is unambiguous.
+ */
+#define APP_RULE_EXCLUDED 1
+#define APP_RULE_NO_SPELLING 2
+#define APP_RULE_BOUNDARY_ONLY 4
+
+/* The length of an entry's program name, and its rule. */
+static size_t excluded_entry_name(const wchar_t *start, const wchar_t *end, int *rule) {
+    const wchar_t *colon = start;
+    while (colon < end && *colon != L':') ++colon;
+    *rule = APP_RULE_EXCLUDED;
+    if (colon < end) {
+        const wchar_t *word = colon + 1;
+        size_t length;
+        while (word < end && *word == L' ') ++word;
+        length = (size_t)(end - word);
+        if (length == 8 && _wcsnicmp(word, L"spelling", 8) == 0) *rule = APP_RULE_NO_SPELLING;
+        else if (length == 4 && _wcsnicmp(word, L"slow", 4) == 0) *rule = APP_RULE_BOUNDARY_ONLY;
+        /* An unknown rule is read as the safe one: excluded. */
+        end = colon;
+        while (end > start && end[-1] == L' ') --end;
+    }
+    return (size_t)(end - start);
+}
+
+/* The rules (APP_RULE_*) the list holds for a program; 0 when none. */
+static int excluded_list_rules(const wchar_t *name) {
     const wchar_t *cursor = g_settings.excluded;
+    int rules = 0;
     if (!name || !*name) return 0;
     while (*cursor) {
         const wchar_t *start;
         const wchar_t *end;
+        size_t length;
+        int rule;
         while (*cursor == L' ' || *cursor == L',' || *cursor == L';') ++cursor;
         start = cursor;
         while (*cursor && *cursor != L',' && *cursor != L';') ++cursor;
         end = cursor;
         while (end > start && end[-1] == L' ') --end;
-        if (end > start && basename_equals(name, start, (size_t)(end - start))) return 1;
+        if (end <= start) continue;
+        length = excluded_entry_name(start, end, &rule);
+        if (length && basename_equals(name, start, length)) rules |= rule;
     }
-    return 0;
+    return rules;
+}
+
+static int excluded_list_contains(const wchar_t *name) {
+    return (excluded_list_rules(name) & APP_RULE_EXCLUDED) != 0;
 }
 
 static void excluded_list_toggle(const wchar_t *name) {
@@ -2266,6 +2387,7 @@ static void excluded_list_toggle(const wchar_t *name) {
 
 static HWND focused_window(HWND foreground);
 
+/* APP_RULE_* for the application the user is typing in. */
 static int compute_process_excluded(HWND foreground) {
     DWORD process_id = 0;
     wchar_t name[MAX_PATH];
@@ -2277,7 +2399,7 @@ static int compute_process_excluded(HWND foreground) {
     GetWindowThreadProcessId(foreground, &process_id);
     GetWindowThreadProcessId(focus, &focus_process_id);
     if (!process_id || process_id == GetCurrentProcessId() ||
-        focus_process_id == GetCurrentProcessId()) return 1;
+        focus_process_id == GetCurrentProcessId()) return APP_RULE_EXCLUDED;
     if (!query_process_basename(foreground, name, MAX_PATH)) return 0;
     /*
      * The focused control may belong to another process: the app behind a
@@ -2291,7 +2413,7 @@ static int compute_process_excluded(HWND foreground) {
         query_process_basename(focus, focus_name, MAX_PATH);
     safe_copy(g_last_typed_process, MAX_PATH,
               focus_name[0] && _wcsicmp(name, L"ApplicationFrameHost.exe") == 0 ? focus_name : name);
-    return excluded_list_contains(name) || (focus_name[0] && excluded_list_contains(focus_name));
+    return excluded_list_rules(name) | (focus_name[0] ? excluded_list_rules(focus_name) : 0);
 }
 
 static HWND focused_window(HWND foreground) {
@@ -2789,8 +2911,23 @@ static void store_phrase_undo(HWND foreground, KS_SLOT source_language,
     safe_copy(g_undo.replacement, KS_MAX_PHRASE_CHARS + 1, replacement);
 }
 
+/* The word the program changed last, as the user typed it: the tray menu
+   offers to never change it again (4.4). One word only, never a phrase. */
+static wchar_t g_last_changed[KS_MAX_WORD + 1];
+static KS_SLOT g_last_changed_slot;
+
+static void remember_last_change(const wchar_t *original, KS_SLOT slot) {
+    g_last_changed[0] = 0;
+    if (!original || !*original || wcslen(original) > KS_MAX_WORD || wcschr(original, L' ') ||
+        (slot != KS_SLOT_A && slot != KS_SLOT_B) || typed_text_private())
+        return;
+    safe_copy(g_last_changed, KS_MAX_WORD + 1, original);
+    g_last_changed_slot = slot;
+}
+
 static void store_undo(HWND foreground, const KS_DECISION *decision,
                        UINT delimiter, int delimiter_zwnj) {
+    remember_last_change(decision->original, decision->source_slot);
     store_phrase_undo(foreground, decision->source_slot, delimiter,
                       delimiter_zwnj, decision->original, decision->replacement);
 }
@@ -3200,6 +3337,45 @@ static void personal_dictionary_poll(void) {
     personal_dictionary_file_time(&g_personal_dictionary_time);
 }
 
+/*
+ * "Never change this word": the word is the user's from now on. Spelling
+ * leaves it alone (ignore list, personal dictionary) and the layout
+ * decision counts it as a word of its language. Returns 1 when it is kept;
+ * with "Remember undone words" off it is kept until the program exits.
+ */
+static int keep_word_forever(const wchar_t *typed, KS_SLOT slot) {
+    wchar_t word[KS_MAX_WORD + 1];
+    const wchar_t *cursor;
+    if (!typed || !*typed || wcslen(typed) > KS_MAX_WORD) return 0;
+    for (cursor = typed; *cursor; ++cursor)
+        if (*cursor == L' ' || *cursor == L'\t' || *cursor == L'\r' || *cursor == L'\n') return 0;
+    safe_copy(word, KS_MAX_WORD + 1, typed);
+    ks_ignore_list_add(&g_spelling_ignore, word);
+    if (slot == KS_SLOT_A || slot == KS_SLOT_B) lower_for_slot(word, slot);
+    else lower_first(word);
+    ks_ignore_list_add(&g_spelling_ignore, word);
+    ks_vocab_trust(&g_session_vocabulary, word);
+    if (!g_settings.personal_dictionary) return 1;
+    if (ks_vocab_trusted(&g_personal_vocabulary, word)) return 1;
+    if (!append_personal_dictionary(word)) return 0;
+    ks_vocab_trust(&g_personal_vocabulary, word);
+    return 1;
+}
+
+/* Takes a word out of the kept words; returns 1 when it was there. */
+static int forget_kept_word(const wchar_t *typed) {
+    wchar_t word[KS_MAX_WORD + 1];
+    int found;
+    if (!typed || !*typed || wcslen(typed) > KS_MAX_WORD) return 0;
+    safe_copy(word, KS_MAX_WORD + 1, typed);
+    found = ks_vocab_forget(&g_personal_vocabulary, word);
+    lower_first(word);
+    found |= ks_vocab_forget(&g_personal_vocabulary, word);
+    ks_vocab_forget(&g_session_vocabulary, word);
+    if (found && g_settings.personal_dictionary) save_personal_dictionary();
+    return found;
+}
+
 static void open_my_words(void) {
     if (!g_settings.personal_dictionary) {
         set_activity(L"Turn on \u201cRemember undone words\u201d first (Correction page).");
@@ -3227,7 +3403,15 @@ static void open_my_words(void) {
  * active there, but spelling correction is skipped below Aggressive. The
  * user-editable "Excluded apps" list still disables everything.
  */
+/* Returns 1 for a code editor or database tool, 2 for a terminal (where a
+   password prompt shows nothing and cannot be detected). */
 static int developer_tool_process(HWND foreground) {
+    static const wchar_t *const terminals[] = {
+        L"WindowsTerminal.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+        L"conhost.exe", L"OpenConsole.exe", L"mintty.exe", L"alacritty.exe",
+        L"wezterm-gui.exe", L"putty.exe", L"git-bash.exe", L"bash.exe", L"wsl.exe",
+        L"ubuntu.exe", L"kitty.exe", L"MobaXterm.exe", L"SecureCRT.exe"
+    };
     static const wchar_t *const developer_tools[] = {
         L"WindowsTerminal.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
         L"conhost.exe", L"OpenConsole.exe", L"mintty.exe", L"alacritty.exe",
@@ -3250,6 +3434,8 @@ static int developer_tool_process(HWND foreground) {
         /* The host process, then the focused control's process (a UWP app
            behind its frame, a web view inside an IDE). */
         if (!query_process_basename(pass ? focus : foreground, name, MAX_PATH)) continue;
+        for (i = 0; i < sizeof(terminals) / sizeof(terminals[0]); ++i)
+            if (_wcsicmp(name, terminals[i]) == 0) return 2;
         for (i = 0; i < sizeof(developer_tools) / sizeof(developer_tools[0]); ++i) {
             if (_wcsicmp(name, developer_tools[i]) == 0) return 1;
         }
@@ -3301,9 +3487,16 @@ static const FOCUS_FACTS *focus_facts(HWND foreground) {
     g_facts.focus_serial = g_focus_serial;
     g_facts.settings_generation = g_settings_generation;
     g_facts.computed_at = now ? now : 1;
-    g_facts.excluded = compute_process_excluded(foreground);
-    g_facts.remote = remote_session_process(foreground);
-    g_facts.developer_tool = g_facts.remote || developer_tool_process(foreground);
+    {
+        int rules = compute_process_excluded(foreground);
+        int tool = developer_tool_process(foreground);
+        g_facts.excluded = (rules & APP_RULE_EXCLUDED) != 0;
+        g_facts.no_spelling = (rules & APP_RULE_NO_SPELLING) != 0;
+        g_facts.boundary_only = (rules & APP_RULE_BOUNDARY_ONLY) != 0;
+        g_facts.remote = remote_session_process(foreground);
+        g_facts.developer_tool = g_facts.remote || tool != 0;
+        g_facts.terminal = tool == 2;
+    }
     g_facts.autocorrect_app = autocorrect_process(foreground);
     /* g_focus_event_protected is -1 while the accessibility query for the
        field is still running: unknown counts as protected. */
@@ -3349,6 +3542,7 @@ static void engine_reset_for_focus(void) {
     /* The Excel cell state is left alone: F2 or a double-click may move the
        focus to the cell editor, which is exactly the "editing" state. */
     g_word_untrusted = 0;
+    g_after_enter = 1;
     /* The cached focused control belongs to the old field (Tab between
        fields keeps the same top-level window). */
     g_target.thread = 0;
@@ -3588,6 +3782,8 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
        only once a correction is actually about to be applied. */
     if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground))
         return SPELL_SUPPRESSED;
+    /* "name.exe:spelling" in the excluded-apps list. */
+    if (focus_facts(foreground)->no_spelling) return SPELL_SUPPRESSED;
     if (is_protected_field(foreground)) {
         set_activity(L"Correction skipped in a protected password field.");
         return SPELL_SUPPRESSED;
@@ -3633,6 +3829,7 @@ static int try_spelling_correction(HWND foreground, UINT delimiter, int delimite
  * "P' W", and one Backspace restores "P W" and keeps P.
  */
 static int helpers_suppressed(HWND foreground);
+static int live_correction_allowed(HWND foreground);
 
 static int try_respell_previous(HWND foreground, UINT delimiter, int delimiter_zwnj) {
     const WORD_HISTORY *last;
@@ -3658,7 +3855,7 @@ static int try_respell_previous(HWND foreground, UINT delimiter, int delimiter_z
        phrases (writing memory, both languages). */
     if (!lexicon->pairs && !g_memory_active) return 0;
     /* Word and Outlook rewrite text behind the caret themselves. */
-    if (focus_facts(foreground)->autocorrect_app) return 0;
+    if (focus_facts(foreground)->autocorrect_app || focus_facts(foreground)->no_spelling) return 0;
     if (g_settings.spelling < KS_SPELL_AGGRESSIVE && spelling_skipped_process(foreground)) return 0;
     tokens_to_language(last->tokens, last->count, last->visible_language, previous);
     tokens_to_language(g_word, g_word_count, g_word_language, current);
@@ -4023,6 +4220,21 @@ static int try_undo(int consume_delimiter) {
    get the raw keys: digits, punctuation and letters are never reshaped
    there. focus_facts caches per focused element and is invalidated by focus
    events (a browser's login fields share one window) and settings changes. */
+/*
+ * May a word be corrected while it is still being typed? Not when the user
+ * asked for corrections at the end of a word only (globally, or for this
+ * application with "name.exe:slow"), and not for the first word of a line
+ * in a terminal: a password typed at a prompt shows nothing, and changing
+ * it (and the layout) unseen would lock the user out. At Space the word is
+ * corrected as usual.
+ */
+static int live_correction_allowed(HWND foreground) {
+    const FOCUS_FACTS *facts = focus_facts(foreground);
+    if (g_settings.boundary_only || facts->boundary_only) return 0;
+    if (facts->terminal && g_word_line_first) return 0;
+    return 1;
+}
+
 static int helpers_suppressed(HWND foreground) {
     const FOCUS_FACTS *facts = focus_facts(foreground);
     return facts->excluded || facts->remote || facts->developer_tool || facts->protected_field;
@@ -4359,7 +4571,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam);
 /* The X of Ctrl+Win+X still held (and auto-repeating) while the clean-up
    it started runs: not a key the user typed into the field. */
 static int cleanup_hotkey_held(DWORD key) {
-    return g_cleanup_step != 0 && key == 'X' && (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+    return g_cleanup_step != 0 && (key == 'X' || key == 'Z') && (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
            ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000));
 }
 
@@ -4745,6 +4957,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
                than the translation window: a mixed word, repaired whole at
                the next evaluation. */
             g_word_mixed = g_pending_word.visible_language != language;
+            g_word_resumed = 1;
             g_overflow_count = 0;
             g_has_context = 1;
             g_word_window = foreground;
@@ -4795,6 +5008,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         }
         if (g_word_count == 0) {
             g_word_after_boundary = g_previous_key_boundary;
+            g_word_line_first = g_after_enter;
+            g_after_enter = 0;
             g_word_fragment = g_previous_key_joined;
             g_word_auto_capitalized = capitalize;
         }
@@ -4833,7 +5048,8 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
             if (g_word_mixed) return deliver_key(code, wparam, lparam, data, translate, shift, caps, foreground, language, capitalize);
         }
 
-        if (!g_overflow_count && !(g_word_fragment && g_word_count <= 3)) {
+        if (!g_overflow_count && !(g_word_fragment && g_word_count <= 3) &&
+            live_correction_allowed(foreground)) {
             intent = current_intent(foreground, &intent_strength);
             live_result = ks_evaluate_contextual(
                 g_word, g_word_count, g_word_language, g_settings.sensitivity,
@@ -4904,6 +5120,7 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
         g_previous_key_boundary = boundary_key == VK_SPACE || boundary_key == VK_RETURN ||
                                   boundary_key == VK_TAB;
         g_previous_key_joined = 0;
+        g_after_enter = boundary_key == VK_RETURN;
         /* Snippets and the lone "i" come before every other evaluation:
            the user asked for exactly this text. */
         if (!g_skip_word && !g_overflow_count && !g_word_mixed && g_word_count > 0 &&
@@ -4976,6 +5193,38 @@ static LRESULT keyboard_hook_body(int code, WPARAM wparam, LPARAM lparam) {
          * isolated-word decision. A later word can therefore supply the
          * missing evidence for earlier ambiguous text.
          */
+        /*
+         * This word was converted while it was being typed, and the user
+         * went on typing it. Finished, it is nothing in the layout it was
+         * converted to, while the keys spell a name or a form of the
+         * original layout (kavanaugh, converted at "kav"): the conversion
+         * was wrong, so the word and the layout go back.
+         */
+        if (g_word_resumed && !g_skip_word && !g_overflow_count && !g_word_mixed && g_word_count >= 4 &&
+            slot_valid(g_word_language)) {
+            int resumed_known[3] = {0, 0, 0};
+            KS_SLOT original_slot = KS_OTHER_SLOT(g_word_language);
+            if (ks_classify_word(g_word, g_word_count, &g_lexicons, resumed_known, NULL) &&
+                !resumed_known[g_word_language] && !resumed_known[original_slot] &&
+                !ks_reading_attested(g_word, g_word_count, g_word_language, &g_lexicons) &&
+                ks_reading_attested(g_word, g_word_count, original_slot, &g_lexicons)) {
+                memset(&decision, 0, sizeof(decision));
+                decision.should_correct = 1;
+                decision.key_count = g_word_count;
+                decision.confidence = 90;
+                decision.source_slot = g_word_language;
+                decision.target_slot = original_slot;
+                tokens_to_language(g_word, g_word_count, g_word_language, decision.original);
+                tokens_to_language(g_word, g_word_count, original_slot, decision.replacement);
+                if (apply_decision(foreground, &decision, g_word_count, boundary_key, zwnj)) {
+                    history_push(foreground, g_word, g_word_count, original_slot, boundary_key, zwnj);
+                    suppress_key_up(data->vkCode);
+                    if (terminates_sentence) start_new_sentence(foreground);
+                    clear_word();
+                    return 1;
+                }
+            }
+        }
         if (!g_skip_word && !g_overflow_count && g_word_count > 0 && !short_fragment &&
             try_sequence_correction(
                 foreground, g_word, g_word_count, g_word_language,
@@ -5523,11 +5772,70 @@ static int clipboard_owned_by_cleanup_target(void) {
 static unsigned long g_cleanup_focus_serial;
 static unsigned long g_cleanup_key_serial;
 
-static void start_selection_cleanup(void) {
+/* 0: clean up the selection; 1: convert it to the other layout (4.4). */
+static int g_cleanup_convert;
+/* The layout the converted text belongs to: the application is asked to
+   switch to it after the paste. */
+static KS_SLOT g_cleanup_convert_target;
+
+/*
+ * Rewrites text as the same keys would have typed it in the other layout
+ * of the pair: "sghl" becomes "سلام" and back. The direction is the script
+ * most of its letters are in. Characters that no key of the pair types
+ * stay as they are. Returns 1 when anything changed.
+ */
+static int convert_text_layout(wchar_t *text, KS_SLOT *target_slot) {
+    static KS_TOKEN table[2 * 0x40];
+    int entries = 0;
+    int votes[3] = {0, 0, 0};
+    DWORD scan;
+    int shift;
+    KS_SLOT source;
+    KS_SLOT target;
+    wchar_t *cursor;
+    int changed = 0;
+    for (scan = 0x02; scan < 0x40 && entries + 2 <= (int)(sizeof(table) / sizeof(table[0])); ++scan)
+        for (shift = 0; shift < 2; ++shift) {
+            KS_TOKEN token;
+            if (map_physical_key(scan, shift, 0, &token) > 0 && token.a && token.b && token.a != token.b)
+                table[entries++] = token;
+        }
+    for (cursor = text; *cursor; ++cursor) {
+        if (!ks_is_letter(*cursor)) continue;
+        if (script_of(*cursor) == g_slots[KS_SLOT_A].script) ++votes[KS_SLOT_A];
+        else if (script_of(*cursor) == g_slots[KS_SLOT_B].script) ++votes[KS_SLOT_B];
+    }
+    if (!votes[KS_SLOT_A] && !votes[KS_SLOT_B]) return 0;
+    source = votes[KS_SLOT_B] > votes[KS_SLOT_A] ? KS_SLOT_B : KS_SLOT_A;
+    target = KS_OTHER_SLOT(source);
+    for (cursor = text; *cursor; ++cursor) {
+        int i;
+        /* A half-space was Shift+Space: a space in the other layout. */
+        if (*cursor == (wchar_t)ZWNJ && slot_is(source, KS_LANG_PERSIAN)) {
+            *cursor = L' ';
+            changed = 1;
+            continue;
+        }
+        for (i = 0; i < entries; ++i) {
+            wchar_t from = source == KS_SLOT_A ? table[i].a : table[i].b;
+            if (from == *cursor) {
+                *cursor = source == KS_SLOT_A ? table[i].b : table[i].a;
+                changed = 1;
+                break;
+            }
+        }
+    }
+    if (target_slot) *target_slot = target;
+    return changed;
+}
+
+static void start_selection_cleanup(int convert) {
     HWND foreground = GetForegroundWindow();
     if (g_cleanup_step) return;
+    g_cleanup_convert = convert;
     if (!foreground || foreground == g_window) {
-        set_activity(L"Select text in another application, then press Ctrl + Win + X.");
+        set_activity(convert ? L"Select text in another application, then press Ctrl + Win + Z."
+                             : L"Select text in another application, then press Ctrl + Win + X.");
         return;
     }
     /* Never inject Ctrl+C into a terminal (it interrupts the running
@@ -5574,6 +5882,18 @@ static void continue_selection_cleanup(void) {
             if (any_modifier_down()) {
                 if (GetTickCount() - g_cleanup_started_at > 3000u) finish_selection_cleanup();
                 return;
+            }
+            {
+                /* Saving the clipboard asks its owner to render every
+                   format. An owner that does not answer would hold this
+                   thread, and with it every key and mouse move (the hooks
+                   live here), until Windows gives up on it. */
+                HWND owner = GetClipboardOwner();
+                if (owner && IsHungAppWindow(owner)) {
+                    set_activity(L"Skipped: the program that owns the clipboard is not responding.");
+                    finish_selection_cleanup();
+                    return;
+                }
             }
             clipboard_snapshot_take(&g_cleanup_saved_clipboard);
             if (!g_cleanup_saved_clipboard.valid || g_cleanup_saved_clipboard.partial) {
@@ -5641,6 +5961,15 @@ static void continue_selection_cleanup(void) {
                 SetTimer(g_window, ID_TIMER_CLEANUP, 50, NULL);
                 return;
             }
+            if (g_cleanup_convert) {
+                if (!convert_text_layout(text, &g_cleanup_convert_target)) {
+                    set_activity(L"Nothing in the selection is typed with the letter keys of your two layouts.");
+                    HeapFree(GetProcessHeap(), 0, text);
+                    g_cleanup_step = 4;
+                    SetTimer(g_window, ID_TIMER_CLEANUP, 50, NULL);
+                    return;
+                }
+            } else
             /* The Persian clean-ups only where Persian is one of the two
                languages: Arabic text keeps its ي ك, Russian text its digits. */
             if (!ks_clean_text(text, g_settings.persian_letters && slot_of_model(KS_LANG_PERSIAN) != KS_SLOT_NONE,
@@ -5672,6 +6001,12 @@ static void continue_selection_cleanup(void) {
                 return;
             }
             send_shortcut('V');
+            if (g_cleanup_convert) {
+                /* What follows is typed in the layout the text now is in. */
+                request_layout(g_cleanup_target, g_cleanup_convert_target);
+                remember_intent(g_cleanup_target, g_cleanup_convert_target, 3);
+                set_activity(L"Selection converted to the other keyboard layout.");
+            } else
             set_activity(L"Selection cleaned up: Persian letters, digits and punctuation.");
             g_cleanup_step = 4;
             SetTimer(g_window, ID_TIMER_CLEANUP, 900, NULL);
@@ -5734,6 +6069,9 @@ static void show_tray_menu(int x, int y) {
         AppendMenuW(helpers_menu, MF_STRING | MF_GRAYED, IDM_CLEANUP,
                     g_cleanup_hotkey_registered ? L"Clean up selected text:  Ctrl + Win + X"
                                                 : L"Clean up selected text: hotkey used by another app");
+        AppendMenuW(helpers_menu, MF_STRING | MF_GRAYED, IDM_CONVERT,
+                    g_convert_hotkey_registered ? L"Convert selected text to the other layout:  Ctrl + Win + Z"
+                                                : L"Convert selected text: hotkey used by another app");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)helpers_menu, L"Typing helpers");
     }
     {
@@ -5764,7 +6102,24 @@ static void show_tray_menu(int x, int y) {
                  escaped);
         AppendMenuW(menu, MF_STRING, IDM_EXCLUDE_CURRENT, label);
     }
+    if (g_last_changed[0]) {
+        wchar_t label[KS_MAX_WORD * 2 + 48];
+        wchar_t escaped[KS_MAX_WORD * 2 + 2];
+        size_t in = 0, out = 0;
+        for (; g_last_changed[in] && out + 2 < sizeof(escaped) / sizeof(escaped[0]); ++in) {
+            if (g_last_changed[in] == L'&') escaped[out++] = L'&';
+            escaped[out++] = g_last_changed[in];
+        }
+        escaped[out] = 0;
+        swprintf(label, sizeof(label) / sizeof(label[0]), L"Never change \u201c%ls\u201d again", escaped);
+        AppendMenuW(menu, MF_STRING, IDM_KEEP_LAST, label);
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    if (g_update_version[0]) {
+        wchar_t label[64];
+        swprintf(label, 64, L"Download version %ls\u2026", g_update_version);
+        AppendMenuW(menu, MF_STRING, IDM_UPDATE, label);
+    }
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
     SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
     SetForegroundWindow(g_window);
@@ -5842,6 +6197,9 @@ static HBRUSH g_brush_tile;
 static HWND g_tile_values[UI_TILE_COUNT];
 static HWND g_tile_captions[UI_TILE_COUNT];
 static HWND g_personal_dictionary;
+static HWND g_boundary_only;
+static HWND g_my_word;
+static HWND g_check_updates;
 static HWND g_digits;
 static HWND g_punctuation;
 static HWND g_persian_letters;
@@ -6152,6 +6510,131 @@ static void update_tray_tip(void) {
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
+/* ---- Update check (4.4, opt-in) -------------------------------------------- */
+
+/*
+ * Off by default: KeySwitchFix makes no network request unless the user
+ * turns "Check for updates" on. Then, once a day, one HTTPS request asks
+ * GitHub for the latest release tag. Nothing about the user or their
+ * typing is sent, nothing is downloaded or installed: a newer version is
+ * announced in the tray, and the menu opens the release page.
+ */
+#define UPDATE_RELEASES_PAGE L"https://github.com/samaliyan/KeySwitchFix/releases/latest"
+
+static volatile LONG g_update_running;
+static ULONGLONG g_update_checked_at;
+
+/* 1 when the release tag ("v4.5.0", "4.5") names a later version than
+   `current` ("4.4.0"). Anything that is not three small numbers is not. */
+static int version_newer(const wchar_t *tag, const wchar_t *current) {
+    int a[3] = {0, 0, 0};
+    int b[3] = {0, 0, 0};
+    int i;
+    if (!tag || !current) return 0;
+    if (*tag == L'v' || *tag == L'V') ++tag;
+    if (*tag < L'0' || *tag > L'9') return 0;
+    for (i = 0; i < 3; ++i) {
+        int digits = 0;
+        while (*tag >= L'0' && *tag <= L'9' && digits < 5) { a[i] = a[i] * 10 + (*tag++ - L'0'); ++digits; }
+        if (*tag >= L'0' && *tag <= L'9') return 0;
+        if (*tag != L'.') break;
+        ++tag;
+    }
+    if (*tag && *tag != L'.') return 0;   /* "4.5.0-beta" is not offered */
+    for (i = 0; i < 3; ++i) {
+        while (*current >= L'0' && *current <= L'9') b[i] = b[i] * 10 + (*current++ - L'0');
+        if (*current != L'.') break;
+        ++current;
+    }
+    for (i = 0; i < 3; ++i)
+        if (a[i] != b[i]) return a[i] > b[i];
+    return 0;
+}
+
+#ifndef KS_WIN32SIM
+static DWORD WINAPI update_check_thread(LPVOID unused) {
+    HINTERNET session = NULL, connection = NULL, request = NULL;
+    char body[4096];
+    DWORD used = 0;
+    wchar_t found[24];
+    (void)unused;
+    found[0] = 0;
+    session = WinHttpOpen(L"KeySwitchFix", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                          WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session) {
+        WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
+        connection = WinHttpConnect(session, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    }
+    if (connection)
+        request = WinHttpOpenRequest(connection, L"GET", L"/repos/samaliyan/KeySwitchFix/releases/latest", NULL,
+                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (request &&
+        WinHttpSendRequest(request, L"Accept: application/vnd.github+json\r\n", (DWORD)-1,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(request, NULL)) {
+        DWORD status = 0;
+        DWORD size = sizeof(status);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) &&
+            status == 200) {
+            /* The tag is near the start of the answer; 4 KB is plenty. */
+            for (;;) {
+                DWORD got = 0;
+                if (used >= sizeof(body) - 1 ||
+                    !WinHttpReadData(request, body + used, (DWORD)(sizeof(body) - 1 - used), &got) || !got)
+                    break;
+                used += got;
+            }
+            body[used] = 0;
+            {
+                const char *key = strstr(body, "\"tag_name\"");
+                const char *value = key ? strchr(key + 10, ':') : NULL;
+                value = value ? strchr(value, '"') : NULL;
+                if (value) {
+                    int i = 0;
+                    for (++value; *value && *value != '"' && i < 23; ++value) {
+                        /* Digits, dots and a leading v only. */
+                        if ((*value >= '0' && *value <= '9') || *value == '.' || *value == 'v' || *value == 'V')
+                            found[i++] = (wchar_t)*value;
+                        else {
+                            i = 0;
+                            break;
+                        }
+                    }
+                    found[i] = 0;
+                }
+            }
+        }
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    if (session) WinHttpCloseHandle(session);
+    if (found[0] && version_newer(found, APP_VERSION)) {
+        /* The window copies it on its own thread. */
+        static wchar_t result[24];
+        safe_copy(result, 24, found[0] == L'v' || found[0] == L'V' ? found + 1 : found);
+        if (g_window) PostMessageW(g_window, WM_APP_UPDATE, 0, (LPARAM)result);
+    }
+    InterlockedExchange(&g_update_running, 0);
+    return 0;
+}
+#endif
+
+/* Starts a check when the option is on and the last one is a day old. */
+static void update_check_now(int force) {
+    ULONGLONG now = GetTickCount64();
+    if (!g_settings.check_updates) return;
+    if (!force && g_update_checked_at && now - g_update_checked_at < 24ull * 60 * 60 * 1000) return;
+    g_update_checked_at = now ? now : 1;
+#ifndef KS_WIN32SIM
+    if (InterlockedCompareExchange(&g_update_running, 1, 0) == 0) {
+        HANDLE thread = CreateThread(NULL, 0, update_check_thread, NULL, 0, NULL);
+        if (thread) CloseHandle(thread);
+        else InterlockedExchange(&g_update_running, 0);
+    }
+#endif
+}
+
 static void show_balloon(const wchar_t *title, const wchar_t *text) {
     /* NIF_REALTIME: a note that cannot be shown now is dropped rather than
        queued in the notification centre. */
@@ -6301,6 +6784,8 @@ static void update_controls_from_settings(void) {
     SendMessageW(g_personal_dictionary, BM_SETCHECK,
                  g_settings.personal_dictionary ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_startup, BM_SETCHECK, g_settings.start_with_windows ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_boundary_only, BM_SETCHECK, g_settings.boundary_only ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_check_updates, BM_SETCHECK, g_settings.check_updates ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_digits, CB_SETCURSEL, (WPARAM)g_settings.digits, 0);
     SendMessageW(g_punctuation, BM_SETCHECK, g_settings.punctuation ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_persian_letters, BM_SETCHECK, g_settings.persian_letters ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -6364,6 +6849,8 @@ static void read_controls_to_settings(void) {
         g_pending_keep_ready = 0;
     }
     g_settings.start_with_windows = SendMessageW(g_startup, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_settings.boundary_only = SendMessageW(g_boundary_only, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_settings.check_updates = SendMessageW(g_check_updates, BM_GETCHECK, 0, 0) == BST_CHECKED;
     selection = SendMessageW(g_digits, CB_GETCURSEL, 0, 0);
     if (selection >= KS_DIGITS_OFF && selection <= KS_DIGITS_LATIN) g_settings.digits = (int)selection;
     g_settings.punctuation = SendMessageW(g_punctuation, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -6391,7 +6878,13 @@ static void apply_controls(void) {
        values read as zero: never save those. */
     if (!g_ui_ready) return;
     g_language_pair_changed = 0;
-    read_controls_to_settings();
+    {
+        int checked_before = g_settings.check_updates;
+        read_controls_to_settings();
+        /* Just switched on: look now, not in a day. */
+        if (g_settings.check_updates && !checked_before) update_check_now(1);
+        if (!g_settings.check_updates) g_update_version[0] = 0;
+    }
     memory_apply_setting();
     clear_word();
     clear_history();
@@ -6453,11 +6946,12 @@ static void update_shortcuts_text(void) {
     swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]),
              L"Undo a correction:  Backspace right after it%ls\n"
              L"Pause or resume everywhere:  Ctrl + Win + K%ls\n"
-             L"Clean up selected text:  Ctrl + Win + X%ls\n"
+             L"Clean up selected text:  Ctrl + Win + X%ls     Convert its layout:  Ctrl + Win + Z%ls\n"
              L"Switch pages here:  Ctrl + Tab     Hide this window:  Esc",
              g_hotkey_registered ? L", or Ctrl + Win + Backspace" : L"",
              g_toggle_hotkey_registered ? L"" : L"   (unavailable: used by another app)",
-             g_cleanup_hotkey_registered ? L"" : L"   (unavailable: used by another app)");
+             g_cleanup_hotkey_registered ? L"" : L" (unavailable)",
+             g_convert_hotkey_registered ? L"" : L" (unavailable)");
     set_label_text(g_shortcuts_label, buffer);
 }
 
@@ -6664,6 +7158,10 @@ static void create_ui(HWND window) {
     g_spelling = combo(window, 0, 3, IDC_SPELLING, spelling, 4);
     g_startup = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(0) + 2, UI_SIDE_WIDTH, L"Start with Wi&ndows",
                          IDC_APP_STARTUP);
+    g_boundary_only = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(1) + 2, UI_SIDE_WIDTH,
+                               L"Fix at &end of word only", IDC_BOUNDARY_ONLY);
+    g_check_updates = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(2) + 2, UI_SIDE_WIDTH,
+                               L"Chec&k for updates", IDC_CHECK_UPDATES);
     g_personal_dictionary = checkbox(window, 0, UI_SIDE_LEFT, UI_ROW(3) + 2, UI_SIDE_WIDTH,
                                      L"&Remember undone words", IDC_PERSONAL_DICTIONARY);
     row_label(window, 0, 4, L"E&xcluded apps");
@@ -6674,9 +7172,10 @@ static void create_ui(HWND window) {
     /* The setting holds 511 characters: stop there rather than cut silently. */
     SendMessageW(g_excluded, EM_SETLIMITTEXT, 511, 0);
     hint(window, 0, UI_CONTROL_LEFT, UI_ROW(5) - 4, UI_CARD_RIGHT - 24 - UI_CONTROL_LEFT, 64,
-         L"Program file names separated by commas, for example KeePass.exe; the tray menu can "
-         L"exclude the app you last typed in. One Backspace right after a correction restores "
-         L"what you typed (Remember undone words keeps it).", 0);
+         L"Program file names separated by commas (KeePass.exe); the tray menu can exclude the "
+         L"app you last typed in. Add :spelling to switch off only spelling there "
+         L"(WINWORD.EXE:spelling), or :slow to correct only at the end of a word. One Backspace "
+         L"right after a correction restores what you typed.", 0);
 
     /* Page 1: Typing. */
     row_label(window, 1, 0, L"&Digits");
@@ -6717,6 +7216,17 @@ static void create_ui(HWND window) {
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     g_vocab_it = checkbox(window, 2, UI_CONTROL_LEFT, UI_ROW(4) + 16, 520,
                           L"&IT && computing terms (about 1,400 English and Persian words)", IDC_VOCAB_IT);
+    /* My words: a word typed here is never changed (or is changed again). */
+    row_label(window, 2, 5, L"&My words");
+    SetWindowPos(g_row_labels[g_row_label_count - 1], NULL, scale(UI_LABEL_LEFT), scale(UI_ROW(5) + 22), 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    g_my_word = create_child(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
+                             UI_CONTROL_LEFT, UI_ROW(5) + 20, 180, 26, window, IDC_MY_WORD);
+    page_add(2, g_my_word);
+    SendMessageW(g_my_word, EM_SETLIMITTEXT, KS_MAX_WORD, 0);
+    button(window, 2, L"&Keep", UI_CONTROL_LEFT + 192, UI_ROW(5) + 16, 84, IDC_MY_WORD_ADD);
+    button(window, 2, L"Remo&ve", UI_CONTROL_LEFT + 284, UI_ROW(5) + 16, 92, IDC_MY_WORD_REMOVE);
+    button(window, 2, L"Open lis&t…", UI_CONTROL_LEFT + 384, UI_ROW(5) + 16, 120, IDC_MY_WORDS_OPEN);
 
     /* Page 3: Statistics. */
     create_tile(window, 0, UI_LABEL_LEFT, UI_ROW(0) - 4, L"layout fixes today");
@@ -7370,6 +7880,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                  (id == IDC_SENSITIVITY || id == IDC_LANGUAGE_MODE || id == IDC_SPELLING || id == IDC_DIGITS)) ||
                 (notification == BN_CLICKED &&
                  (id == IDC_APP_STARTUP || id == IDC_PERSONAL_DICTIONARY || id == IDC_PUNCTUATION ||
+                  id == IDC_BOUNDARY_ONLY || id == IDC_CHECK_UPDATES ||
                   id == IDC_PERSIAN_LETTERS || id == IDC_CAPITALIZE || id == IDC_SNIPPETS ||
                   id == IDC_LEARN_WRITING || id == IDC_VOCAB_IT)) ||
                 (notification == CBN_CLOSEUP &&
@@ -7493,8 +8004,54 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                     open_memory_file();
                     return 0;
                 case IDM_OPEN_MY_WORDS:
+                case IDC_MY_WORDS_OPEN:
                     open_my_words();
                     return 0;
+                case IDM_KEEP_LAST:
+                    if (g_last_changed[0]) {
+                        if (keep_word_forever(g_last_changed, g_last_changed_slot))
+                            set_activity_pair(L"Kept", g_last_changed,
+                                              g_settings.personal_dictionary ? L"never changed again"
+                                                                             : L"not changed until you exit");
+                        else
+                            set_activity(L"The word could not be saved to your kept words.");
+                        g_last_changed[0] = 0;
+                    }
+                    return 0;
+                case IDM_CONVERT:
+                    set_activity(L"Select text in any application and press Ctrl + Win + Z to convert it to the other layout.");
+                    return 0;
+                case IDC_MY_WORD_ADD:
+                case IDC_MY_WORD_REMOVE: {
+                    wchar_t word[KS_MAX_WORD + 2];
+                    wchar_t *start = word;
+                    wchar_t *end;
+                    word[0] = 0;
+                    GetWindowTextW(g_my_word, word, KS_MAX_WORD + 2);
+                    while (*start == L' ') ++start;
+                    end = start + wcslen(start);
+                    while (end > start && end[-1] == L' ') --end;
+                    *end = 0;
+                    if (!*start || wcschr(start, L' ') || wcslen(start) > KS_MAX_WORD) {
+                        set_activity(L"Type one word (up to 32 letters) in the My words box first.");
+                        return 0;
+                    }
+                    if (id == IDC_MY_WORD_ADD) {
+                        if (!g_settings.personal_dictionary)
+                            set_activity(L"Turn on \u201cRemember undone words\u201d first (Correction page).");
+                        else if (keep_word_forever(start, script_of(start[0]) == g_slots[KS_SLOT_B].script
+                                                              ? KS_SLOT_B : KS_SLOT_A)) {
+                            set_activity_pair(L"Kept", start, L"never changed");
+                            SetWindowTextW(g_my_word, L"");
+                        } else
+                            set_activity(L"The word could not be saved to your kept words.");
+                    } else if (forget_kept_word(start)) {
+                        set_activity_pair(L"Removed", start, L"corrected again from now on");
+                        SetWindowTextW(g_my_word, L"");
+                    } else
+                        set_activity(L"That word is not among your kept words.");
+                    return 0;
+                }
                 case IDC_FORGET_MEMORY:
                 case IDM_FORGET_MEMORY:
                 {
@@ -7558,6 +8115,9 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                             ? L"Writing language: the second language wins ambiguous collisions."
                             : L"Writing language: the first language wins ambiguous collisions.");
                     return 0;
+                case IDM_UPDATE:
+                    ShellExecuteW(NULL, L"open", UPDATE_RELEASES_PAGE, NULL, NULL, SW_SHOWNORMAL);
+                    return 0;
                 case IDM_EXIT:
                     g_exit_requested = 1;
                     DestroyWindow(window);
@@ -7575,9 +8135,9 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                 toggle_enabled(1);
                 return 0;
             }
-            if (wparam == ID_HOTKEY_CLEANUP) {
+            if (wparam == ID_HOTKEY_CLEANUP || wparam == ID_HOTKEY_CONVERT) {
                 if (engine_enter()) {
-                    start_selection_cleanup();
+                    start_selection_cleanup(wparam == ID_HOTKEY_CONVERT);
                     engine_leave();
                 }
                 return 0;
@@ -7587,6 +8147,11 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             if (wparam == ID_TIMER_STATUS) {
                 if (IsWindowVisible(window) && !IsIconic(window))
                     update_diagnostics_ui();
+                return 0;
+            }
+            if (wparam == ID_TIMER_UPDATE) {
+                SetTimer(window, ID_TIMER_UPDATE, 6u * 60u * 60u * 1000u, NULL);
+                update_check_now(0);
                 return 0;
             }
             if (wparam == ID_TIMER_HOOK_WATCHDOG) {
@@ -7670,6 +8235,18 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
         case WM_APP_KEEP_WORD:
             save_kept_word();
             return 0;
+        case WM_APP_UPDATE: {
+            const wchar_t *version = (const wchar_t *)lparam;
+            if (version && version_newer(version, APP_VERSION) && wcscmp(version, g_update_version) != 0) {
+                wchar_t text[160];
+                safe_copy(g_update_version, 24, version);
+                swprintf(text, 160, L"Version %ls is available. Open the tray menu to see the download page.",
+                         g_update_version);
+                show_balloon(L"KeySwitchFix update", text);
+                set_activity(text);
+            }
+            return 0;
+        }
         case WM_APP_FOCUS_QUERY:
             g_focus_query_posted = 0;
             if (g_engine_depth > 0) {
@@ -7767,6 +8344,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             KillTimer(window, ID_TIMER_FOCUS_QUERY);
             KillTimer(window, ID_TIMER_STATE_QUERY);
             KillTimer(window, ID_TIMER_LANGUAGES);
+            KillTimer(window, ID_TIMER_UPDATE);
             stats_save();
             memory_save();
             /* Exit right after a clean-up pasted: the user's own clipboard
@@ -7792,6 +8370,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             if (g_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_UNDO);
             if (g_toggle_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_TOGGLE);
             if (g_cleanup_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_CLEANUP);
+            if (g_convert_hotkey_registered) UnregisterHotKey(window, ID_HOTKEY_CONVERT);
             if (g_focus_event_hook) UnhookWinEvent(g_focus_event_hook);
             if (g_state_event_hook) UnhookWinEvent(g_state_event_hook);
             if (g_keyboard_hook) UnhookWindowsHookEx(g_keyboard_hook);
@@ -7840,6 +8419,7 @@ static void load_spelling_lexicons(void) {
         load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
     /* Optional: without the pair table spelling works word by word. */
     load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
+    load_rank_resource(IDR_EN_PAIRS, &g_english_pairs);
     /* Optional: without the wide lexicons only dictionary words are known. */
     load_bloom_resource(IDR_EN_WIDE_BLOOM, &g_english_wide_bloom);
     load_bloom_resource(IDR_FA_WIDE_BLOOM, &g_persian_wide_bloom);
@@ -7852,6 +8432,7 @@ static void load_spelling_lexicons(void) {
     g_english_spelling.common = &g_english_common_bloom;
     g_english_spelling.forms = &g_english_forms_bloom;
     g_english_spelling.attested = g_english_wide_bloom.valid ? &g_english_wide_bloom : NULL;
+    g_english_spelling.pairs = g_english_pairs.valid ? &g_english_pairs : NULL;
     memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
     g_persian_spelling.language = KS_LANG_PERSIAN;
     g_persian_spelling.ranks = &g_persian_rank_table;
@@ -8044,6 +8625,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
        punctuation) in place. */
     g_cleanup_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_CLEANUP,
                                                   MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, 'X');
+    /* The opt-in update check: a minute after start, then every six hours
+       (a check runs only when the last one is a day old). */
+    SetTimer(g_window, ID_TIMER_UPDATE, 6u * 60u * 60u * 1000u, NULL);
+    if (g_settings.check_updates) SetTimer(g_window, ID_TIMER_UPDATE, 60000u, NULL);
+    /* Ctrl + Win + Z converts the selected text to the other layout. */
+    g_convert_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_CONVERT,
+                                                  MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, 'Z');
     add_tray_icon();
     update_diagnostics_ui();
 
