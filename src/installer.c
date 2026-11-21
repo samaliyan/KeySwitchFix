@@ -413,6 +413,8 @@ static int write_initial_settings(int startup) {
     wchar_t number[8];
     int ok = 1;
     int settings_existed = GetFileAttributesW(g_settings_path) != INVALID_FILE_ATTRIBUTES;
+    /* UTF-16, so that program names in any alphabet survive (4.4). */
+    ks_ensure_unicode_ini(g_settings_path);
     /* A completed install must start in a working state, even when an older
        settings file had automatic correction paused. */
     ok &= WritePrivateProfileStringW(L"General", L"Enabled", L"1", g_settings_path) != 0;
@@ -477,6 +479,14 @@ static void note_problem(const wchar_t *what) {
     wcscat(g_install_problems, what);
 }
 
+/* A silent install (/silent: winget, scripts, the updater) shows nothing;
+   its result is the exit code. */
+static int g_silent_install;
+
+static void install_message(HWND dialog, const wchar_t *text, const wchar_t *title, UINT flags) {
+    if (!g_silent_install) MessageBoxW(dialog, text, title, flags);
+}
+
 static int perform_install(HWND dialog, int startup) {
     const wchar_t *targets[2];
     int desktop_created;
@@ -485,7 +495,7 @@ static int perform_install(HWND dialog, int startup) {
     targets[1] = g_uninstaller_path;
     g_install_problems[0] = 0;
     if (!g_paths_ok) {
-        MessageBoxW(dialog,
+        install_message(dialog,
                     L"The installation folder path is too long for Windows. KeySwitchFix cannot be installed "
                     L"for this user name.", L"KeySwitchFix Setup", MB_OK | MB_ICONERROR);
         return 0;
@@ -497,14 +507,14 @@ static int perform_install(HWND dialog, int startup) {
         !stage_resource_file(IDR_UNINSTALL_BINARY, g_uninstaller_path)) {
         discard_staged_files(targets, 2);
         restart_previous_copy();
-        MessageBoxW(dialog,
+        install_message(dialog,
                     L"The program files could not be written (disk full, or blocked by security software). "
                     L"Nothing was changed.", L"KeySwitchFix Setup", MB_OK | MB_ICONERROR);
         return 0;
     }
     if (!commit_staged_files(targets, 2)) {
         restart_previous_copy();
-        MessageBoxW(dialog,
+        install_message(dialog,
                     L"The program files could not be replaced (a file is in use). The previous version was "
                     L"kept. Close KeySwitchFix and try again.", L"KeySwitchFix Setup", MB_OK | MB_ICONERROR);
         return 0;
@@ -816,6 +826,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
     uninstall = has_switch(wide_command, L"/uninstall") ||
                 wcsstr(base_name, L"Uninstall") != NULL;
     if (uninstall) return perform_uninstall(silent, has_switch(wide_command, L"/purge")) ? 0 : 1;
+    if (silent) {
+        /*
+         * KeySwitchFix-Setup.exe /silent: install or update without a
+         * window, keep the user's "start with Windows" choice, and start
+         * the program again unless /nolaunch is given. Exit code 0 when
+         * the program files are in place.
+         */
+        g_silent_install = 1;
+        if (!perform_install(NULL, startup_default())) return 1;
+        if (!has_switch(wide_command, L"/nolaunch"))
+            ShellExecuteW(NULL, L"open", g_app_path, L"", g_install_directory, SW_SHOWNORMAL);
+        return 0;
+    }
     {
         INT_PTR result = DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_INSTALLER), NULL,
                                          installer_dialog_proc, 0);

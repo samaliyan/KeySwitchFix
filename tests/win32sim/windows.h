@@ -107,6 +107,7 @@ typedef INT_PTR (*DLGPROC)(HWND, UINT, WPARAM, LPARAM);
 #define WAIT_TIMEOUT 258L
 #define GENERIC_WRITE 0x40000000L
 #define CREATE_ALWAYS 2
+#define CREATE_NEW 1
 #define FILE_ATTRIBUTE_NORMAL 0x80
 #define MOVEFILE_REPLACE_EXISTING 1
 #define MOVEFILE_WRITE_THROUGH 8
@@ -494,6 +495,7 @@ typedef size_t SIZE_T;
 #define CF_GDIOBJLAST 0x3FF
 UINT EnumClipboardFormats(UINT);
 int CountClipboardFormats(void);
+BOOL IsHungAppWindow(HWND);
 SIZE_T GlobalSize(HANDLE);
 void Sleep(DWORD);
 #define WM_QUERYENDSESSION 0x11

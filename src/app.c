@@ -802,6 +802,8 @@ static int save_settings(void) {
         g_startup_registry_failed = !update_startup_registry();
         return 0;
     }
+    /* Names in the excluded-apps list may use any alphabet (4.4). */
+    ks_ensure_unicode_ini(g_settings_path);
     swprintf(number, 16, L"%d", g_settings.enabled);
     ok &= WritePrivateProfileStringW(L"General", L"Enabled", number, g_settings_path);
     swprintf(number, 16, L"%d", g_settings.sensitivity);
@@ -5869,6 +5871,18 @@ static void continue_selection_cleanup(void) {
             if (any_modifier_down()) {
                 if (GetTickCount() - g_cleanup_started_at > 3000u) finish_selection_cleanup();
                 return;
+            }
+            {
+                /* Saving the clipboard asks its owner to render every
+                   format. An owner that does not answer would hold this
+                   thread, and with it every key and mouse move (the hooks
+                   live here), until Windows gives up on it. */
+                HWND owner = GetClipboardOwner();
+                if (owner && IsHungAppWindow(owner)) {
+                    set_activity(L"Skipped: the program that owns the clipboard is not responding.");
+                    finish_selection_cleanup();
+                    return;
+                }
             }
             clipboard_snapshot_take(&g_cleanup_saved_clipboard);
             if (!g_cleanup_saved_clipboard.valid || g_cleanup_saved_clipboard.partial) {
