@@ -152,7 +152,7 @@ cd resources
 cd ..
 "$ZIG" cc -target x86_64-windows-gnu -DUNICODE -D_UNICODE -std=c11 -O2 \
   -Wall -Wextra -Werror -Isrc -Iresources src/app.c src/core.c src/spell.c src/typing.c src/domain.c src/memory.c resources/app.res \
-  -o dist/KeySwitchFix.exe -luser32 -lgdi32 -lcomctl32 -lshell32 -ladvapi32 -lole32 -loleaut32 -loleacc -luxtheme -ldwmapi \
+  -o dist/KeySwitchFix.exe -luser32 -lgdi32 -lcomctl32 -lshell32 -ladvapi32 -lole32 -loleaut32 -loleacc -luxtheme -ldwmapi -lwinhttp \
   -Wl,/subsystem:windows
 
 cd resources

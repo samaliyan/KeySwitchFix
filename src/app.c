@@ -3,6 +3,9 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <oleacc.h>
+#ifndef KS_WIN32SIM
+#include <winhttp.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,6 +39,8 @@
 #define WM_APP_LANGUAGES (WM_APP + 5)
 /* Save the word the user kept (undid a correction of, then moved on). */
 #define WM_APP_KEEP_WORD (WM_APP + 6)
+/* The update check finished on its thread (4.4). */
+#define WM_APP_UPDATE (WM_APP + 7)
 
 #define ID_TRAY 1
 #define ID_TIMER_STATUS 10
@@ -53,6 +58,7 @@
 #define ID_TIMER_FOCUS_QUERY 21
 #define ID_TIMER_STATE_QUERY 22
 #define ID_TIMER_LANGUAGES 23
+#define ID_TIMER_UPDATE 24
 
 /*
  * Windows silently removes a low-level hook whose callback exceeds the
@@ -118,6 +124,7 @@
 #define IDM_OPEN_MY_WORDS 218
 #define IDM_KEEP_LAST 219
 #define IDM_CONVERT 220
+#define IDM_UPDATE 221
 
 /* Marks the input KeySwitchFix injects. Chosen at start-up, so another
    program cannot make its keys look like ours. */
@@ -232,6 +239,8 @@ static int g_exit_requested;
 static int g_hotkey_registered;
 static int g_toggle_hotkey_registered;
 static int g_cleanup_hotkey_registered;
+/* The newer version the opt-in update check found, or empty. */
+static wchar_t g_update_version[24];
 static int g_convert_hotkey_registered;
 /* Snippets: the table, its file, and the file time it was loaded from. */
 static KS_SNIPPET_TABLE g_snippets;
@@ -6104,6 +6113,11 @@ static void show_tray_menu(int x, int y) {
         AppendMenuW(menu, MF_STRING, IDM_KEEP_LAST, label);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    if (g_update_version[0]) {
+        wchar_t label[64];
+        swprintf(label, 64, L"Download version %ls\u2026", g_update_version);
+        AppendMenuW(menu, MF_STRING, IDM_UPDATE, label);
+    }
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
     SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
     SetForegroundWindow(g_window);
@@ -6494,6 +6508,131 @@ static void update_tray_tip(void) {
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
+/* ---- Update check (4.4, opt-in) -------------------------------------------- */
+
+/*
+ * Off by default: KeySwitchFix makes no network request unless the user
+ * turns "Check for updates" on. Then, once a day, one HTTPS request asks
+ * GitHub for the latest release tag. Nothing about the user or their
+ * typing is sent, nothing is downloaded or installed: a newer version is
+ * announced in the tray, and the menu opens the release page.
+ */
+#define UPDATE_RELEASES_PAGE L"https://github.com/samaliyan/KeySwitchFix/releases/latest"
+
+static volatile LONG g_update_running;
+static ULONGLONG g_update_checked_at;
+
+/* 1 when the release tag ("v4.5.0", "4.5") names a later version than
+   `current` ("4.4.0"). Anything that is not three small numbers is not. */
+static int version_newer(const wchar_t *tag, const wchar_t *current) {
+    int a[3] = {0, 0, 0};
+    int b[3] = {0, 0, 0};
+    int i;
+    if (!tag || !current) return 0;
+    if (*tag == L'v' || *tag == L'V') ++tag;
+    if (*tag < L'0' || *tag > L'9') return 0;
+    for (i = 0; i < 3; ++i) {
+        int digits = 0;
+        while (*tag >= L'0' && *tag <= L'9' && digits < 5) { a[i] = a[i] * 10 + (*tag++ - L'0'); ++digits; }
+        if (*tag >= L'0' && *tag <= L'9') return 0;
+        if (*tag != L'.') break;
+        ++tag;
+    }
+    if (*tag && *tag != L'.') return 0;   /* "4.5.0-beta" is not offered */
+    for (i = 0; i < 3; ++i) {
+        while (*current >= L'0' && *current <= L'9') b[i] = b[i] * 10 + (*current++ - L'0');
+        if (*current != L'.') break;
+        ++current;
+    }
+    for (i = 0; i < 3; ++i)
+        if (a[i] != b[i]) return a[i] > b[i];
+    return 0;
+}
+
+#ifndef KS_WIN32SIM
+static DWORD WINAPI update_check_thread(LPVOID unused) {
+    HINTERNET session = NULL, connection = NULL, request = NULL;
+    char body[4096];
+    DWORD used = 0;
+    wchar_t found[24];
+    (void)unused;
+    found[0] = 0;
+    session = WinHttpOpen(L"KeySwitchFix", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                          WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session) {
+        WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
+        connection = WinHttpConnect(session, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    }
+    if (connection)
+        request = WinHttpOpenRequest(connection, L"GET", L"/repos/samaliyan/KeySwitchFix/releases/latest", NULL,
+                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (request &&
+        WinHttpSendRequest(request, L"Accept: application/vnd.github+json\r\n", (DWORD)-1,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(request, NULL)) {
+        DWORD status = 0;
+        DWORD size = sizeof(status);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) &&
+            status == 200) {
+            /* The tag is near the start of the answer; 4 KB is plenty. */
+            for (;;) {
+                DWORD got = 0;
+                if (used >= sizeof(body) - 1 ||
+                    !WinHttpReadData(request, body + used, (DWORD)(sizeof(body) - 1 - used), &got) || !got)
+                    break;
+                used += got;
+            }
+            body[used] = 0;
+            {
+                const char *key = strstr(body, "\"tag_name\"");
+                const char *value = key ? strchr(key + 10, ':') : NULL;
+                value = value ? strchr(value, '"') : NULL;
+                if (value) {
+                    int i = 0;
+                    for (++value; *value && *value != '"' && i < 23; ++value) {
+                        /* Digits, dots and a leading v only. */
+                        if ((*value >= '0' && *value <= '9') || *value == '.' || *value == 'v' || *value == 'V')
+                            found[i++] = (wchar_t)*value;
+                        else {
+                            i = 0;
+                            break;
+                        }
+                    }
+                    found[i] = 0;
+                }
+            }
+        }
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    if (session) WinHttpCloseHandle(session);
+    if (found[0] && version_newer(found, APP_VERSION)) {
+        /* The window copies it on its own thread. */
+        static wchar_t result[24];
+        safe_copy(result, 24, found[0] == L'v' || found[0] == L'V' ? found + 1 : found);
+        if (g_window) PostMessageW(g_window, WM_APP_UPDATE, 0, (LPARAM)result);
+    }
+    InterlockedExchange(&g_update_running, 0);
+    return 0;
+}
+#endif
+
+/* Starts a check when the option is on and the last one is a day old. */
+static void update_check_now(int force) {
+    ULONGLONG now = GetTickCount64();
+    if (!g_settings.check_updates) return;
+    if (!force && g_update_checked_at && now - g_update_checked_at < 24ull * 60 * 60 * 1000) return;
+    g_update_checked_at = now ? now : 1;
+#ifndef KS_WIN32SIM
+    if (InterlockedCompareExchange(&g_update_running, 1, 0) == 0) {
+        HANDLE thread = CreateThread(NULL, 0, update_check_thread, NULL, 0, NULL);
+        if (thread) CloseHandle(thread);
+        else InterlockedExchange(&g_update_running, 0);
+    }
+#endif
+}
+
 static void show_balloon(const wchar_t *title, const wchar_t *text) {
     /* NIF_REALTIME: a note that cannot be shown now is dropped rather than
        queued in the notification centre. */
@@ -6737,7 +6876,13 @@ static void apply_controls(void) {
        values read as zero: never save those. */
     if (!g_ui_ready) return;
     g_language_pair_changed = 0;
-    read_controls_to_settings();
+    {
+        int checked_before = g_settings.check_updates;
+        read_controls_to_settings();
+        /* Just switched on: look now, not in a day. */
+        if (g_settings.check_updates && !checked_before) update_check_now(1);
+        if (!g_settings.check_updates) g_update_version[0] = 0;
+    }
     memory_apply_setting();
     clear_word();
     clear_history();
@@ -7968,6 +8113,9 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
                             ? L"Writing language: the second language wins ambiguous collisions."
                             : L"Writing language: the first language wins ambiguous collisions.");
                     return 0;
+                case IDM_UPDATE:
+                    ShellExecuteW(NULL, L"open", UPDATE_RELEASES_PAGE, NULL, NULL, SW_SHOWNORMAL);
+                    return 0;
                 case IDM_EXIT:
                     g_exit_requested = 1;
                     DestroyWindow(window);
@@ -7997,6 +8145,11 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             if (wparam == ID_TIMER_STATUS) {
                 if (IsWindowVisible(window) && !IsIconic(window))
                     update_diagnostics_ui();
+                return 0;
+            }
+            if (wparam == ID_TIMER_UPDATE) {
+                SetTimer(window, ID_TIMER_UPDATE, 6u * 60u * 60u * 1000u, NULL);
+                update_check_now(0);
                 return 0;
             }
             if (wparam == ID_TIMER_HOOK_WATCHDOG) {
@@ -8080,6 +8233,18 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
         case WM_APP_KEEP_WORD:
             save_kept_word();
             return 0;
+        case WM_APP_UPDATE: {
+            const wchar_t *version = (const wchar_t *)lparam;
+            if (version && version_newer(version, APP_VERSION) && wcscmp(version, g_update_version) != 0) {
+                wchar_t text[160];
+                safe_copy(g_update_version, 24, version);
+                swprintf(text, 160, L"Version %ls is available. Open the tray menu to see the download page.",
+                         g_update_version);
+                show_balloon(L"KeySwitchFix update", text);
+                set_activity(text);
+            }
+            return 0;
+        }
         case WM_APP_FOCUS_QUERY:
             g_focus_query_posted = 0;
             if (g_engine_depth > 0) {
@@ -8177,6 +8342,7 @@ static LRESULT CALLBACK main_window_proc(HWND window, UINT message, WPARAM wpara
             KillTimer(window, ID_TIMER_FOCUS_QUERY);
             KillTimer(window, ID_TIMER_STATE_QUERY);
             KillTimer(window, ID_TIMER_LANGUAGES);
+            KillTimer(window, ID_TIMER_UPDATE);
             stats_save();
             memory_save();
             /* Exit right after a clean-up pasted: the user's own clipboard
@@ -8455,6 +8621,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
        punctuation) in place. */
     g_cleanup_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_CLEANUP,
                                                   MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, 'X');
+    /* The opt-in update check: a minute after start, then every six hours
+       (a check runs only when the last one is a day old). */
+    SetTimer(g_window, ID_TIMER_UPDATE, 6u * 60u * 60u * 1000u, NULL);
+    if (g_settings.check_updates) SetTimer(g_window, ID_TIMER_UPDATE, 60000u, NULL);
     /* Ctrl + Win + Z converts the selected text to the other layout. */
     g_convert_hotkey_registered = RegisterHotKey(g_window, ID_HOTKEY_CONVERT,
                                                   MOD_CONTROL | MOD_WIN | MOD_NOREPEAT, 'Z');

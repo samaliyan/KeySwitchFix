@@ -1331,6 +1331,15 @@ static void version_4_4(void) {
     g_settings.personal_dictionary = 0;
     ks_vocab_reset(&g_personal_vocabulary);
 
+    /* The update check compares release tags. */
+    expect(version_newer(L"v4.5.0", L"4.4.0") && version_newer(L"4.4.1", L"4.4.0") &&
+               version_newer(L"v5.0", L"4.9.9") && version_newer(L"v4.10.0", L"4.9.0"),
+           "a later release is recognised");
+    expect(!version_newer(L"v4.4.0", L"4.4.0") && !version_newer(L"v4.3.9", L"4.4.0") &&
+               !version_newer(L"", L"4.4.0") && !version_newer(L"latest", L"4.4.0") &&
+               !version_newer(L"v4.5.0-beta", L"4.4.0") && !version_newer(L"v999999.0.0", L"4.4.0"),
+           "the same, an older, a pre-release or a malformed tag is not offered");
+
     /* Selection conversion: the same keys in the other layout. */
     {
         wchar_t text[64];

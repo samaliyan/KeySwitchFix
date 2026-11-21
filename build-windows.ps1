@@ -154,7 +154,7 @@ Run $Zig @("rc", "/:auto-includes", "gnu", "/c", "65001", "/fo", "app.res", "app
 Pop-Location
 Run $Zig ($common + @("src\app.c", "src\core.c", "src\spell.c", "src\typing.c", "src\domain.c", "src\memory.c", "resources\app.res",
           "-o", "dist\KeySwitchFix.exe",
-          "-luser32", "-lgdi32", "-lcomctl32", "-lshell32", "-ladvapi32", "-lole32", "-loleaut32", "-loleacc", "-luxtheme", "-ldwmapi", "-Wl,/subsystem:windows"))
+          "-luser32", "-lgdi32", "-lcomctl32", "-lshell32", "-ladvapi32", "-lole32", "-loleaut32", "-loleacc", "-luxtheme", "-ldwmapi", "-lwinhttp", "-Wl,/subsystem:windows"))
 
 Step "KeySwitchFix-Uninstall.exe"
 Push-Location resources

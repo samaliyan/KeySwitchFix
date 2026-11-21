@@ -8,6 +8,8 @@
  */
 #ifndef W32STUB_WINDOWS_H
 #define W32STUB_WINDOWS_H
+/* Lets the application leave out what cannot run here (the network). */
+#define KS_WIN32SIM 1
 #include <stddef.h>
 #include <stdint.h>
 #include <wchar.h>
