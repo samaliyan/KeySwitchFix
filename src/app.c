@@ -441,6 +441,13 @@ static KS_BLOOM g_persian_common_bloom;
 /* Every inflected form the dictionaries allow (spelling only). */
 static KS_BLOOM g_english_forms_bloom;
 static KS_BLOOM g_persian_forms_bloom;
+/* The wide lexicons (4.3): names, brands, abbreviations and other tokens
+   real text contains but no dictionary lists, and their beginnings. They
+   protect what the user typed; they are never a reason to change it. */
+static KS_BLOOM g_english_wide_bloom;
+static KS_BLOOM g_persian_wide_bloom;
+static KS_BLOOM g_english_wide_prefix_bloom;
+static KS_BLOOM g_persian_wide_prefix_bloom;
 /* Persian word pairs (4.2): the words around a typo help choose its repair. */
 static KS_RANK_TABLE g_persian_pairs;
 /* The word a spelling fix just typed: the context of the next word, since
@@ -1893,18 +1900,26 @@ static void bind_slot_lexicons(KS_SLOT slot) {
         g_lexicons.prefixes[slot] = &state->pack.prefixes;
         g_lexicons.common_prefixes[slot] =
             state->pack.common_prefixes.valid ? &state->pack.common_prefixes : NULL;
+        g_lexicons.wide[slot][0] = g_lexicons.wide[slot][1] = NULL;
+        g_lexicons.wide_prefixes[slot] = NULL;
     } else if (state->profile && state->profile->model == KS_LANG_PERSIAN) {
         g_lexicons.words[slot] = &g_persian_bloom;
         g_lexicons.common[slot] = &g_persian_common_bloom;
         g_lexicons.frequent[slot] = &g_persian_frequent_bloom;
         g_lexicons.prefixes[slot] = &g_persian_prefix_bloom;
         g_lexicons.common_prefixes[slot] = &g_persian_common_prefix_bloom;
+        g_lexicons.wide[slot][0] = g_persian_wide_bloom.valid ? &g_persian_wide_bloom : NULL;
+        g_lexicons.wide[slot][1] = g_persian_forms_bloom.valid ? &g_persian_forms_bloom : NULL;
+        g_lexicons.wide_prefixes[slot] = g_persian_wide_prefix_bloom.valid ? &g_persian_wide_prefix_bloom : NULL;
     } else {
         g_lexicons.words[slot] = &g_english_bloom;
         g_lexicons.common[slot] = &g_english_common_bloom;
         g_lexicons.frequent[slot] = &g_english_frequent_bloom;
         g_lexicons.prefixes[slot] = &g_english_prefix_bloom;
         g_lexicons.common_prefixes[slot] = &g_english_common_prefix_bloom;
+        g_lexicons.wide[slot][0] = g_english_wide_bloom.valid ? &g_english_wide_bloom : NULL;
+        g_lexicons.wide[slot][1] = g_english_forms_bloom.valid ? &g_english_forms_bloom : NULL;
+        g_lexicons.wide_prefixes[slot] = g_english_wide_prefix_bloom.valid ? &g_english_wide_prefix_bloom : NULL;
     }
     g_lexicons.profile[slot] = state->profile;
 }
@@ -1974,6 +1989,7 @@ static void release_language_pair(void) {
     for (slot = KS_SLOT_A; slot <= KS_SLOT_B; ++slot) {
         g_lexicons.words[slot] = g_lexicons.common[slot] = g_lexicons.frequent[slot] = NULL;
         g_lexicons.prefixes[slot] = g_lexicons.common_prefixes[slot] = NULL;
+        g_lexicons.wide[slot][0] = g_lexicons.wide[slot][1] = g_lexicons.wide_prefixes[slot] = NULL;
         if (g_slots[slot].pack_data) HeapFree(GetProcessHeap(), 0, g_slots[slot].pack_data);
         g_slots[slot].pack_data = NULL;
     }
@@ -7725,6 +7741,57 @@ static int command_line_has(const wchar_t *name) {
     return found;
 }
 
+/*
+ * Everything beyond the base dictionaries: the spelling tables, the word
+ * forms, the word pairs and the wide lexicons. All optional: a build that
+ * shipped without them still repairs layouts, and the dashboard says that
+ * spelling is unavailable.
+ */
+static void load_spelling_lexicons(void) {
+    /*
+     * Spelling correction needs the frequency tables. They are generated from
+     * wordfreq at build time; if a build shipped without them, the layout
+     * repair keeps working and the dashboard says spelling is unavailable.
+     */
+    g_spelling_available =
+        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
+        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
+        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
+        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
+    /* Optional: without the pair table spelling works word by word. */
+    load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
+    /* Optional: without the wide lexicons only dictionary words are known. */
+    load_bloom_resource(IDR_EN_WIDE_BLOOM, &g_english_wide_bloom);
+    load_bloom_resource(IDR_FA_WIDE_BLOOM, &g_persian_wide_bloom);
+    load_bloom_resource(IDR_EN_WIDE_PREFIX, &g_english_wide_prefix_bloom);
+    load_bloom_resource(IDR_FA_WIDE_PREFIX, &g_persian_wide_prefix_bloom);
+    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
+    g_english_spelling.language = KS_LANG_ENGLISH;
+    g_english_spelling.ranks = &g_english_rank_table;
+    g_english_spelling.words = &g_english_bloom;
+    g_english_spelling.common = &g_english_common_bloom;
+    g_english_spelling.forms = &g_english_forms_bloom;
+    g_english_spelling.attested = g_english_wide_bloom.valid ? &g_english_wide_bloom : NULL;
+    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
+    g_persian_spelling.language = KS_LANG_PERSIAN;
+    g_persian_spelling.ranks = &g_persian_rank_table;
+    g_persian_spelling.words = &g_persian_bloom;
+    g_persian_spelling.common = &g_persian_common_bloom;
+    g_persian_spelling.forms = &g_persian_forms_bloom;
+    g_persian_spelling.pairs = g_persian_pairs.valid ? &g_persian_pairs : NULL;
+    g_persian_spelling.attested = g_persian_wide_bloom.valid ? &g_persian_wide_bloom : NULL;
+    g_english_spelling.vocabulary = &g_session_vocabulary;
+    g_persian_spelling.vocabulary = &g_session_vocabulary;
+    g_english_spelling.personal = &g_personal_vocabulary;
+    g_persian_spelling.personal = &g_personal_vocabulary;
+    g_english_spelling.rank_adjust = spell_rank_adjust;
+    g_english_spelling.rank_adjust_context = &g_rank_language_en;
+    g_persian_spelling.rank_adjust = spell_rank_adjust;
+    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
+    g_english_spelling.pair_adjust = spell_pair_adjust;
+    g_persian_spelling.pair_adjust = spell_pair_adjust;
+}
+
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_ansi, int show_command) {
     unsigned activity_before_load = 0;
     int language_pair_ok = 1;
@@ -7807,41 +7874,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line_an
     g_extra_words.has_prefix = extra_word_prefix;
     g_extra_words.context = NULL;
     g_lexicons.extra = &g_extra_words;
-    /*
-     * Spelling correction needs the frequency tables. They are generated from
-     * wordfreq at build time; if a build shipped without them, the layout
-     * repair keeps working and the dashboard says spelling is unavailable.
-     */
-    g_spelling_available =
-        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
-        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
-        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
-        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
-    /* Optional: without the pair table spelling works word by word. */
-    load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs);
-    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
-    g_english_spelling.language = KS_LANG_ENGLISH;
-    g_english_spelling.ranks = &g_english_rank_table;
-    g_english_spelling.words = &g_english_bloom;
-    g_english_spelling.common = &g_english_common_bloom;
-    g_english_spelling.forms = &g_english_forms_bloom;
-    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
-    g_persian_spelling.language = KS_LANG_PERSIAN;
-    g_persian_spelling.ranks = &g_persian_rank_table;
-    g_persian_spelling.words = &g_persian_bloom;
-    g_persian_spelling.common = &g_persian_common_bloom;
-    g_persian_spelling.forms = &g_persian_forms_bloom;
-    g_persian_spelling.pairs = g_persian_pairs.valid ? &g_persian_pairs : NULL;
-    g_english_spelling.vocabulary = &g_session_vocabulary;
-    g_persian_spelling.vocabulary = &g_session_vocabulary;
-    g_english_spelling.personal = &g_personal_vocabulary;
-    g_persian_spelling.personal = &g_personal_vocabulary;
-    g_english_spelling.rank_adjust = spell_rank_adjust;
-    g_english_spelling.rank_adjust_context = &g_rank_language_en;
-    g_persian_spelling.rank_adjust = spell_rank_adjust;
-    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
-    g_english_spelling.pair_adjust = spell_pair_adjust;
-    g_persian_spelling.pair_adjust = spell_pair_adjust;
+    load_spelling_lexicons();
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_context_reset(&g_intent_context);

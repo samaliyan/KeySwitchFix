@@ -16,6 +16,10 @@ IDR_FA_RANK_TABLE RCDATA "fa-rank.bin"
 IDR_EN_FORMS_BLOOM RCDATA "en-forms.bloom"
 IDR_FA_FORMS_BLOOM RCDATA "fa-forms.bloom"
 IDR_FA_PAIRS RCDATA "fa-pairs.bin"
+IDR_EN_WIDE_BLOOM RCDATA "en-wide.bloom"
+IDR_FA_WIDE_BLOOM RCDATA "fa-wide.bloom"
+IDR_EN_WIDE_PREFIX RCDATA "en-wide-prefix.bloom"
+IDR_FA_WIDE_PREFIX RCDATA "fa-wide-prefix.bloom"
 
 1 VERSIONINFO
 FILEVERSION 4,2,0,0

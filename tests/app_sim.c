@@ -380,6 +380,10 @@ static struct { int id; const char *file; unsigned char *data; size_t size; } si
     {IDR_EN_FORMS_BLOOM, "resources/en-forms.bloom", NULL, 0},
     {IDR_FA_FORMS_BLOOM, "resources/fa-forms.bloom", NULL, 0},
     {IDR_FA_PAIRS, "resources/fa-pairs.bin", NULL, 0},
+    {IDR_EN_WIDE_BLOOM, "resources/en-wide.bloom", NULL, 0},
+    {IDR_FA_WIDE_BLOOM, "resources/fa-wide.bloom", NULL, 0},
+    {IDR_EN_WIDE_PREFIX, "resources/en-wide-prefix.bloom", NULL, 0},
+    {IDR_FA_WIDE_PREFIX, "resources/fa-wide-prefix.bloom", NULL, 0},
 };
 
 HRSRC FindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type) {
@@ -677,6 +681,9 @@ static void load_builtin(void) {
     g_extra_words.contains = extra_word_known;
     g_extra_words.has_prefix = extra_word_prefix;
     g_lexicons.extra = &g_extra_words;
+    /* As WinMain does: the forms and the wide lexicons guard the layout
+       decision too, so every scenario runs with them. */
+    load_spelling_lexicons();
 }
 
 /* ---- Scenarios ------------------------------------------------------------ */
@@ -827,32 +834,12 @@ static void spelling(void) {
     printf("Spelling with the real tables\n");
     install_layouts(2, (uintptr_t)0x04090409u, (uintptr_t)0x04290429u);
     sim_start(L"en", L"fa");
-    g_spelling_available =
-        load_rank_resource(IDR_EN_RANK_TABLE, &g_english_rank_table) &&
-        load_rank_resource(IDR_FA_RANK_TABLE, &g_persian_rank_table) &&
-        load_bloom_resource(IDR_EN_FORMS_BLOOM, &g_english_forms_bloom) &&
-        load_bloom_resource(IDR_FA_FORMS_BLOOM, &g_persian_forms_bloom);
+    load_spelling_lexicons();
     expect(g_spelling_available, "the spelling tables load");
-    expect(load_rank_resource(IDR_FA_PAIRS, &g_persian_pairs), "the Persian word-pair table loads");
-    memset(&g_english_spelling, 0, sizeof(g_english_spelling));
-    g_english_spelling.language = KS_LANG_ENGLISH;
-    g_english_spelling.ranks = &g_english_rank_table;
-    g_english_spelling.words = &g_english_bloom;
-    g_english_spelling.common = &g_english_common_bloom;
-    g_english_spelling.forms = &g_english_forms_bloom;
-    memset(&g_persian_spelling, 0, sizeof(g_persian_spelling));
-    g_persian_spelling.language = KS_LANG_PERSIAN;
-    g_persian_spelling.ranks = &g_persian_rank_table;
-    g_persian_spelling.words = &g_persian_bloom;
-    g_persian_spelling.common = &g_persian_common_bloom;
-    g_persian_spelling.forms = &g_persian_forms_bloom;
+    expect(g_persian_pairs.valid, "the Persian word-pair table loads");
+    expect(g_english_wide_bloom.valid && g_persian_wide_bloom.valid, "the wide lexicons load");
+    /* The scenarios below were written for word-by-word spelling. */
     g_persian_spelling.pairs = NULL;
-    g_english_spelling.vocabulary = g_persian_spelling.vocabulary = &g_session_vocabulary;
-    g_english_spelling.personal = g_persian_spelling.personal = &g_personal_vocabulary;
-    g_english_spelling.rank_adjust = g_persian_spelling.rank_adjust = spell_rank_adjust;
-    g_english_spelling.rank_adjust_context = &g_rank_language_en;
-    g_persian_spelling.rank_adjust_context = &g_rank_language_fa;
-    g_english_spelling.pair_adjust = g_persian_spelling.pair_adjust = spell_pair_adjust;
     ks_ignore_list_reset(&g_spelling_ignore);
     ks_vocab_reset(&g_session_vocabulary);
     ks_vocab_reset(&g_personal_vocabulary);

@@ -1,0 +1,23 @@
+# Classic English misspellings and run-together words. A large corpus
+# attests them (people really type them), so the wide lexicon would keep
+# them as words; listed here they stay repairable by spelling correction.
+# One or more lower-case tokens per line; '#' starts a comment.
+# Only tokens that are never a name, a brand or an abbreviation.
+teh hte adn nad taht waht wiht thsi tihs yuo cna jsut taek woudl coudl shoudl
+thier wierd freind frist peice beleive recieve recieved reciever acheive acheived
+realy untill wich whcih becuase beacuse alot aswell ofthe inthe tothe onthe forthe
+infact incase noone theyare havebeen thankyou atleast eachother everytime abit
+alittle inorder infront ofcourse aswel
+theres
+occured occuring occurence comming begining writting geting runing stoping
+truely definately definatly seperate seperately goverment enviroment tommorow
+tomorow tommorrow calender grammer accomodate acommodate adress agressive
+apparantly arguement basicly beautifull buisness bussiness carefull collegue
+completly concious curiousity dissapear dissapoint embarass existance
+familar finaly foriegn fourty freindly happend harrass immediatly
+independant intresting knowlege liason libary lisence neccessary necesary
+noticable ocassion occassion oppurtunity paralel persistant posession
+prefered publically recomend refered relevent religous rember remeber
+resturant rythm sentance sieze similiar sincerly speach succesful sucessful
+suprise suprised tendancy threshhold tounge untill usefull wether
+wheather wellcome writen yeild langauge mispell mispelled goverments
